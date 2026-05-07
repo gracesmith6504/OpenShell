@@ -10,12 +10,15 @@ from .sandbox import (
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
+    ProviderClient,
+    ProviderRef,
     Sandbox,
     SandboxClient,
     SandboxError,
     SandboxRef,
     SandboxSession,
     TlsConfig,
+    policy_from_yaml,
 )
 
 try:
@@ -30,6 +33,8 @@ __all__ = [
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
+    "ProviderClient",
+    "ProviderRef",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
@@ -37,4 +42,5 @@ __all__ = [
     "SandboxSession",
     "TlsConfig",
     "__version__",
+    "policy_from_yaml",
 ]

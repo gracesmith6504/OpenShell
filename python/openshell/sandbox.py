@@ -4,22 +4,27 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import pathlib
 import sys
+import tarfile
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import grpc
+from google.protobuf import json_format
 
 from ._proto import (
+    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
     openshell_pb2_grpc,
+    sandbox_pb2,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +44,13 @@ class SandboxRef:
     id: str
     name: str
     phase: int
+
+
+@dataclass(frozen=True)
+class ProviderRef:
+    id: str
+    name: str
+    type: str
 
 
 @dataclass(frozen=True)
@@ -137,6 +149,13 @@ class SandboxClient:
             )
             self._channel = grpc.secure_channel(endpoint, credentials)
         self._stub = openshell_pb2_grpc.OpenShellStub(self._channel)
+        self._providers: ProviderClient | None = None
+
+    @property
+    def providers(self) -> ProviderClient:
+        if self._providers is None:
+            self._providers = ProviderClient(self._stub, timeout=self._timeout)
+        return self._providers
 
     @classmethod
     def from_active_cluster(
@@ -186,12 +205,48 @@ class SandboxClient:
         self,
         *,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        providers: Sequence[str] | None = None,
+        policy: sandbox_pb2.SandboxPolicy | None = None,
+        environment: Mapping[str, str] | None = None,
+        gpu: bool = False,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
-        request_spec = spec if spec is not None else _default_spec()
-        response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(spec=request_spec),
-            timeout=self._timeout,
+        kwargs_used = (
+            image is not None
+            or providers is not None
+            or policy is not None
+            or environment is not None
+            or gpu
         )
+        if spec is not None and kwargs_used:
+            raise SandboxError(
+                "create() accepts either spec= or the convenience kwargs "
+                "(image, providers, policy, environment, gpu), not both"
+            )
+
+        if spec is not None:
+            request_spec = spec
+        elif kwargs_used:
+            request_spec = openshell_pb2.SandboxSpec(
+                environment=dict(environment or {}),
+                providers=list(providers or []),
+                gpu=gpu,
+            )
+            if image is not None:
+                request_spec.template.image = image
+            if policy is not None:
+                request_spec.policy.CopyFrom(policy)
+        else:
+            request_spec = _default_spec()
+
+        request = openshell_pb2.CreateSandboxRequest(
+            spec=request_spec,
+            name=name or "",
+            labels=dict(labels or {}),
+        )
+        response = self._stub.CreateSandbox(request, timeout=self._timeout)
         sandbox_ref = _sandbox_ref(response.sandbox)
         if sandbox_ref.id == "":
             raise SandboxError("CreateSandbox returned empty sandbox id")
@@ -258,6 +313,39 @@ class SandboxClient:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
         raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+
+    def upload(
+        self,
+        sandbox_id: str,
+        src: str | pathlib.Path,
+        dst: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        src_path = pathlib.Path(src)
+        if not src_path.exists():
+            raise SandboxError(f"upload source does not exist: {src_path}")
+
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            tar.add(str(src_path), arcname=src_path.name)
+        tarball = buffer.getvalue()
+
+        # Stream the tarball over ExecSandbox stdin instead of using the
+        # gateway SSH tunnel; sufficient for notebook-sized payloads and
+        # avoids an SSH client dependency.
+        quoted_dst = "'" + dst.replace("'", "'\\''") + "'"
+        result = self.exec(
+            sandbox_id,
+            ["sh", "-c", f"mkdir -p {quoted_dst} && tar xzf - -C {quoted_dst}"],
+            stdin=tarball,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.exit_code != 0:
+            raise SandboxError(
+                f"upload to {dst} failed (exit {result.exit_code}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
 
     def exec_stream(
         self,
@@ -372,6 +460,80 @@ class SandboxClient:
             env=exec_env,
             timeout_seconds=timeout_seconds,
         )
+
+
+class ProviderClient:
+    """gRPC client for provider CRUD."""
+
+    def __init__(
+        self,
+        stub: openshell_pb2_grpc.OpenShellStub,
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        self._stub = stub
+        self._timeout = timeout
+
+    def create(
+        self,
+        *,
+        name: str,
+        provider_type: str,
+        credentials: Mapping[str, str] | None = None,
+        credentials_from_env: Sequence[str] | None = None,
+        config: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> ProviderRef:
+        creds: dict[str, str] = dict(credentials or {})
+        for env_name in credentials_from_env or ():
+            value = os.environ.get(env_name)
+            if value is None:
+                raise SandboxError(
+                    f"environment variable {env_name!r} is not set; "
+                    f"cannot resolve credential for provider {name!r}"
+                )
+            creds[env_name] = value
+
+        provider = datamodel_pb2.Provider(
+            metadata=datamodel_pb2.ObjectMeta(
+                name=name,
+                labels=dict(labels or {}),
+            ),
+            type=provider_type,
+            credentials=creds,
+            config=dict(config or {}),
+        )
+        response = self._stub.CreateProvider(
+            openshell_pb2.CreateProviderRequest(provider=provider),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def get(self, name: str) -> ProviderRef:
+        response = self._stub.GetProvider(
+            openshell_pb2.GetProviderRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> builtins.list[ProviderRef]:
+        response = self._stub.ListProviders(
+            openshell_pb2.ListProvidersRequest(limit=limit, offset=offset),
+            timeout=self._timeout,
+        )
+        return [_provider_ref(item) for item in response.providers]
+
+    def delete(self, name: str) -> bool:
+        response = self._stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(name=name),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
 
 
 @dataclass(frozen=True)
@@ -549,6 +711,36 @@ class Sandbox:
         )
 
 
+def policy_from_yaml(
+    source: str | pathlib.Path,
+) -> sandbox_pb2.SandboxPolicy:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise SandboxError(
+            "policy_from_yaml requires PyYAML; install with `pip install pyyaml`"
+        ) from exc
+
+    if isinstance(source, pathlib.Path):
+        text = source.read_text()
+    elif "\n" not in source and pathlib.Path(source).exists():
+        text = pathlib.Path(source).read_text()
+    else:
+        text = source
+
+    parsed = yaml.safe_load(text)
+    if not isinstance(parsed, dict):
+        raise SandboxError("policy YAML must parse to a mapping at the top level")
+
+    # CLI YAML uses `filesystem_policy`; the proto field is `filesystem`.
+    if "filesystem_policy" in parsed and "filesystem" not in parsed:
+        parsed["filesystem"] = parsed.pop("filesystem_policy")
+
+    policy = sandbox_pb2.SandboxPolicy()
+    json_format.ParseDict(parsed, policy, ignore_unknown_fields=False)
+    return policy
+
+
 _PYTHON_CLOUDPICKLE_BOOTSTRAP = (
     "import base64,cloudpickle,os;"
     "payload=base64.b64decode(os.environ['OPENSHELL_PYFUNC_B64']);"
@@ -580,6 +772,14 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
         phase=sandbox.phase,
+    )
+
+
+def _provider_ref(provider: datamodel_pb2.Provider) -> ProviderRef:
+    return ProviderRef(
+        id=provider.metadata.id if provider.metadata else "",
+        name=provider.metadata.name if provider.metadata else "",
+        type=provider.type,
     )
 
 
