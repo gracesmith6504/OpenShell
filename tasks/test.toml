@@ -5,7 +5,7 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python"]
+depends = ["test:rust", "test:python", "test:install"]
 
 [e2e]
 description = "Run all end-to-end tests (Rust + Python)"
@@ -25,6 +25,11 @@ description = "Run Python tests"
 depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run pytest python/"
+hide = true
+
+["test:install"]
+description = "Run installer shell tests"
+run = "scripts/test-install-ostree.sh"
 hide = true
 
 ["e2e:rust"]

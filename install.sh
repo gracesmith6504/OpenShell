@@ -5,6 +5,8 @@
 # Install OpenShell from a GitHub release.
 #
 # Linux installs either the Debian or RPM packages from the selected release.
+# RPM-based ostree systems use a user-local install path so immutable /usr
+# deployments do not require package layering or a reboot.
 # Apple Silicon macOS installs the generated Homebrew formula, so Homebrew owns
 # the binary layout and launchd service lifecycle.
 #
@@ -54,7 +56,8 @@ NOTES:
     from ${GITHUB_URL}/releases/latest.
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
+    x86_64/aarch64, depending on the host package manager. RPM-based ostree
+    hosts install into user-local paths instead of layering system packages.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -216,8 +219,18 @@ detect_platform() {
   esac
 }
 
+is_ostree_system() {
+  [ "${OPENSHELL_TEST_OSTREE_BOOTED:-}" = "1" ] || [ -e /run/ostree-booted ]
+}
+
 linux_package_method() {
-  if has_cmd dpkg; then
+  if is_ostree_system; then
+    if has_cmd rpm; then
+      echo "rpm-ostree"
+    else
+      error "ostree Linux installs require rpm-compatible release assets"
+    fi
+  elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
@@ -402,6 +415,175 @@ install_rpm_packages() {
   fi
 }
 
+extract_rpm_payload() {
+  _rpm_path="$1"
+  _extract_dir="$2"
+
+  require_cmd rpm2cpio
+  require_cmd cpio
+
+  mkdir -p "$_extract_dir"
+  (
+    cd "$_extract_dir"
+    rpm2cpio "$_rpm_path" | cpio -idm --quiet
+  )
+}
+
+supervisor_image_tag() {
+  case "$RELEASE_TAG" in
+    dev)
+      echo "dev"
+      ;;
+    *)
+      echo "latest"
+      ;;
+  esac
+}
+
+write_ostree_gateway_unit() {
+  _unit_file="$1"
+  _gateway_bin="$2"
+  _init_pki="$3"
+  _init_gateway_env="$4"
+  _supervisor_tag="$(supervisor_image_tag)"
+
+  cat >"$_unit_file" <<EOF
+[Unit]
+Description=OpenShell Gateway (user)
+Documentation=https://github.com/NVIDIA/OpenShell
+After=podman.socket
+Requires=podman.socket
+
+[Service]
+Type=exec
+ExecStartPre=${_init_pki} %S/openshell/tls
+ExecStartPre=${_init_gateway_env} %E/openshell/gateway.env
+EnvironmentFile=-%E/openshell/gateway.env
+Environment=OPENSHELL_BIND_ADDRESS=127.0.0.1
+Environment=OPENSHELL_SERVER_PORT=${LOCAL_GATEWAY_PORT}
+Environment=OPENSHELL_DRIVERS=podman
+Environment=OPENSHELL_DB_URL=sqlite://%S/openshell/gateway.db
+Environment=OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:${LOCAL_GATEWAY_PORT}
+Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
+Environment=OPENSHELL_SSH_GATEWAY_PORT=${LOCAL_GATEWAY_PORT}
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:${_supervisor_tag}
+Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+Environment=OPENSHELL_TLS_CERT=%S/openshell/tls/server/tls.crt
+Environment=OPENSHELL_TLS_KEY=%S/openshell/tls/server/tls.key
+Environment=OPENSHELL_TLS_CLIENT_CA=%S/openshell/tls/ca.crt
+Environment=OPENSHELL_PODMAN_TLS_CA=%S/openshell/tls/ca.crt
+Environment=OPENSHELL_PODMAN_TLS_CERT=%S/openshell/tls/client/tls.crt
+Environment=OPENSHELL_PODMAN_TLS_KEY=%S/openshell/tls/client/tls.key
+ExecStart=${_gateway_bin}
+StateDirectory=openshell
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+install_ostree_file() {
+  _src="$1"
+  _dst="$2"
+  _mode="$3"
+  _dst_dir="$(dirname "$_dst")"
+
+  [ -e "$_src" ] || error "expected file not found in RPM payload: ${_src}"
+  as_target_user mkdir -p "$_dst_dir"
+  as_target_user install -m "$_mode" "$_src" "$_dst"
+}
+
+path_contains_dir() {
+  _dir="$1"
+  case ":${PATH:-}:" in
+    *":${_dir}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_user_local_path_hint() {
+  _local_bin="$1"
+
+  if ! path_contains_dir "$_local_bin"; then
+    info "${_local_bin} is not on your PATH."
+    info "Add it with: export PATH=\"${_local_bin}:\$PATH\""
+  fi
+}
+
+install_ostree_payload_files() {
+  _cli_root="$1"
+  _gateway_root="$2"
+  _tmpdir="$3"
+
+  _local_bin="${TARGET_HOME}/.local/bin"
+  _local_libexec="${TARGET_HOME}/.local/libexec/openshell"
+  _unit_dir="${TARGET_HOME}/.config/systemd/user"
+  _unit_file="${_unit_dir}/openshell-gateway.service"
+
+  info "installing OpenShell into user-local paths for ostree host..."
+  install_ostree_file "${_cli_root}/usr/bin/openshell" "${_local_bin}/openshell" 0755
+  install_ostree_file "${_gateway_root}/usr/bin/openshell-gateway" "${_local_bin}/openshell-gateway" 0755
+  install_ostree_file "${_gateway_root}/usr/libexec/openshell/init-pki.sh" "${_local_libexec}/init-pki.sh" 0755
+  install_ostree_file "${_gateway_root}/usr/libexec/openshell/init-gateway-env.sh" "${_local_libexec}/init-gateway-env.sh" 0755
+
+  _staged_unit="${_tmpdir}/openshell-gateway.service"
+  write_ostree_gateway_unit \
+    "$_staged_unit" \
+    "${_local_bin}/openshell-gateway" \
+    "${_local_libexec}/init-pki.sh" \
+    "${_local_libexec}/init-gateway-env.sh"
+
+  as_target_user mkdir -p "$_unit_dir"
+  as_target_user install -m 0644 "$_staged_unit" "$_unit_file"
+
+  OPENSHELL_REGISTER_BIN="${_local_bin}/openshell"
+  info "installed ostree user service unit at ${_unit_file}"
+  print_user_local_path_hint "$_local_bin"
+}
+
+download_linux_rpm_assets() {
+  _tmpdir="$1"
+  _arch="$(get_rpm_arch)"
+
+  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
+  info "downloading ${RELEASE_TAG} release checksums..."
+  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${_checksums_url}"
+  }
+
+  RPM_FILE="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
+  if [ -z "$RPM_FILE" ]; then
+    error "no openshell RPM package found for architecture: ${_arch}"
+  fi
+
+  GATEWAY_RPM_FILE="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-gateway)"
+  if [ -z "$GATEWAY_RPM_FILE" ]; then
+    error "no openshell-gateway RPM package found for architecture: ${_arch}"
+  fi
+
+  info "selected ${RPM_FILE} and ${GATEWAY_RPM_FILE}"
+
+  for _package_file in "$RPM_FILE" "$GATEWAY_RPM_FILE"; do
+    _package_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_package_file}"
+    _package_path="${_tmpdir}/${_package_file}"
+
+    info "downloading ${_package_file}..."
+    download_release_asset "$RELEASE_TAG" "$_package_file" "$_package_path" || {
+      error "failed to download ${_package_url}"
+    }
+    chmod 0644 "$_package_path"
+
+    info "verifying checksum for ${_package_file}..."
+    verify_checksum "$_package_path" "${_tmpdir}/${CHECKSUMS_NAME}" "$_package_file"
+  done
+}
+
 homebrew_formula_path() {
   _tap="$1"
   _formula="$2"
@@ -502,7 +684,7 @@ remove_local_gateway_registration() {
   [ -n "$TARGET_HOME" ] || error "cannot resolve home directory for ${TARGET_USER}"
   _config_dir="${TARGET_HOME}/.config/openshell"
 
-  # The install-dev gateway is a user service. Replace the CLI registration
+  # The installer-managed gateway is a user service. Replace the CLI registration
   # directly instead of asking `gateway destroy` to tear down Docker resources.
   # shellcheck disable=SC2016
   as_target_user sh -c '
@@ -599,46 +781,40 @@ install_linux_rpm() {
   require_cmd rpm
   set_linux_target_runtime_dir
 
-  _arch="$(get_rpm_arch)"
   _tmpdir="$(mktemp -d)"
   chmod 0755 "$_tmpdir"
   trap 'rm -rf "$_tmpdir"' EXIT
 
-  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
-  info "downloading ${RELEASE_TAG} release checksums..."
-  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
-    error "failed to download ${_checksums_url}"
-  }
+  download_linux_rpm_assets "$_tmpdir"
 
-  _rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
-  if [ -z "$_rpm_file" ]; then
-    error "no openshell RPM package found for architecture: ${_arch}"
-  fi
-
-  _gateway_rpm_file="$(find_rpm_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell-gateway)"
-  if [ -z "$_gateway_rpm_file" ]; then
-    error "no openshell-gateway RPM package found for architecture: ${_arch}"
-  fi
-
-  info "selected ${_rpm_file} and ${_gateway_rpm_file}"
-
-  for _package_file in "$_rpm_file" "$_gateway_rpm_file"; do
-    _package_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_package_file}"
-    _package_path="${_tmpdir}/${_package_file}"
-
-    info "downloading ${_package_file}..."
-    download_release_asset "$RELEASE_TAG" "$_package_file" "$_package_path" || {
-      error "failed to download ${_package_url}"
-    }
-    chmod 0644 "$_package_path"
-
-    info "verifying checksum for ${_package_file}..."
-    verify_checksum "$_package_path" "${_tmpdir}/${CHECKSUMS_NAME}" "$_package_file"
-  done
-
-  info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
-  install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
+  info "installing ${RPM_FILE} and ${GATEWAY_RPM_FILE}..."
+  install_rpm_packages "${_tmpdir}/${RPM_FILE}" "${_tmpdir}/${GATEWAY_RPM_FILE}"
   info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
+  start_user_gateway
+}
+
+install_linux_rpm_ostree() {
+  require_cmd rpm
+  require_cmd rpm2cpio
+  require_cmd cpio
+  set_linux_target_runtime_dir
+
+  _tmpdir="$(mktemp -d)"
+  chmod 0755 "$_tmpdir"
+  trap 'rm -rf "$_tmpdir"' EXIT
+
+  download_linux_rpm_assets "$_tmpdir"
+
+  _cli_extract_dir="${_tmpdir}/openshell-rpm"
+  _gateway_extract_dir="${_tmpdir}/openshell-gateway-rpm"
+
+  info "extracting ${RPM_FILE} without mutating ostree deployment..."
+  extract_rpm_payload "${_tmpdir}/${RPM_FILE}" "$_cli_extract_dir"
+  info "extracting ${GATEWAY_RPM_FILE} without mutating ostree deployment..."
+  extract_rpm_payload "${_tmpdir}/${GATEWAY_RPM_FILE}" "$_gateway_extract_dir"
+
+  install_ostree_payload_files "$_cli_extract_dir" "$_gateway_extract_dir" "$_tmpdir"
+  info "installed ${APP_NAME} from ${RELEASE_TAG} into user-local ostree paths"
   start_user_gateway
 }
 
@@ -727,6 +903,9 @@ main() {
         rpm)
           install_linux_rpm
           ;;
+        rpm-ostree)
+          install_linux_rpm_ostree
+          ;;
         *)
           error "unsupported Linux package method"
           ;;
@@ -741,4 +920,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${OPENSHELL_INSTALL_SOURCE_ONLY:-}" != "1" ]; then
+  main "$@"
+fi

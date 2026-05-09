@@ -16,7 +16,7 @@ Install OpenShell with a single command:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The script detects your operating system and installs the OpenShell CLI and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes.
+The script detects your operating system and installs the OpenShell CLI and gateway. On mutable Linux hosts and macOS, it uses the native package manager. On RPM-based ostree hosts, it installs the gateway into user-local paths so the immutable system deployment does not need package layering or a reboot. It then starts the local gateway server so you can begin creating sandboxes.
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
@@ -50,6 +50,8 @@ brew services restart openshell
 ## Linux
 
 On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
+
+On RPM-based ostree systems such as Fedora Silverblue, Fedora CoreOS, Bazzite, Aurora, and Bluefin, the install script extracts the RPM payloads into user-local paths instead of mutating `/usr`. The CLI and gateway are installed under `~/.local/bin`, helper scripts under `~/.local/libexec/openshell`, and the user service under `~/.config/systemd/user/openshell-gateway.service`.
 
 On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 

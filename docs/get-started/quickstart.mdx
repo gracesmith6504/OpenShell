@@ -28,7 +28,7 @@ Run the install script:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The install script uses Homebrew, RPM, or a Debian package based on your machine. It starts the local gateway server after installation.
+The install script uses Homebrew, RPM, or a Debian package based on your machine. On RPM-based ostree hosts, it uses a user-local install path instead of system package layering. It starts the local gateway server after installation.
 
 If you prefer [uv](https://docs.astral.sh/uv/):
 
