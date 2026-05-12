@@ -74,9 +74,9 @@ sudo loginctl enable-linger $USER
 You can also install the gateway by downloading the release binary and starting `openshell-gateway` yourself.
 
 ```shell
-GATEWAY_TARGET=x86_64-unknown-linux-gnu
+# Other targets: aarch64-unknown-linux-gnu, aarch64-apple-darwin
 mkdir -p "$HOME/.local/bin"
-curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-gateway-${GATEWAY_TARGET}.tar.gz" \
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz" \
   | tar -xz -C "$HOME/.local/bin" openshell-gateway
 chmod 755 "$HOME/.local/bin/openshell-gateway"
 export PATH="$HOME/.local/bin:$PATH"
