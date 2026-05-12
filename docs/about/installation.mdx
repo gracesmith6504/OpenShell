@@ -34,31 +34,6 @@ OpenShell supports several local compute drivers. The installer chooses a defaul
 
 For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers). For gateway and sandbox operations, refer to [Gateways](/sandboxes/manage-gateways) and [Sandboxes](/sandboxes/manage-sandboxes).
 
-## Manually running the Gateway
-
-You can run the gateway without Homebrew, RPM, Debian packages, or Helm by downloading the release binary and starting `openshell-gateway` yourself. This is useful on immutable or image-based systems where package-manager installation is not the right fit.
-
-Choose the gateway release artifact that matches your host:
-
-| Host | `GATEWAY_TARGET` |
-|---|---|
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux Arm64 | `aarch64-unknown-linux-gnu` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-
-```shell
-VERSION="v0.0.0"
-GATEWAY_TARGET=x86_64-unknown-linux-gnu
-BASE_URL="https://github.com/NVIDIA/OpenShell/releases/download/${VERSION}"
-
-mkdir -p "$HOME/.local/bin"
-curl -LsSf "${BASE_URL}/openshell-gateway-${GATEWAY_TARGET}.tar.gz" | tar -xz -C "$HOME/.local/bin" openshell-gateway
-chmod 755 "$HOME/.local/bin/openshell-gateway"
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Set `VERSION` to a release tag from [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases). For production installs, download and verify the release checksum files before installing the artifact. To configure the gateway process, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
-
 ## macOS
 
 On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
@@ -93,6 +68,21 @@ To keep the user service running after logout, enable linger:
 ```shell
 sudo loginctl enable-linger $USER
 ```
+
+## Manually running the Gateway
+
+You can also install the gateway by downloading the release binary and starting `openshell-gateway` yourself.
+
+```shell
+GATEWAY_TARGET=x86_64-unknown-linux-gnu
+mkdir -p "$HOME/.local/bin"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-gateway-${GATEWAY_TARGET}.tar.gz" \
+  | tar -xz -C "$HOME/.local/bin" openshell-gateway
+chmod 755 "$HOME/.local/bin/openshell-gateway"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To configure the gateway process, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
 
 ## Kubernetes
 
