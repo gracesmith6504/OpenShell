@@ -51,3 +51,4 @@ zyga
 russellb
 zanetworker
 alangou
+SDAChess
