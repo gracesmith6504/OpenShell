@@ -69,7 +69,7 @@ To keep the user service running after logout, enable linger:
 sudo loginctl enable-linger $USER
 ```
 
-## Manually running the Gateway
+## Manual Gateway Setup
 
 You can also install the gateway by downloading the release binary and starting `openshell-gateway` yourself.
 
@@ -91,7 +91,31 @@ chmod 755 "$HOME/.local/bin/openshell-gateway"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-To configure the gateway process, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
+To configure the gateway process itself, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
+
+## Manual CLI Setup
+
+You can also install the CLI by downloading the release binary directly.
+
+```shell
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64|Linux-amd64) cli_target="x86_64-unknown-linux-musl" ;;
+  Linux-aarch64|Linux-arm64) cli_target="aarch64-unknown-linux-musl" ;;
+  Darwin-arm64|Darwin-aarch64) cli_target="aarch64-apple-darwin" ;;
+  *)
+    echo "Unsupported CLI binary target: $(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "$HOME/.local/bin"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-${cli_target}.tar.gz" \
+  | tar -xz -C "$HOME/.local/bin" openshell
+chmod 755 "$HOME/.local/bin/openshell"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+After installing the CLI, use `openshell gateway add` to register a gateway. For gateway registration commands, refer to [Register an Existing Gateway](/sandboxes/manage-gateways#register-an-existing-gateway).
 
 ## Kubernetes
 
