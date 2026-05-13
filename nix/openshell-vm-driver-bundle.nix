@@ -5,11 +5,13 @@
   zstd,
   openshellLibkrun,
   openshellLibkrunfw,
+  openshellSandbox,
   gvproxy,
 }:
 
 stdenvNoCC.mkDerivation {
   pname = "openshell-vm-driver-bundle";
+  inherit (openshellSandbox) version;
 
   dontUnpack = true;
 
@@ -22,6 +24,7 @@ stdenvNoCC.mkDerivation {
     zstd -19 -T0 -f ${openshellLibkrun}/lib64/libkrun.so -o "$out/libkrun.so.zst"
     zstd -19 -T0 -f ${openshellLibkrunfw}/lib64/libkrunfw.so.5 -o "$out/libkrunfw.so.5.zst"
     zstd -19 -T0 -f ${gvproxy}/bin/gvproxy -o "$out/gvproxy.zst"
+    zstd -19 -T0 -f ${openshellSandbox}/bin/openshell-sandbox -o "$out/openshell-sandbox.zst"
 
     runHook postInstall
   '';
