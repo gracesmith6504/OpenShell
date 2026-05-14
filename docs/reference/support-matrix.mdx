@@ -41,6 +41,7 @@ The gateway can manage sandboxes through several compute drivers.
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
 | Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
+| Slurm | Experimental for Apptainer-backed HPC sandboxes. | Requires a Slurm login node, compute-node callback reachability, Apptainer, and shared storage for driver state. |
 
 ## Software Prerequisites
 
@@ -54,6 +55,8 @@ Install the software for the compute driver you use:
 | Helm | 3.x | Required to install `deploy/helm/openshell`. |
 | kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
 | Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
+| Slurm | Site dependent | Required for Slurm-backed gateways. The gateway host must provide `sbatch`, `srun`, `squeue`, and `scancel`. |
+| Apptainer | Site dependent | Required by the Slurm driver MVP to run OCI/SIF sandbox images on compute nodes. |
 
 ## Sandbox Runtime Versions
 

@@ -69,7 +69,9 @@ the SSH handshake secret).
 
 **OPENSHELL_DRIVERS** (default: podman)
 :   Compute driver for sandbox management. Options: **podman**,
-    **docker**, **kubernetes**. The RPM unit defaults to **podman**.
+    **docker**, **kubernetes**, **vm**, **slurm**. The RPM unit defaults
+    to **podman**. Slurm and VM are explicit opt-in drivers and are not
+    auto-detected.
 
 **OPENSHELL_DB_URL** (default: sqlite://$XDG_STATE_HOME/openshell/gateway.db)
 :   SQLite database URL for gateway state persistence.
@@ -136,6 +138,25 @@ the SSH handshake secret).
 **OPENSHELL_STOP_TIMEOUT** (default: 10)
 :   Seconds to wait after SIGTERM before sending SIGKILL when stopping
     a sandbox container.
+
+## Slurm Driver
+
+**OPENSHELL_SLURM_WORK_DIR** (default: /tmp/openshell-slurm)
+:   Shared filesystem directory used for Slurm job scripts, environment
+    files, logs, and metadata.
+
+**OPENSHELL_SLURM_SUPERVISOR_BIN**
+:   Shared filesystem path to the Linux `openshell-sandbox` binary.
+
+**OPENSHELL_SLURM_PARTITION**, **OPENSHELL_SLURM_ACCOUNT**, **OPENSHELL_SLURM_QOS**, **OPENSHELL_SLURM_TIME_LIMIT**
+:   Optional scheduling values passed to `sbatch`.
+
+**OPENSHELL_SLURM_EXTRA_SBATCH_ARG**, **OPENSHELL_SLURM_EXTRA_SRUN_ARG**, **OPENSHELL_SLURM_EXTRA_APPTAINER_ARG**
+:   Extra operator-supplied arguments for the generated Slurm and
+    Apptainer commands.
+
+**OPENSHELL_SLURM_GPU_RESOURCE** (default: gpu)
+:   GRES resource name used when sandbox creation requests a GPU.
 
 # EXAMPLES
 

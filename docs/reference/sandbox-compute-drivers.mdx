@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Compute Drivers"
 sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, and Kubernetes sandbox compute drivers."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Reference"
+description: "Reference for Docker, Podman, MicroVM, Kubernetes, and Slurm sandbox compute drivers."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Slurm, Reference"
 position: 4
 ---
 
@@ -20,22 +20,22 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 openshell-gateway --drivers docker
 ```
 
-You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
+You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `docker`, `podman`, `kubernetes`, `vm`, and `slurm`.
 
-When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
+When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM and Slurm drivers are never auto-detected; configure them explicitly.
 
 Common gateway options:
 
 | Option | Environment variable | Description |
 |---|---|---|
-| `--drivers <driver>` | `OPENSHELL_DRIVERS` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+| `--drivers <driver>` | `OPENSHELL_DRIVERS` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, `vm`, and `slurm`. |
 | `--sandbox-image <image>` | `OPENSHELL_SANDBOX_IMAGE` | Set the default sandbox image used when a sandbox create request does not specify one. |
 | `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | Set the gateway callback endpoint that sandbox workloads use to connect back to OpenShell. |
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
-container requests and limits. The VM driver accepts the fields but currently
-ignores them.
+container requests and limits. Slurm maps them to `--cpus-per-task` and `--mem`.
+The VM driver accepts the fields but currently ignores them.
 
 ## Docker Driver
 
@@ -123,3 +123,30 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | Not applicable | Not applicable | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+## Slurm Driver
+
+Slurm-backed sandboxes run as batch jobs submitted from a gateway on a Slurm login node. Use Slurm when OpenShell should launch sandbox workloads onto an HPC cluster through normal `sbatch` and `srun` scheduling.
+
+The Slurm driver MVP uses Apptainer. The generated batch script runs one `srun apptainer exec` task that bind-mounts the `openshell-sandbox` supervisor binary into the sandbox image. The supervisor then connects back to the gateway endpoint from the compute node.
+
+The gateway requires a shared filesystem path visible from the login and compute nodes for generated scripts, environment files, logs, and job metadata.
+
+| Option | Environment variable | Description |
+|---|---|---|
+| `--drivers slurm` | `OPENSHELL_DRIVERS=slurm` | Select the Slurm compute driver. Slurm is never auto-detected. |
+| `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | Gateway callback endpoint reachable from compute nodes. Required. |
+| `--slurm-work-dir <path>` | `OPENSHELL_SLURM_WORK_DIR` | Shared work directory for Slurm job scripts and metadata. |
+| `--slurm-supervisor-bin <path>` | `OPENSHELL_SLURM_SUPERVISOR_BIN` | Shared path to the Linux `openshell-sandbox` supervisor binary. |
+| `--slurm-partition`, `--slurm-account`, `--slurm-qos`, `--slurm-time-limit` | Matching `OPENSHELL_SLURM_*` variables | Optional Slurm scheduling settings passed to `sbatch`. |
+| `--slurm-extra-sbatch-arg`, `--slurm-extra-srun-arg`, `--slurm-extra-apptainer-arg` | Matching `OPENSHELL_SLURM_EXTRA_*` variables | Repeatable operator-controlled passthrough arguments. |
+| `--slurm-gpu-resource <name>` | `OPENSHELL_SLURM_GPU_RESOURCE` | GRES resource name used for `--gpu`; defaults to `gpu`. |
+| `--slurm-tls-ca`, `--slurm-tls-cert`, `--slurm-tls-key` | `OPENSHELL_SLURM_TLS_CA`, `OPENSHELL_SLURM_TLS_CERT`, `OPENSHELL_SLURM_TLS_KEY` | Bind-mount sandbox client TLS materials into Apptainer for mTLS callback to the gateway. |
+
+Run the local validation environment with:
+
+```shell
+mise run e2e:slurm
+```
+
+The task starts a Docker Compose Slurm cluster with separate login, controller, and compute containers, starts the gateway on the login node, and runs the smoke e2e against Apptainer-backed Slurm jobs.

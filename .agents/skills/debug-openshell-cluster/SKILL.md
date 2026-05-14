@@ -1,13 +1,13 @@
 ---
 name: debug-openshell-cluster
-description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use when the user has a gateway health failure, Docker/Podman runtime issue, Helm install failure, Kubernetes scheduling issue, TLS secret issue, VM driver issue, or sandbox startup problem. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, vm driver.
+description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use when the user has a gateway health failure, Docker/Podman runtime issue, Helm install failure, Kubernetes scheduling issue, TLS secret issue, VM driver issue, Slurm driver issue, or sandbox startup problem. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, vm driver, slurm driver.
 ---
 
 # Debug OpenShell Gateway Deployment
 
-Diagnose a gateway and its selected compute platform. Do not assume OpenShell provisions Kubernetes or runs a k3s container. OpenShell targets a reachable gateway endpoint backed by Docker, Podman, Kubernetes, or the experimental VM driver.
+Diagnose a gateway and its selected compute platform. Do not assume OpenShell provisions Kubernetes or runs a k3s container. OpenShell targets a reachable gateway endpoint backed by Docker, Podman, Kubernetes, Slurm, or the experimental VM driver.
 
-Use `openshell` first to identify the active endpoint. Then use the platform tools that match the gateway's compute driver: `docker`, `podman`, `kubectl`/`helm`, or VM driver logs.
+Use `openshell` first to identify the active endpoint. Then use the platform tools that match the gateway's compute driver: `docker`, `podman`, `kubectl`/`helm`, Slurm commands, or VM driver logs.
 
 ## Overview
 
@@ -25,7 +25,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 
 - The `openshell` CLI must be available for endpoint checks.
 - Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
-- Know the compute platform: Docker, Podman, Kubernetes, or VM.
+- Know the compute platform: Docker, Podman, Kubernetes, Slurm, or VM.
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
@@ -55,6 +55,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 | Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls. |
 | Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
 | Kubernetes | Helm release, StatefulSet, service, secrets, sandbox pods, events. |
+| Slurm | Slurm controller reachability, job state, Apptainer availability, shared work directory, gateway callback endpoint. |
 | VM | VM driver logs, rootfs availability, host virtualization support. |
 
 ### Step 3: Check Docker-Backed Gateways
@@ -178,7 +179,45 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
-### Step 6: Check VM-Backed Gateways
+### Step 6: Check Slurm-Backed Gateways
+
+Run these checks on the login node where the gateway is running:
+
+```bash
+sbatch --version
+srun --version
+squeue --me
+sinfo
+apptainer --version
+openshell status
+```
+
+Verify the Slurm driver settings:
+
+- `OPENSHELL_DRIVERS=slurm`
+- `OPENSHELL_GRPC_ENDPOINT` is reachable from compute nodes.
+- `OPENSHELL_SLURM_WORK_DIR` exists on shared storage visible to login and compute nodes.
+- `OPENSHELL_SLURM_SUPERVISOR_BIN` points to an executable Linux `openshell-sandbox` binary on shared storage.
+- `OPENSHELL_SSH_HANDSHAKE_SECRET` is set.
+
+If sandbox creation submits a job but the sandbox never becomes ready, inspect:
+
+```bash
+squeue --name 'openshell-*'
+sacct -X --jobs <job-id> --format JobIDRaw,State,Reason,ExitCode
+cat "$OPENSHELL_SLURM_WORK_DIR"/<sandbox-id>/slurm-*.out
+cat "$OPENSHELL_SLURM_WORK_DIR"/<sandbox-id>/slurm-*.err
+cat "$OPENSHELL_SLURM_WORK_DIR"/<sandbox-id>/status.env
+```
+
+Common findings:
+
+- Job pending: inspect `squeue` reason, partition/account/QoS, and requested CPU/memory/GRES.
+- Apptainer image pull failure: verify registry reachability from compute nodes and the sandbox image reference.
+- Supervisor cannot call back: verify `OPENSHELL_GRPC_ENDPOINT`, firewall rules, TLS mode, and gateway logs.
+- Supervisor binary missing on compute nodes: verify the shared path and executable permissions.
+
+### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
 
@@ -199,7 +238,7 @@ openshell logs <sandbox-name>
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
-| Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
+| Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/Slurm/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |

@@ -24,11 +24,12 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
+| Slurm | HPC clusters with a gateway on a login node. | Apptainer container inside a Slurm job plus nested sandbox namespace. | Uses `sbatch`, `srun`, Slurm job state, and a shared work directory visible to login and compute nodes. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
-Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+Kubernetes mirrors each limit into the matching request. Slurm maps them to
+`--cpus-per-task` and `--mem`. VM accepts the fields but currently ignores them.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
@@ -42,6 +43,7 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
+- `crates/openshell-driver-slurm/README.md`
 
 ## Supervisor Delivery
 
@@ -53,6 +55,7 @@ The supervisor must be available inside each sandbox workload:
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Sandbox pod image or pod template configuration. |
 | VM | Embedded in the guest rootfs bundle. |
+| Slurm | Shared-filesystem supervisor binary bind-mounted into Apptainer at job runtime. |
 
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
@@ -72,9 +75,10 @@ runtime still owns GPU device injection.
 ## Deployment Shape
 
 Kubernetes deployments use the Helm chart under `deploy/helm/openshell`.
-Standalone local deployments start the gateway with a selected runtime such as
-Docker, Podman, or VM. The CLI can register multiple gateways and switch between
-them without changing the sandbox architecture.
+Slurm deployments run the gateway on a login node and submit jobs to compute
+nodes. Standalone local deployments start the gateway with a selected runtime
+such as Docker, Podman, or VM. The CLI can register multiple gateways and switch
+between them without changing the sandbox architecture.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

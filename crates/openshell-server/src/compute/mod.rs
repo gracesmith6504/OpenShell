@@ -6,6 +6,7 @@
 pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
+pub use openshell_driver_slurm::SlurmComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -34,6 +35,7 @@ use openshell_driver_kubernetes::{
 use openshell_driver_podman::{
     ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
 };
+use openshell_driver_slurm::{ComputeDriverService as SlurmDriverService, SlurmComputeDriver};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
@@ -385,6 +387,34 @@ impl ComputeRuntime {
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        Self::from_driver(
+            driver,
+            None,
+            None,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn new_slurm(
+        config: SlurmComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = SlurmComputeDriver::new(config)
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let driver: SharedComputeDriver = Arc::new(SlurmDriverService::new(driver));
         Self::from_driver(
             driver,
             None,

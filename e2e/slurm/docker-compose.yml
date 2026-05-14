@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  controller:
+    build:
+      context: .
+    hostname: controller
+    command: ["controller"]
+    init: true
+
+  compute:
+    build:
+      context: .
+    hostname: compute
+    command: ["compute"]
+    init: true
+    privileged: true
+    depends_on:
+      - controller
+    volumes:
+      - slurm-work:/work
+      - ${OPENSHELL_SLURM_BIN_DIR:?set OPENSHELL_SLURM_BIN_DIR}:/opt/openshell/bin:ro
+
+  login:
+    build:
+      context: .
+    hostname: login
+    command: ["login"]
+    init: true
+    depends_on:
+      - controller
+      - compute
+    ports:
+      - "${OPENSHELL_SLURM_GATEWAY_PORT:?set OPENSHELL_SLURM_GATEWAY_PORT}:8080"
+    volumes:
+      - slurm-work:/work
+      - ${OPENSHELL_SLURM_BIN_DIR:?set OPENSHELL_SLURM_BIN_DIR}:/opt/openshell/bin:ro
+
+volumes:
+  slurm-work:

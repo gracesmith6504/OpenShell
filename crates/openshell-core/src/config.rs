@@ -59,6 +59,7 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    Slurm,
 }
 
 impl ComputeDriverKind {
@@ -69,6 +70,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::Slurm => "slurm",
         }
     }
 }
@@ -88,8 +90,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "slurm" => Ok(Self::Slurm),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, slurm"
             )),
         }
     }
@@ -98,7 +101,7 @@ impl FromStr for ComputeDriverKind {
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
+/// VM and Slurm are never auto-detected (require explicit `--drivers`).
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.

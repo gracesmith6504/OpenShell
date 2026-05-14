@@ -49,7 +49,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
+use compute::{ComputeRuntime, DockerComputeConfig, SlurmComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -152,6 +152,7 @@ pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
     docker_config: DockerComputeConfig,
+    slurm_config: SlurmComputeConfig,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let database_url = config.database_url.trim();
@@ -194,6 +195,7 @@ pub async fn run_server(
         &config,
         &vm_config,
         &docker_config,
+        &slurm_config,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -551,6 +553,7 @@ async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
     docker_config: &DockerComputeConfig,
+    slurm_config: &SlurmComputeConfig,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -694,26 +697,37 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
+        ComputeDriverKind::Slurm => ComputeRuntime::new_slurm(
+            slurm_config.clone(),
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
     }
 }
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     match config.compute_drivers.as_slice() {
         [] => match openshell_core::config::detect_driver() {
-            Some(ComputeDriverKind::Vm) => Err(Error::config(
-                "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
+            Some(ComputeDriverKind::Vm | ComputeDriverKind::Slurm) => Err(Error::config(
+                "vm and slurm compute drivers are opt-in only; set --drivers vm or --drivers slurm",
             )),
             Some(driver) => Ok(driver),
             None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, vm, or slurm",
             )),
         },
         [
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
             | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
+            | ComputeDriverKind::Podman
+            | ComputeDriverKind::Slurm),
         ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
@@ -852,6 +866,15 @@ mod tests {
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_slurm() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Slurm]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Slurm
         );
     }
 

@@ -4,7 +4,7 @@
 title: "Manage Gateways"
 sidebar-title: "Gateways"
 description: "Register OpenShell gateways, switch between environments, inspect gateway status, and troubleshoot gateway access."
-keywords: "Generative AI, Cybersecurity, Gateway, Docker, Podman, Kubernetes, MicroVM, CLI"
+keywords: "Generative AI, Cybersecurity, Gateway, Docker, Podman, Kubernetes, MicroVM, Slurm, CLI"
 position: 2
 ---
 
@@ -30,11 +30,12 @@ A gateway provisions sandboxes through the compute driver configured for that ga
 | Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
 | Kubernetes | Pods in an operator-managed cluster. | Shared clusters and cloud environments. |
 | MicroVM | VM-backed sandboxes. | Workflows that need VM-backed isolation. |
+| Slurm | Apptainer-backed jobs on Slurm compute nodes. | HPC clusters where the gateway runs on a login node. |
 
 All compute drivers expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
 
 <Tip>
-For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
+For driver setup, including Docker, Podman, MicroVM, Kubernetes, and Slurm paths, refer to [Installation](/about/installation).
 
 </Tip>
 
@@ -160,6 +161,7 @@ For sandbox startup failures, inspect the selected compute driver:
 | Podman | Podman socket availability, rootless networking, image availability, and sandbox container state. |
 | Kubernetes | Events and sandbox pods in the namespace configured by `server.sandboxNamespace`. |
 | MicroVM | VM driver logs, rootfs availability, and gateway logs. |
+| Slurm | Gateway logs, Slurm job state, generated job logs under the Slurm work directory, and Apptainer image availability. |
 
 ## Next Steps
 

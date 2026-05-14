@@ -59,7 +59,8 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 **--drivers** *DRIVER*\[,*DRIVER*\]
 :   Compute driver. Accepts a comma-delimited list. The gateway
     currently requires exactly one driver. Options: **podman**,
-    **docker**, **kubernetes**. Default: **kubernetes**.
+    **docker**, **kubernetes**, **vm**, **slurm**. Slurm and VM are
+    explicit opt-in drivers and are not auto-detected.
     Environment: **OPENSHELL_DRIVERS**.
 
 **--tls-cert** *PATH*

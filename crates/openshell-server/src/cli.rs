@@ -16,7 +16,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
-use crate::compute::{DockerComputeConfig, VmComputeConfig};
+use crate::compute::{DockerComputeConfig, SlurmComputeConfig, VmComputeConfig};
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
@@ -236,6 +236,75 @@ struct RunArgs {
         default_value = DEFAULT_DOCKER_NETWORK_NAME
     )]
     docker_network_name: String,
+
+    /// Shared filesystem directory used by the Slurm driver for scripts,
+    /// environment files, logs, and job metadata.
+    #[arg(
+        long,
+        env = "OPENSHELL_SLURM_WORK_DIR",
+        default_value_os_t = SlurmComputeConfig::default_work_dir()
+    )]
+    slurm_work_dir: PathBuf,
+
+    /// Slurm partition for sandbox jobs.
+    #[arg(long, env = "OPENSHELL_SLURM_PARTITION")]
+    slurm_partition: Option<String>,
+
+    /// Slurm account for sandbox jobs.
+    #[arg(long, env = "OPENSHELL_SLURM_ACCOUNT")]
+    slurm_account: Option<String>,
+
+    /// Slurm `QoS` for sandbox jobs.
+    #[arg(long, env = "OPENSHELL_SLURM_QOS")]
+    slurm_qos: Option<String>,
+
+    /// Slurm time limit for sandbox jobs, passed to sbatch --time.
+    #[arg(long, env = "OPENSHELL_SLURM_TIME_LIMIT")]
+    slurm_time_limit: Option<String>,
+
+    /// Apptainer executable available on Slurm compute nodes.
+    #[arg(
+        long,
+        env = "OPENSHELL_SLURM_APPTAINER_BIN",
+        default_value_t = SlurmComputeConfig::default_apptainer_bin()
+    )]
+    slurm_apptainer_bin: String,
+
+    /// Shared filesystem path to the Linux openshell-sandbox supervisor binary.
+    #[arg(long, env = "OPENSHELL_SLURM_SUPERVISOR_BIN")]
+    slurm_supervisor_bin: Option<PathBuf>,
+
+    /// Extra argument passed to sbatch. May be repeated.
+    #[arg(long, env = "OPENSHELL_SLURM_EXTRA_SBATCH_ARG")]
+    slurm_extra_sbatch_arg: Vec<String>,
+
+    /// Extra argument passed to srun inside the generated batch script. May be repeated.
+    #[arg(long, env = "OPENSHELL_SLURM_EXTRA_SRUN_ARG")]
+    slurm_extra_srun_arg: Vec<String>,
+
+    /// Extra argument passed to apptainer exec inside the generated batch script. May be repeated.
+    #[arg(long, env = "OPENSHELL_SLURM_EXTRA_APPTAINER_ARG")]
+    slurm_extra_apptainer_arg: Vec<String>,
+
+    /// Slurm GRES resource name used when --gpu is requested.
+    #[arg(
+        long,
+        env = "OPENSHELL_SLURM_GPU_RESOURCE",
+        default_value_t = SlurmComputeConfig::default_gpu_resource()
+    )]
+    slurm_gpu_resource: String,
+
+    /// CA certificate bind-mounted into Slurm Apptainer sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_SLURM_TLS_CA")]
+    slurm_tls_ca: Option<PathBuf>,
+
+    /// Client certificate bind-mounted into Slurm Apptainer sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_SLURM_TLS_CERT")]
+    slurm_tls_cert: Option<PathBuf>,
+
+    /// Client private key bind-mounted into Slurm Apptainer sandboxes for gateway mTLS.
+    #[arg(long, env = "OPENSHELL_SLURM_TLS_KEY")]
+    slurm_tls_key: Option<PathBuf>,
 
     /// Enable Kubernetes user namespace isolation (hostUsers: false) for
     /// sandbox pods.
@@ -475,6 +544,34 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         network_name: args.docker_network_name,
     };
 
+    let slurm_config = SlurmComputeConfig {
+        work_dir: args.slurm_work_dir,
+        default_image: config.sandbox_image.clone(),
+        grpc_endpoint: config.grpc_endpoint.clone(),
+        partition: args.slurm_partition,
+        account: args.slurm_account,
+        qos: args.slurm_qos,
+        time_limit: args.slurm_time_limit,
+        apptainer_bin: args.slurm_apptainer_bin,
+        supervisor_bin: args.slurm_supervisor_bin.unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(|parent| parent.join("openshell-sandbox")))
+                .unwrap_or_else(|| PathBuf::from("openshell-sandbox"))
+        }),
+        sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+        ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+        ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+        log_level: config.log_level.clone(),
+        extra_sbatch_args: args.slurm_extra_sbatch_arg,
+        extra_srun_args: args.slurm_extra_srun_arg,
+        extra_apptainer_args: args.slurm_extra_apptainer_arg,
+        gpu_resource: args.slurm_gpu_resource,
+        guest_tls_ca: args.slurm_tls_ca,
+        guest_tls_cert: args.slurm_tls_cert,
+        guest_tls_key: args.slurm_tls_key,
+    };
+
     if args.disable_tls {
         info!("TLS disabled — listening on plaintext HTTP");
     } else if args.disable_gateway_auth {
@@ -483,9 +580,15 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
-    run_server(config, vm_config, docker_config, tracing_log_bus)
-        .await
-        .into_diagnostic()
+    run_server(
+        config,
+        vm_config,
+        docker_config,
+        slurm_config,
+        tracing_log_bus,
+    )
+    .await
+    .into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
