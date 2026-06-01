@@ -365,18 +365,6 @@ download_release_asset() {
     return 0
   fi
 
-  # GitHub normalizes `~` to `.` in release asset names, while checksum files
-  # can still record package filenames with `~dev` for correct version ordering.
-  # Download the normalized asset but verify it against the checksum entry for
-  # the original package filename.
-  _normalized="$(printf '%s' "$_filename" | tr '~' '.')"
-  if [ "$_normalized" != "$_filename" ]; then
-    if download "${GITHUB_URL}/releases/download/${_tag}/${_normalized}" "$_output"; then
-      info "using GitHub-normalized asset name ${_normalized}"
-      return 0
-    fi
-  fi
-
   return 1
 }
 
