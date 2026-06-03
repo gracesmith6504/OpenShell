@@ -86,10 +86,6 @@ fn driver_gpu_requirement(spec: &SandboxSpec) -> Option<&DriverGpuResourceRequir
         .and_then(|requirements| requirements.gpu.as_ref())
 }
 
-fn gpu_has_explicit_device_ids(gpu: Option<&DriverGpuResourceRequirement>) -> bool {
-    gpu.is_some_and(|gpu| !gpu.device_ids.is_empty())
-}
-
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
 // ---------------------------------------------------------------------------
@@ -222,11 +218,6 @@ impl KubernetesComputeDriver {
         &self,
         gpu: Option<&DriverGpuResourceRequirement>,
     ) -> Result<(), tonic::Status> {
-        if gpu_has_explicit_device_ids(gpu) {
-            return Err(tonic::Status::invalid_argument(
-                "kubernetes compute driver does not support explicit GPU device IDs",
-            ));
-        }
         if gpu.is_some()
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
@@ -319,14 +310,6 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
-        if let Some(gpu) = sandbox.spec.as_ref().and_then(driver_gpu_requirement)
-            && gpu_has_explicit_device_ids(Some(gpu))
-        {
-            return Err(KubernetesDriverError::Precondition(
-                "kubernetes compute driver does not support explicit GPU device IDs".to_string(),
-            ));
-        }
-
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -1724,10 +1707,7 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn gpu_request(count: Option<u32>) -> DriverGpuResourceRequirement {
-        DriverGpuResourceRequirement {
-            device_ids: vec![],
-            count,
-        }
+        DriverGpuResourceRequirement { count }
     }
 
     #[test]
@@ -2075,23 +2055,6 @@ mod tests {
             pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
             serde_json::json!("2")
         );
-    }
-
-    #[test]
-    fn gpu_has_explicit_device_ids_only_when_ids_are_present() {
-        assert!(!gpu_has_explicit_device_ids(None));
-        assert!(!gpu_has_explicit_device_ids(Some(
-            &DriverGpuResourceRequirement {
-                device_ids: vec![],
-                count: None,
-            }
-        )));
-        assert!(gpu_has_explicit_device_ids(Some(
-            &DriverGpuResourceRequirement {
-                device_ids: vec!["nvidia.com/gpu=0".to_string()],
-                count: None,
-            }
-        )));
     }
 
     #[test]

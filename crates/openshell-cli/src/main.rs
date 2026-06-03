@@ -1215,8 +1215,8 @@ enum SandboxCommands {
 
         /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
         /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
-        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long, requires = "gpu", conflicts_with = "gpu_count")]
+        /// When omitted with --gpu, the driver uses its default GPU selection.
+        #[arg(long, conflicts_with = "gpu_count")]
         gpu_device: Option<String>,
 
         /// Request a specific number of GPUs. Mutually exclusive with --gpu-device.
@@ -4318,6 +4318,32 @@ mod tests {
             result.is_err(),
             "sandbox create --gpu-count 0 should be rejected"
         );
+    }
+
+    #[test]
+    fn sandbox_create_gpu_device_parses_without_gpu_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu-device",
+            "nvidia.com/gpu=0",
+        ])
+        .expect("sandbox create --gpu-device should parse without --gpu");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        gpu, gpu_device, ..
+                    }),
+                ..
+            }) => {
+                assert!(!gpu);
+                assert_eq!(gpu_device.as_deref(), Some("nvidia.com/gpu=0"));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
     }
 
     #[test]

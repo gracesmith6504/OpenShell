@@ -42,7 +42,11 @@ but currently ignores them.
 
 GPU requests enter the driver layer through
 `SandboxSpec.resource_requirements.gpu`. The compact interim shape supports a
-default GPU request, GPU count, and driver-specific device IDs.
+default GPU request and GPU count. Exact driver-native device selection is
+passed through the selected runtime's `driver_config` block; the gateway
+selects that block but does not interpret the nested driver schema. Drivers
+that support exact selection validate that the unique `gpu_device_ids` entry
+count matches the portable GPU count.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
@@ -81,9 +85,7 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection. GPU requests can include explicit
-driver-native device IDs or a requested count; the gateway validates the public
-request shape and each runtime enforces the GPU allocation modes it supports.
+runtime still owns GPU device injection.
 
 ## Deployment Shape
 

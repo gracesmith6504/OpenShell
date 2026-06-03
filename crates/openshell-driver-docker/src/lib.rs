@@ -25,7 +25,7 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
 };
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{cdi_gpu_device_ids, validate_gpu_device_ids_count};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -375,7 +375,14 @@ impl DockerComputeDriver {
                 "docker sandboxes require a template image",
             ));
         }
-        Self::validate_gpu_request(driver_gpu_requirement(spec), config.supports_gpu)?;
+        let gpu_device_ids =
+            docker_gpu_device_ids_from_driver_config(template.driver_config.as_ref())
+                .map_err(Status::invalid_argument)?;
+        Self::validate_gpu_request(
+            driver_gpu_requirement(spec),
+            &gpu_device_ids,
+            config.supports_gpu,
+        )?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
@@ -411,9 +418,24 @@ impl DockerComputeDriver {
 
     fn validate_gpu_request(
         gpu: Option<&DriverGpuResourceRequirement>,
+        gpu_device_ids: &[String],
         supports_gpu: bool,
     ) -> Result<(), Status> {
-        if gpu.is_some_and(|gpu| gpu.count.is_some()) {
+        if gpu.is_none() && !gpu_device_ids.is_empty() {
+            return Err(Status::invalid_argument(
+                "template.driver_config.gpu_device_ids requires resource_requirements.gpu.count",
+            ));
+        }
+        if let Some(gpu) = gpu
+            && gpu.count == Some(0)
+        {
+            return Err(Status::invalid_argument(
+                "resource_requirements.gpu.count must be greater than 0",
+            ));
+        }
+        if !gpu_device_ids.is_empty() {
+            validate_gpu_device_ids_count(gpu, gpu_device_ids).map_err(Status::invalid_argument)?;
+        } else if gpu.is_some_and(|gpu| gpu.count.is_some()) {
             return Err(Status::invalid_argument(
                 "docker compute driver does not support GPU count requests",
             ));
@@ -1729,10 +1751,44 @@ fn driver_gpu_requirement(
         .and_then(|requirements| requirements.gpu.as_ref())
 }
 
+fn docker_gpu_device_ids_from_driver_config(
+    driver_config: Option<&prost_types::Struct>,
+) -> Result<Vec<String>, String> {
+    use prost_types::value::Kind;
+
+    let Some(config) = driver_config else {
+        return Ok(Vec::new());
+    };
+    if config.fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(value) = config.fields.get("gpu_device_ids") else {
+        return Ok(Vec::new());
+    };
+    let Some(Kind::ListValue(list)) = value.kind.as_ref() else {
+        return Err("driver_config.gpu_device_ids must be a list of strings".to_string());
+    };
+
+    list.values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| match value.kind.as_ref() {
+            Some(Kind::StringValue(device_id)) if !device_id.trim().is_empty() => {
+                Ok(device_id.clone())
+            }
+            _ => Err(format!(
+                "driver_config.gpu_device_ids[{idx}] must be a non-empty string"
+            )),
+        })
+        .collect()
+}
+
 fn docker_gpu_device_requests(
     gpu: Option<&DriverGpuResourceRequirement>,
+    gpu_device_ids: &[String],
 ) -> Option<Vec<DeviceRequest>> {
-    cdi_gpu_device_ids(gpu).map(|device_ids| {
+    cdi_gpu_device_ids(gpu, gpu_device_ids).map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
             device_ids: Some(device_ids),
@@ -1754,6 +1810,8 @@ fn build_container_create_body(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
+    let gpu_device_ids = docker_gpu_device_ids_from_driver_config(template.driver_config.as_ref())
+        .map_err(Status::invalid_argument)?;
     let mut labels = template.labels.clone();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
@@ -1783,7 +1841,10 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
-            device_requests: docker_gpu_device_requests(driver_gpu_requirement(spec)),
+            device_requests: docker_gpu_device_requests(
+                driver_gpu_requirement(spec),
+                &gpu_device_ids,
+            ),
             binds: Some(build_binds(sandbox, config)?),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

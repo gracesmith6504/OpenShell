@@ -133,7 +133,7 @@ pub(super) fn validate_sandbox_spec(
 
     // --- spec.resource_requirements ---
     if let Some(ref requirements) = spec.resource_requirements {
-        validate_resource_requirements(requirements)?;
+        validate_resource_requirements(*requirements)?;
     }
 
     // --- spec.policy serialized size ---
@@ -150,22 +150,17 @@ pub(super) fn validate_sandbox_spec(
 }
 
 fn validate_resource_requirements(
-    requirements: &openshell_core::proto::SandboxResourceRequirements,
+    requirements: openshell_core::proto::SandboxResourceRequirements,
 ) -> Result<(), Status> {
-    if let Some(ref gpu) = requirements.gpu {
+    if let Some(gpu) = requirements.gpu {
         validate_gpu_requirement(gpu)?;
     }
     Ok(())
 }
 
 fn validate_gpu_requirement(
-    gpu: &openshell_core::proto::GpuResourceRequirement,
+    gpu: openshell_core::proto::GpuResourceRequirement,
 ) -> Result<(), Status> {
-    if gpu.count.is_some() && !gpu.device_ids.is_empty() {
-        return Err(Status::invalid_argument(
-            "resource_requirements.gpu.count is mutually exclusive with resource_requirements.gpu.device_ids",
-        ));
-    }
     if gpu.count == Some(0) {
         return Err(Status::invalid_argument(
             "resource_requirements.gpu.count must be greater than 0",
@@ -227,6 +222,14 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
                 "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
+    if let Some(ref s) = tmpl.driver_config {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
     }
@@ -691,7 +694,10 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{GpuResourceRequirement, SandboxResourceRequirements, SandboxSpec};
+    use openshell_core::proto::{
+        GpuResourceRequirement, SandboxResourceRequirements, SandboxSpec, SandboxTemplate,
+    };
+    use prost_types::{Struct, Value, value::Kind};
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -718,10 +724,7 @@ mod tests {
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
             resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec![],
-                    count: None,
-                }),
+                gpu: Some(GpuResourceRequirement { count: None }),
             }),
             ..Default::default()
         };
@@ -732,10 +735,7 @@ mod tests {
     fn validate_sandbox_spec_accepts_gpu_count() {
         let spec = SandboxSpec {
             resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec![],
-                    count: Some(2),
-                }),
+                gpu: Some(GpuResourceRequirement { count: Some(2) }),
             }),
             ..Default::default()
         };
@@ -746,10 +746,7 @@ mod tests {
     fn validate_sandbox_spec_rejects_zero_gpu_count() {
         let spec = SandboxSpec {
             resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec![],
-                    count: Some(0),
-                }),
+                gpu: Some(GpuResourceRequirement { count: Some(0) }),
             }),
             ..Default::default()
         };
@@ -761,21 +758,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_sandbox_spec_rejects_gpu_count_with_device_id() {
+    fn validate_sandbox_spec_accepts_driver_config() {
         let spec = SandboxSpec {
-            resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
-                    count: Some(1),
+            template: Some(SandboxTemplate {
+                driver_config: Some(Struct {
+                    fields: std::iter::once((
+                        "docker".to_string(),
+                        Value {
+                            kind: Some(Kind::StructValue(Struct::default())),
+                        },
+                    ))
+                    .collect(),
                 }),
+                ..Default::default()
             }),
             ..Default::default()
         };
 
-        let err = validate_sandbox_spec("gpu-count-sandbox", &spec).unwrap_err();
-
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("mutually exclusive"));
+        assert!(validate_sandbox_spec("driver-config-sandbox", &spec).is_ok());
     }
 
     #[test]

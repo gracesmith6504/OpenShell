@@ -922,15 +922,23 @@ async fn sandbox_create_sends_gpu_count_request() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let gpu = requests[0]
+    let spec = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
+        .expect("sandbox spec should be sent");
+    let gpu = spec
+        .resource_requirements
+        .as_ref()
         .and_then(|requirements| requirements.gpu.as_ref())
         .expect("GPU request should be sent");
 
-    assert!(gpu.device_ids.is_empty());
     assert_eq!(gpu.count, Some(2));
+    assert!(
+        spec.template
+            .as_ref()
+            .and_then(|template| template.driver_config.as_ref())
+            .is_none()
+    );
 }
 
 #[tokio::test]

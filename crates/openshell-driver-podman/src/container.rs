@@ -379,17 +379,57 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let gpu = sandbox.spec.as_ref().and_then(|spec| {
+    let spec = sandbox.spec.as_ref();
+    let gpu = spec.and_then(|spec| {
         spec.resource_requirements
             .as_ref()
             .and_then(|requirements| requirements.gpu.as_ref())
     });
-    cdi_gpu_device_ids(gpu).map(|device_ids| {
+    let gpu_device_ids = spec
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| {
+            gpu_device_ids_from_driver_config(template.driver_config.as_ref()).ok()
+        })
+        .unwrap_or_default();
+    cdi_gpu_device_ids(gpu, &gpu_device_ids).map(|device_ids| {
         device_ids
             .into_iter()
             .map(|path| LinuxDevice { path })
             .collect()
     })
+}
+
+pub fn gpu_device_ids_from_driver_config(
+    driver_config: Option<&prost_types::Struct>,
+) -> Result<Vec<String>, String> {
+    use prost_types::value::Kind;
+
+    let Some(config) = driver_config else {
+        return Ok(Vec::new());
+    };
+    if config.fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(value) = config.fields.get("gpu_device_ids") else {
+        return Ok(Vec::new());
+    };
+    let Some(Kind::ListValue(list)) = value.kind.as_ref() else {
+        return Err("driver_config.gpu_device_ids must be a list of strings".to_string());
+    };
+
+    list.values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| match value.kind.as_ref() {
+            Some(Kind::StringValue(device_id)) if !device_id.trim().is_empty() => {
+                Ok(device_id.clone())
+            }
+            _ => Err(format!(
+                "driver_config.gpu_device_ids[{idx}] must be a non-empty string"
+            )),
+        })
+        .collect()
 }
 
 /// Build the Podman container creation JSON spec.
@@ -703,6 +743,60 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    fn gpu_device_ids_driver_config(device_ids: &[&str]) -> prost_types::Struct {
+        use prost_types::{ListValue, Struct, Value, value::Kind};
+
+        Struct {
+            fields: std::iter::once((
+                "gpu_device_ids".to_string(),
+                Value {
+                    kind: Some(Kind::ListValue(ListValue {
+                        values: device_ids
+                            .iter()
+                            .map(|device_id| Value {
+                                kind: Some(Kind::StringValue((*device_id).to_string())),
+                            })
+                            .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn gpu_device_ids_from_driver_config_ignores_unrelated_fields() {
+        use prost_types::{ListValue, Struct, Value, value::Kind};
+
+        let config = Struct {
+            fields: [
+                (
+                    "gpu_device_ids".to_string(),
+                    Value {
+                        kind: Some(Kind::ListValue(ListValue {
+                            values: vec![Value {
+                                kind: Some(Kind::StringValue("nvidia.com/gpu=0".to_string())),
+                            }],
+                        })),
+                    },
+                ),
+                (
+                    "future_field".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("ignored".to_string())),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        assert_eq!(
+            gpu_device_ids_from_driver_config(Some(&config)).unwrap(),
+            vec!["nvidia.com/gpu=0".to_string()]
+        );
+    }
+
     #[test]
     fn parse_cpu_millicore() {
         assert_eq!(parse_cpu_to_microseconds("500m"), Some(50_000));
@@ -819,10 +913,7 @@ mod tests {
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             resource_requirements: Some(DriverSandboxResourceRequirements {
-                gpu: Some(DriverGpuResourceRequirement {
-                    device_ids: vec![],
-                    count: None,
-                }),
+                gpu: Some(DriverGpuResourceRequirement { count: None }),
             }),
             ..Default::default()
         });
@@ -839,15 +930,17 @@ mod tests {
     fn container_spec_passes_explicit_cdi_device_id_through() {
         use openshell_core::proto::compute::v1::{
             DriverGpuResourceRequirement, DriverSandboxResourceRequirements, DriverSandboxSpec,
+            DriverSandboxTemplate,
         };
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(gpu_device_ids_driver_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
             resource_requirements: Some(DriverSandboxResourceRequirements {
-                gpu: Some(DriverGpuResourceRequirement {
-                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
-                    count: None,
-                }),
+                gpu: Some(DriverGpuResourceRequirement { count: Some(1) }),
             }),
             ..Default::default()
         });

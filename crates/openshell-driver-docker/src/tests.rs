@@ -24,13 +24,64 @@ use tempfile::TempDir;
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn gpu_resource_requirements(
-    device_ids: Vec<String>,
-    count: Option<u32>,
-) -> DriverSandboxResourceRequirements {
+fn gpu_resource_requirements(count: Option<u32>) -> DriverSandboxResourceRequirements {
     DriverSandboxResourceRequirements {
-        gpu: Some(DriverGpuResourceRequirement { device_ids, count }),
+        gpu: Some(DriverGpuResourceRequirement { count }),
     }
+}
+
+fn gpu_device_ids_driver_config(device_ids: &[&str]) -> prost_types::Struct {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+
+    Struct {
+        fields: std::iter::once((
+            "gpu_device_ids".to_string(),
+            Value {
+                kind: Some(Kind::ListValue(ListValue {
+                    values: device_ids
+                        .iter()
+                        .map(|device_id| Value {
+                            kind: Some(Kind::StringValue((*device_id).to_string())),
+                        })
+                        .collect(),
+                })),
+            },
+        ))
+        .collect(),
+    }
+}
+
+#[test]
+fn docker_gpu_device_ids_from_driver_config_ignores_unrelated_fields() {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+
+    let config = Struct {
+        fields: [
+            (
+                "gpu_device_ids".to_string(),
+                Value {
+                    kind: Some(Kind::ListValue(ListValue {
+                        values: vec![Value {
+                            kind: Some(Kind::StringValue("nvidia.com/gpu=0".to_string())),
+                        }],
+                    })),
+                },
+            ),
+            (
+                "future_field".to_string(),
+                Value {
+                    kind: Some(Kind::StringValue("ignored".to_string())),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    assert_eq!(
+        docker_gpu_device_ids_from_driver_config(Some(&config)).unwrap(),
+        vec!["nvidia.com/gpu=0".to_string()]
+    );
 }
 
 fn test_sandbox() -> DriverSandbox {
@@ -51,6 +102,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 resources: None,
                 platform_config: None,
+                driver_config: None,
             }),
             sandbox_token: String::new(),
             resource_requirements: None,
@@ -401,6 +453,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_limit: String::new(),
         }),
         platform_config: None,
+        driver_config: None,
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -421,6 +474,7 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
             ..Default::default()
         }),
         platform_config: None,
+        driver_config: None,
     };
 
     let limits = docker_resource_limits(&template).unwrap();
@@ -614,8 +668,7 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().resource_requirements =
-        Some(gpu_resource_requirements(vec![], None));
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resource_requirements(None));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
@@ -628,13 +681,78 @@ fn validate_sandbox_rejects_gpu_count() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().resource_requirements =
-        Some(gpu_resource_requirements(vec![], Some(2)));
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resource_requirements(Some(2)));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("does not support GPU count"));
+}
+
+#[test]
+fn validate_sandbox_accepts_gpu_count_with_matching_device_ids() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resource_requirements(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(gpu_device_ids_driver_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap();
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_device_ids_without_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resource_requirements(None));
+    spec.template.as_mut().unwrap().driver_config =
+        Some(gpu_device_ids_driver_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("requires resource_requirements.gpu.count")
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_device_ids_with_zero_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resource_requirements(Some(0)));
+    spec.template.as_mut().unwrap().driver_config =
+        Some(gpu_device_ids_driver_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("must be greater than 0"));
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_device_ids_count_mismatch() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resource_requirements(Some(2)));
+    spec.template.as_mut().unwrap().driver_config =
+        Some(gpu_device_ids_driver_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("unique entry count"));
 }
 
 #[test]
@@ -664,8 +782,7 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().resource_requirements =
-        Some(gpu_resource_requirements(vec![], None));
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resource_requirements(None));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -683,17 +800,16 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
 }
 
 #[test]
-fn build_container_create_body_passes_explicit_cdi_device_ids_through() {
+fn build_container_create_body_passes_explicit_gpu_device_ids_through() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resource_requirements(
-        vec![
-            "nvidia.com/gpu=0".to_string(),
-            "nvidia.com/gpu=1".to_string(),
-        ],
-        None,
-    ));
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resource_requirements(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(gpu_device_ids_driver_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body

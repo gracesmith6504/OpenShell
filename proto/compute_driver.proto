@@ -100,14 +100,14 @@ message DriverSandboxResourceRequirements {
   DriverGpuResourceRequirement gpu = 1;
 }
 
-// Driver-owned GPU resource requirement. Device identifiers are interpreted by
-// the selected compute driver and are an interim compatibility surface.
+// Driver-owned GPU resource requirement.
 message DriverGpuResourceRequirement {
-  // Optional number of GPUs requested. Mutually exclusive with device_ids.
+  reserved 2;
+  reserved "device_ids";
+
+  // Optional number of GPUs requested. When unset, presence means the driver
+  // chooses its default GPU assignment behavior.
   optional uint32 count = 1;
-  // Optional driver-native device identifiers. Mutually exclusive with count.
-  // Empty means the driver chooses its default GPU assignment behavior.
-  repeated string device_ids = 2;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
@@ -133,6 +133,9 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Caller-provided config for the selected driver only. This is the inner
+  // block from public SandboxTemplate.driver_config after gateway selection.
+  google.protobuf.Struct driver_config = 12;
 }
 
 // Typed compute-resource requirements.

@@ -10,6 +10,7 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
+use openshell_core::gpu::validate_gpu_device_ids_count;
 use openshell_core::proto::compute::v1::{
     DriverGpuResourceRequirement, DriverSandbox, GetCapabilitiesResponse,
 };
@@ -282,14 +283,40 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
-        Self::validate_gpu_request(gpu)
+        let spec = sandbox.spec.as_ref();
+        let gpu = spec.and_then(driver_gpu_requirement);
+        let gpu_device_ids = spec
+            .and_then(|spec| spec.template.as_ref())
+            .map(|template| {
+                container::gpu_device_ids_from_driver_config(template.driver_config.as_ref())
+                    .map_err(ComputeDriverError::Precondition)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Self::validate_gpu_request(gpu, &gpu_device_ids)
     }
 
     fn validate_gpu_request(
         gpu: Option<&DriverGpuResourceRequirement>,
+        gpu_device_ids: &[String],
     ) -> Result<(), ComputeDriverError> {
-        if gpu.is_some_and(|gpu| gpu.count.is_some()) {
+        if gpu.is_none() && !gpu_device_ids.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "template.driver_config.gpu_device_ids requires resource_requirements.gpu.count"
+                    .to_string(),
+            ));
+        }
+        if let Some(gpu) = gpu
+            && gpu.count == Some(0)
+        {
+            return Err(ComputeDriverError::Precondition(
+                "resource_requirements.gpu.count must be greater than 0".to_string(),
+            ));
+        }
+        if !gpu_device_ids.is_empty() {
+            validate_gpu_device_ids_count(gpu, gpu_device_ids)
+                .map_err(ComputeDriverError::Precondition)?;
+        } else if gpu.is_some_and(|gpu| gpu.count.is_some()) {
             return Err(ComputeDriverError::Precondition(
                 "podman compute driver does not support GPU count requests".to_string(),
             ));
@@ -687,14 +714,59 @@ mod tests {
 
     #[test]
     fn validate_gpu_request_rejects_count() {
-        let err = PodmanComputeDriver::validate_gpu_request(Some(&DriverGpuResourceRequirement {
-            device_ids: vec![],
-            count: Some(2),
-        }))
+        let err = PodmanComputeDriver::validate_gpu_request(
+            Some(&DriverGpuResourceRequirement { count: Some(2) }),
+            &[],
+        )
         .expect_err("GPU count should be rejected");
 
         assert!(
             matches!(err, ComputeDriverError::Precondition(message) if message.contains("does not support GPU count"))
+        );
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_device_ids_without_count() {
+        let device_ids = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = PodmanComputeDriver::validate_gpu_request(
+            Some(&DriverGpuResourceRequirement { count: None }),
+            &device_ids,
+        )
+        .expect_err("device IDs without count should be rejected");
+
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(message) if message.contains("requires resource_requirements.gpu.count"))
+        );
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_device_ids_with_zero_count() {
+        let device_ids = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = PodmanComputeDriver::validate_gpu_request(
+            Some(&DriverGpuResourceRequirement { count: Some(0) }),
+            &device_ids,
+        )
+        .expect_err("device IDs with zero count should be rejected");
+
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(message) if message.contains("must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_device_id_count_mismatch() {
+        let device_ids = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = PodmanComputeDriver::validate_gpu_request(
+            Some(&DriverGpuResourceRequirement { count: Some(2) }),
+            &device_ids,
+        )
+        .expect_err("device ID count mismatch should be rejected");
+
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(message) if message.contains("unique entry count"))
         );
     }
 

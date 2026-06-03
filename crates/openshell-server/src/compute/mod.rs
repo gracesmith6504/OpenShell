@@ -426,7 +426,7 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox);
+        let driver_sandbox = driver_sandbox_from_public(sandbox, self.driver_kind)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -470,7 +470,7 @@ impl ComputeRuntime {
                 }
             })?;
 
-        let mut driver_sandbox = driver_sandbox_from_public(&sandbox);
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, self.driver_kind)?;
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -552,12 +552,11 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&id);
         self.cleanup_sandbox_owned_records(&sandbox).await;
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
         let deleted = self
             .driver
             .delete_sandbox(Request::new(DeleteSandboxRequest {
-                sandbox_id: driver_sandbox.id,
-                sandbox_name: driver_sandbox.name,
+                sandbox_id: sandbox.object_id().to_string(),
+                sandbox_name: sandbox.object_name().to_string(),
             }))
             .await
             .map(|response| response.into_inner().deleted)
@@ -1250,54 +1249,92 @@ impl ComputeRuntime {
     }
 }
 
-fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
-    DriverSandbox {
+#[allow(clippy::result_large_err)]
+fn driver_sandbox_from_public(
+    sandbox: &Sandbox,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandbox, Status> {
+    Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
         name: sandbox.object_name().to_string(),
         namespace: String::new(), // Namespace is set by the driver based on its config
-        spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
+        spec: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| driver_sandbox_spec_from_public(spec, driver_kind))
+            .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
-    }
+    })
 }
 
-fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
-    DriverSandboxSpec {
+#[allow(clippy::result_large_err)]
+fn driver_sandbox_spec_from_public(
+    spec: &SandboxSpec,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxSpec, Status> {
+    Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
         template: spec
             .template
             .as_ref()
-            .map(driver_sandbox_template_from_public),
+            .map(|template| driver_sandbox_template_from_public(template, driver_kind))
+            .transpose()?,
         resource_requirements: spec
             .resource_requirements
             .as_ref()
-            .map(driver_resource_requirements_from_public),
+            .map(|requirements| driver_resource_requirements_from_public(*requirements)),
         sandbox_token: String::new(),
-    }
+    })
 }
 
 fn driver_resource_requirements_from_public(
-    requirements: &openshell_core::proto::SandboxResourceRequirements,
+    requirements: openshell_core::proto::SandboxResourceRequirements,
 ) -> DriverSandboxResourceRequirements {
     DriverSandboxResourceRequirements {
         gpu: requirements
             .gpu
             .as_ref()
-            .map(|gpu| DriverGpuResourceRequirement {
-                device_ids: gpu.device_ids.clone(),
-                count: gpu.count,
-            }),
+            .map(|gpu| DriverGpuResourceRequirement { count: gpu.count }),
     }
 }
 
-fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
-    DriverSandboxTemplate {
+#[allow(clippy::result_large_err)]
+fn driver_sandbox_template_from_public(
+    template: &SandboxTemplate,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxTemplate, Status> {
+    Ok(DriverSandboxTemplate {
         image: template.image.clone(),
         agent_socket_path: template.agent_socket.clone(),
         labels: template.labels.clone(),
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        driver_config: select_driver_config(&template.driver_config, driver_kind)?,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn select_driver_config(
+    driver_config: &Option<prost_types::Struct>,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<Option<prost_types::Struct>, Status> {
+    let Some(driver_kind) = driver_kind else {
+        return Ok(None);
+    };
+    let Some(config) = driver_config.as_ref() else {
+        return Ok(None);
+    };
+    let Some(value) = config.fields.get(driver_kind.as_str()) else {
+        return Ok(None);
+    };
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StructValue(inner)) => Ok(Some(inner.clone())),
+        _ => Err(Status::invalid_argument(format!(
+            "template.driver_config.{} must be an object",
+            driver_kind.as_str()
+        ))),
     }
 }
 
@@ -1825,43 +1862,78 @@ mod tests {
     }
 
     #[test]
-    fn driver_sandbox_spec_from_public_preserves_gpu_request_device_ids() {
+    fn driver_sandbox_spec_from_public_selects_matching_driver_config_block() {
         let public = SandboxSpec {
-            resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
-                    count: None,
+            template: Some(SandboxTemplate {
+                driver_config: Some(prost_types::Struct {
+                    fields: [
+                        (
+                            "docker".to_string(),
+                            struct_value([(
+                                "gpu_device_ids",
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::ListValue(
+                                        prost_types::ListValue {
+                                            values: vec![string_value("nvidia.com/gpu=0")],
+                                        },
+                                    )),
+                                },
+                            )]),
+                        ),
+                        (
+                            "vm".to_string(),
+                            struct_value([(
+                                "gpu_device_ids",
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::ListValue(
+                                        prost_types::ListValue {
+                                            values: vec![string_value("0")],
+                                        },
+                                    )),
+                                },
+                            )]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
                 }),
+                ..Default::default()
             }),
             ..Default::default()
         };
 
-        let driver = driver_sandbox_spec_from_public(&public);
+        let driver =
+            driver_sandbox_spec_from_public(&public, Some(ComputeDriverKind::Docker)).unwrap();
 
-        assert_eq!(
-            driver
-                .resource_requirements
-                .expect("driver resource requirements should be present")
-                .gpu
-                .expect("driver GPU requirement should be present")
-                .device_ids,
-            vec!["nvidia.com/gpu=0".to_string()]
-        );
+        let config = driver
+            .template
+            .expect("driver template should be present")
+            .driver_config
+            .expect("driver config should be selected");
+        let device_ids = config
+            .fields
+            .get("gpu_device_ids")
+            .and_then(|value| match value.kind.as_ref() {
+                Some(prost_types::value::Kind::ListValue(list)) => list.values.first(),
+                _ => None,
+            })
+            .and_then(|value| match value.kind.as_ref() {
+                Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
+                _ => None,
+            });
+        assert_eq!(device_ids, Some("nvidia.com/gpu=0"));
     }
 
     #[test]
     fn driver_sandbox_spec_from_public_preserves_gpu_count() {
         let public = SandboxSpec {
             resource_requirements: Some(SandboxResourceRequirements {
-                gpu: Some(GpuResourceRequirement {
-                    device_ids: vec![],
-                    count: Some(2),
-                }),
+                gpu: Some(GpuResourceRequirement { count: Some(2) }),
             }),
             ..Default::default()
         };
 
-        let driver = driver_sandbox_spec_from_public(&public);
+        let driver = driver_sandbox_spec_from_public(&public, None).unwrap();
 
         assert_eq!(
             driver
@@ -2332,10 +2404,7 @@ mod tests {
             &mut status,
             Some(&SandboxSpec {
                 resource_requirements: Some(SandboxResourceRequirements {
-                    gpu: Some(GpuResourceRequirement {
-                        device_ids: vec![],
-                        count: None,
-                    }),
+                    gpu: Some(GpuResourceRequirement { count: None }),
                 }),
                 ..Default::default()
             }),
@@ -2644,10 +2713,7 @@ mod tests {
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(SandboxResourceRequirements {
-                    gpu: Some(GpuResourceRequirement {
-                        device_ids: vec![],
-                        count: None,
-                    }),
+                    gpu: Some(GpuResourceRequirement { count: None }),
                 }),
                 ..Default::default()
             }),
