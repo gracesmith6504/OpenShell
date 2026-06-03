@@ -73,7 +73,6 @@ network_policies:
     binaries:
       - { path: /usr/lib/node_modules/opencode-ai/bin/.opencode }
 
-# --- demo magic: interpreted by the redaction proxy, ignored by OpenShell ---
 content_policy:
   content_type:
     image: redact
