@@ -14,6 +14,8 @@ opencode (sandbox)
 
 The "demo magic": the proxy reads an OpenShell-style policy file (`policies/content-policy.yaml`) on **every** request. OpenShell itself does not interpret the `content_policy` block (that would need code changes) - only this proxy does. Flip one line and the next image request changes routing, no restart.
 
+**New here? Follow the step-by-step [WALKTHROUGH.md](WALKTHROUGH.md).** The sections below are the reference.
+
 ## Layout
 
 | Path | What |

@@ -44,9 +44,26 @@ sleep 6
 "${SSH[@]}" "curl -s -m 6 -o /dev/null -w 'sandbox web / = HTTP %{http_code}\n' http://127.0.0.1:${WEB_PORT}/" || true
 
 echo "== exposing web service via the gateway =="
-openshell service expose "$SANDBOX_NAME" "$WEB_PORT" "$SERVICE_NAME"
+EXPOSE_OUT="$(openshell service expose "$SANDBOX_NAME" "$WEB_PORT" "$SERVICE_NAME" 2>&1)"
+echo "$EXPOSE_OUT"
+
+# Pull the exposed URL out of the command output (grep stops at the ANSI reset).
+URL="$(printf '%s\n' "$EXPOSE_OUT" | grep -oE 'https?://[A-Za-z0-9.:/_-]+' | head -1)"
 
 echo
-echo "Done. Open the URL printed above (http://${SANDBOX_NAME}--${SERVICE_NAME}.openshell.localhost:<gateway-port>/)."
+if [ -n "$URL" ]; then
+  echo "Opening $URL"
+  if command -v open >/dev/null 2>&1; then
+    open "$URL"            # macOS
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$URL" >/dev/null 2>&1 &   # Linux
+  else
+    echo "(could not auto-open a browser - open the URL above manually)"
+  fi
+else
+  echo "Done. Open the URL printed above."
+fi
+
+echo
 echo "Verify the wiring:"
 echo "  ${SSH[*]} 'export HOME=/sandbox; cd /sandbox/workspace; opencode run --model inference-local/openai/openai/gpt-5.5 \"say hi\"'"
