@@ -42,7 +42,7 @@ The main `README.md` should stay relatively high-level. It should explain the pr
 - [done] Non-goals. Final set: model routing; general-purpose middleware framework; constraining/sandboxing the middleware itself; runtime management of middleware; guaranteeing detection correctness; support for multiple deployment modes.
 - [done] Proposal: architecture, hooks/placement, contract (+ proto sketch), registration/delivery, policy integration, ordering, metadata, audit/logging.
 - [done] Prior art (kept inline in the README, not a separate appendix).
-- [todo] Terminology.
+- [done] Terminology.
 - [todo] Implementation plan.
 - [todo] Risks.
 - [todo] Alternatives.
@@ -68,7 +68,7 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 
 ## Required RFC Pieces
 
-- [todo] Terminology: define `middleware`, `hook`, `egress`, `finding`, `metadata`, `transformation`, `registered middleware`, and `middleware config`. Decide whether `egress` needs an OpenShell-specific definition. Not yet written.
+- [done] Terminology: defines `egress` (OpenShell-specific: admitted, parsed request, not raw packets), `middleware`, `registered middleware`, `built-in middleware`, `hook`, `middleware config`, `capabilities`, `decision`, `transformation`, `finding`, `metadata`, `chain`. Placed between Non-goals and Proposal.
 - [done] Gateway configuration: operators register middleware via `[[openshell.proxy.middleware]]` (name + endpoint). Auth material and timeout defaults not yet fully specified.
 - [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. The `GetSandboxBundle` question is not yet explicitly resolved.
 - [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
@@ -114,7 +114,7 @@ Still open:
 
 ## Drafting Queue (next)
 
-- Write Terminology, Implementation plan, Risks, Alternatives, Open questions sections.
+- Write Implementation plan, Risks, Alternatives, Open questions sections.
 - Fill the pipeline-placement appendix from the real supervisor relay path.
 - Expand the request-response-contract and policy-integration appendices beyond the README sketches.
 - Write the failure-and-audit appendix (OCSF field mappings).
@@ -129,6 +129,7 @@ These need a home in the RFC - likely a "Limits and limitations" section plus co
 - **Content encoding (gzip).** Define how gzip/compressed HTTP request bodies are handled: does OpenShell decode before the hook, or does the middleware receive the encoded bytes and decode itself? Pick one and state it (also affects size-limit accounting: encoded vs decoded size).
 - **Chunked / slow-drip uploads.** How chunked transfer-encoding and slow "drip" uploads interact with buffering and timeouts. Note this is already a constraint for credential injection, which buffers the request today - document the existing behavior and whether middleware changes it.
 - **Opaque payloads (limitation).** Payloads that are zipped, otherwise encoded, or encrypted cannot be introspected. State explicitly that middleware can only act on content it can parse; opaque bodies cannot be inspected, so policy must decide whether such traffic is allowed through or denied.
+- **TLS-termination requirement (limitation).** Initially, middleware only runs on traffic OpenShell TLS-terminates and introspects at L7. If traffic is allowed at L4 and not TLS-terminated (e.g. opaque TCP/TLS passthrough), the hook is never invoked and the middleware is silently bypassed. State this explicitly and reconcile with the fail-closed stance: attaching middleware to an endpoint implies that endpoint must be L7-introspected, so policy cannot fall back to L4 to skip a required middleware.
 
 ## Framing
 

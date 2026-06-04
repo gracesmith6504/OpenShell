@@ -41,6 +41,23 @@ Beyond redaction, middleware also produces structured findings and metadata abou
 - **Guaranteeing detection correctness.** OpenShell places the hook and enforces the decision the middleware returns, but it does not guarantee that a middleware actually catches all sensitive content. Detection quality is the middleware's responsibility.
 - **Support for multiple deployment modes.** The first version commits to a single deployment shape: an externally managed middleware service. Other shapes such as WASM middleware, OpenShell-managed images, sidecars, and running the middleware inside its own sandbox are not designed in this RFC. They remain explicitly open for later evaluation rather than being baked into the initial contract. See [appendices/deployment-options.md](appendices/deployment-options.md).
 
+## Terminology
+
+This RFC uses the following terms with specific meanings.
+
+- **Egress.** An outbound request a sandbox sends to an upstream destination through the supervisor proxy. Middleware acts on the parsed request the supervisor has already admitted and is about to forward, not on raw packets or arbitrary network activity.
+- **Middleware.** A service that inspects, transforms, blocks, or annotates egress requests through the contract defined in this RFC. A middleware owns its detection and transformation logic and never makes the upstream call itself; the supervisor always owns the upstream call.
+- **Registered middleware.** A middleware an operator declares in gateway configuration as a name plus an endpoint. Registration is an administrative action that establishes which endpoints may receive raw request content; policy authors can then reference a registered middleware by name but cannot point traffic at an arbitrary endpoint.
+- **Built-in middleware.** A middleware that ships inside the supervisor binary and is served in-process over the same gRPC contract, with no network hop and no gateway registration. Built-in names are reserved with the `openshell-` prefix.
+- **Hook.** A defined point in the supervisor proxy flow where the supervisor invokes a middleware. This version defines a single hook, `request.before_upstream`, which runs after network and L7 policy admit a request and before credential injection and upstream forwarding. The design allows more hooks later.
+- **Middleware config.** The service-specific configuration fragment a policy supplies to a middleware. OpenShell does not interpret it; it passes the fragment to the middleware and relies on `ValidateConfig` to check it.
+- **Capabilities.** The self-description a middleware returns from `GetCapabilities`: its identity and version, the hooks it implements, and operational limits such as maximum body size and timeout. OpenShell validates that a registered middleware's capabilities support every policy that references it.
+- **Decision.** The allow-or-deny outcome a middleware returns for a request. `allow` lets the request proceed (possibly transformed); `deny` short-circuits it. This vocabulary matches the rest of the OpenShell policy system.
+- **Transformation.** A middleware returning replacement content, and any allowed header mutations, that the supervisor forwards in place of the original request. A later middleware in a chain sees the previous stage's transformed content.
+- **Finding.** A structured, audit-safe observation a middleware reports about a request, such as a label, count, and confidence. A finding never carries raw matched values, redacted spans, or the original sensitive content.
+- **Metadata.** Namespaced key/value annotations a middleware emits into a request-local bag for downstream consumers, such as a future model router. Metadata uses stable primitive types, never carries raw sensitive values, and is marked for where it may be used (audit, routing, or internal-only).
+- **Chain.** The ordered set of middleware that applies to a single request. Each middleware runs in turn, a later stage sees the previous stage's transformed content, a `deny` short-circuits the remaining stages, and each middleware runs at most once per request.
+
 ## Proposal
 
 The first version makes egress middleware concrete without prematurely standardizing every future deployment model. The chosen path is an externally managed middleware service: the operator runs the service, OpenShell routes selected egress through it, and the middleware returns a decision plus optional transformed content and metadata. This keeps the first iteration focused on the contract, failure behavior, and sandbox integration while leaving other deployment shapes open (see [appendices/deployment-options.md](appendices/deployment-options.md)).
