@@ -7,8 +7,8 @@ This tracker is the working document for drafting RFC 0005. Keep the main `READM
 - RFC folder: `rfc/0005-sandbox-egress-middleware/`
 - Branch: `rfc-0005-sandbox-egress-middleware`
 - Draft PR: https://github.com/NVIDIA/OpenShell/pull/1738
-- State: Proposal section drafted end to end. Done: Summary, Motivation, Use-case (Privacy Guard), Non-goals, Proposal (Architecture, Hooks and placement, Contract + proto sketch, Registration and delivery, Policy integration, Middleware ordering, Metadata, Audit and logging), Prior art.
-- Not yet written: Terminology, Implementation plan, Risks, Alternatives, Open questions (still placeholders), plus several appendices (see Planned Appendices).
+- State: README drafted end to end - Summary, Motivation, Use-case (Privacy Guard), Non-goals, Terminology, Proposal (all subsections), Prior art, Implementation plan, Risks, Alternatives, Open questions. Two supporting appendices kept (deployment-options, protocol-extensions); the four planned detail appendices were dropped with content inlined (see Planned Appendices).
+- Remaining: optional polish only - two missing diagrams (current proxy flow, configuration flow) and the minor notes at the end of this tracker.
 - GitHub roadmap issue: https://github.com/NVIDIA/OpenShell/issues/1043
 - GitHub RFC tracking issue: https://github.com/NVIDIA/OpenShell/issues/1733
 - Related model routing RFC issue: https://github.com/NVIDIA/OpenShell/issues/1734
@@ -52,11 +52,11 @@ The main `README.md` should stay relatively high-level. It should explain the pr
 
 - [done] `appendices/deployment-options.md`: external-service decision and future options (sandboxed middleware, WASM, managed image/sidecar).
 - [done] `appendices/protocol-extensions.md`: streaming (transport vs processing, 4 MB limit, now-or-never oneof), additional hooks, semantic context, content preview, portable capabilities, header rules. (Subsumes much of the old `future-extensions.md` idea.)
-- [todo] `appendices/request-response-contract.md`: full request/response schema, decision model, metadata fields, transformation semantics. (README has only a simplified sketch.)
-- [todo] `appendices/policy-integration.md`: full policy schema and composition with existing OPA/Rego evaluation.
-- [todo] `appendices/pipeline-placement.md`: exact placement in the supervisor relay path vs network/L7 policy and credential injection (credential handling is interleaved with L7 today; verify against real relay code).
-- [todo] `appendices/failure-and-audit.md`: fail-open/closed, timeout/retry, OCSF field mappings, sensitive-value handling.
-- Dropped: `appendices/prior-art.md` (prior art lives inline in the README). `appendices/future-extensions.md` folded into `protocol-extensions.md`.
+- Dropped: `appendices/request-response-contract.md` - the proto sketch in the README conveys the contract shape; full field-by-field schema is implementation-spec material, not design-decision material.
+- Dropped: `appendices/policy-integration.md` - the worked YAML example + chain/ordering prose cover the surface; OPA/Rego composition reduced to one inline sentence in Policy integration.
+- Dropped: `appendices/pipeline-placement.md` - the load-bearing claim (hook runs before credential injection) is now an inline note in Hooks and placement, grounded in the real relay path.
+- Dropped: `appendices/failure-and-audit.md` - OCSF field mappings are implementation detail; the load-bearing mechanics (over-cap = on_error, rate-limiting ownership) moved into Risks, and gzip/chunked moved into Open questions.
+- Dropped earlier: `appendices/prior-art.md` (prior art lives inline in the README). `appendices/future-extensions.md` folded into `protocol-extensions.md`.
 
 ## Visuals To Include
 
@@ -72,11 +72,11 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 - [done] Gateway configuration: operators register middleware via `[[openshell.proxy.middleware]]` (name + endpoint). Auth material and timeout defaults not yet fully specified.
 - [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. Exact delivery shape still open - extend `GetSandboxConfig` / `SandboxPolicy` or add a `GetInferenceBundle`-style bundle RPC (see open question below).
 - [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
-- [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list deferred to the request-response-contract appendix.
+- [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list settled during implementation (request-response-contract appendix dropped).
 - [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{outcome, body}`).
 - [done] Policy shape + middleware section: top-level `network_middlewares` list referenced by `middleware: [...]` on network policies; chains; `on_error`.
 - [done] Failure behavior: `on_error` per middleware, fail-closed by default; capability validation fails the config load.
-- [done] Audit/logging: OCSF categories (HttpActivity, DetectionFinding, ConfigStateChange) + safety rules. Field mappings deferred to failure-and-audit appendix.
+- [done] Audit/logging: OCSF categories (HttpActivity, DetectionFinding, ConfigStateChange) + safety rules. Field mappings are an implementation detail (failure-and-audit appendix dropped).
 - [done] Model routing handoff: metadata section; router out of scope (#1734).
 
 ## Decisions
@@ -114,17 +114,14 @@ Still open:
 
 ## Drafting Queue (next)
 
-- Open questions section written (HTTP scope, delivery path, mandatory capability discovery, two-selector overlap, metadata namespacing). Remaining mechanics (gzip, chunked uploads) deferred to the failure-and-audit appendix.
-- Fill the pipeline-placement appendix from the real supervisor relay path.
-- Expand the request-response-contract and policy-integration appendices beyond the README sketches.
-- Write the failure-and-audit appendix (OCSF field mappings).
-- Decide and document the "research preview" framing (see below).
+- Main README is drafted end to end and all four planned detail appendices were dropped (see Planned Appendices). Inline notes absorbed the load-bearing content (placement, policy composition, over-cap behavior, rate limiting, gzip/chunked).
+- Remaining optional polish: the two missing diagrams (current proxy flow, configuration flow); whether to add the "research preview" term to the Summary; the minor notes below.
 
 ## Limits, failure modes, and limitations (to cover)
 
 These need a home in the RFC - likely a "Limits and limitations" section plus content in Risks and the failure-and-audit appendix.
 
-Status: the Risks section now covers the high-level framing of limits/timeouts, fail-closed, body buffering, opaque payloads, and the TLS-termination gap. Still to do: gzip/content-encoding handling, chunked/slow-drip uploads, explicit rate-limiting statement, and the detailed mechanics (defaults, `max_body_bytes`, OCSF field mappings) in the failure-and-audit appendix. Decide whether a dedicated "Limits and limitations" section is still warranted or whether Risks + appendix suffice.
+Status: homed inline rather than in a dedicated section or appendix. Risks now covers limits/timeouts, fail-closed, body buffering + explicit over-cap = `on_error` behavior, rate-limiting ownership, opaque payloads, and the TLS-termination gap. Open questions covers gzip/content-encoding and chunked/slow-drip uploads. Remaining mechanics (exact defaults, `max_body_bytes` accounting, OCSF field mappings) are implementation details, not RFC content. No dedicated "Limits and limitations" section was added.
 
 - **Limits and timeouts.** Define how request size limits and call timeouts are enforced and by whom. Core tension to capture: rejecting an over-limit request can break sandbox workloads (e.g. inference calls whose context grows each turn until it exceeds the cap), but allowing it through unprocessed means content that should have been redacted egresses anyway. Decide the default and whether it is policy-configurable (ties into the `on_error` / over-cap skip behavior). Reconcile with the proxy's current 256 KiB buffering cap and the capability `max_body_bytes`.
 - **Failure modes / rate limiting.** The middleware service is responsible for its own rate limiting; OpenShell does not rate limit middleware calls. Document this, plus behavior when the middleware is overloaded or unavailable (fail-closed by default).
