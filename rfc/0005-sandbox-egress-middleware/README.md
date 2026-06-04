@@ -164,15 +164,6 @@ message Verdict {
   repeated Finding finding = 5;         // labels, counts, confidence
 }
 
-message ProcessResponse {
-  Decision decision = 1;                // ALLOW or DENY
-  bytes body = 2;                       // replacement content when transformed
-  map<string, string> set_headers = 3;  // subject to an OpenShell allow-list
-  string deny_reason = 4;               // safe, machine-readable
-  map<string, string> metadata = 5;     // namespaced, no raw values
-  repeated Finding finding = 6;         // labels, counts, confidence
-}
-
 enum Decision {
   DECISION_UNSPECIFIED = 0;
   ALLOW = 1;

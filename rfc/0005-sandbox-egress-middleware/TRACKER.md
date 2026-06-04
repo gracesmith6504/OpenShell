@@ -4,19 +4,31 @@ This tracker is the working document for drafting RFC 0005. Keep the main `READM
 
 ## Current Status
 
-- RFC folder created: `rfc/0005-sandbox-egress-middleware/`
-- Main RFC draft: `rfc/0005-sandbox-egress-middleware/README.md`
-- State: high-level draft scaffold
+- RFC folder: `rfc/0005-sandbox-egress-middleware/`
+- Branch: `rfc-0005-sandbox-egress-middleware`
+- Draft PR: https://github.com/NVIDIA/OpenShell/pull/1738
+- State: Proposal section drafted end to end. Done: Summary, Motivation, Use-case (Privacy Guard), Non-goals, Proposal (Architecture, Hooks and placement, Contract + proto sketch, Registration and delivery, Policy integration, Middleware ordering, Metadata, Audit and logging), Prior art.
+- Not yet written: Terminology, Implementation plan, Risks, Alternatives, Open questions (still placeholders), plus several appendices (see Planned Appendices).
 - GitHub roadmap issue: https://github.com/NVIDIA/OpenShell/issues/1043
 - GitHub RFC tracking issue: https://github.com/NVIDIA/OpenShell/issues/1733
 - Related model routing RFC issue: https://github.com/NVIDIA/OpenShell/issues/1734
+- Note: RFC number `0005` collides with `rfc/0005-privacy-guard/` (and `0002` is also duplicated). PR proposes reserving numbers / allowing gaps. Renumber if that lands.
 
 ## Research Content
 
 - Active research notes live in `rfc/0005-privacy-guard/research-notes/`.
 - Archived material lives in `rfc/0005-privacy-guard/do-not-read-unless-requested/`.
 - Treat the archived material as opt-in context only. Do not pull from it unless a specific question requires it.
-- As research gets incorporated, add a short note here that identifies which source informed which section or appendix.
+
+Sources incorporated so far:
+
+- `context.md` -> Motivation, operator/user trust split, registration-vs-policy split.
+- `e2e-example.md` -> gateway TOML (`[[openshell.proxy.middleware]]`), `network_middlewares` policy example, chain ordering.
+- `pre-rfc-interface.md` -> hook placement (`request.before_upstream`), contract shape, capability fields, failure semantics, OCSF inputs.
+- `pre-rfc-registration.md` -> registration model, gRPC/TLS transport choice, validation timing.
+- `pre-rfc-policy-configuration.md` -> reusable middleware policy layer, `on_error`, operator/user control.
+- `review-01.md` -> gRPC-vs-REST rationale, ext_proc/go-plugin/CSI prior art, streaming + Wasm alternatives.
+- `thought-01.md` -> capability model and the (now superseded) single-middleware decision; chains are in v1.
 
 ## Intended RFC Shape
 
@@ -24,26 +36,27 @@ The main `README.md` should stay relatively high-level. It should explain the pr
 
 ## Main README Sections
 
-- Summary: concise description of sandbox proxy egress middleware, where it fits, and the initial experimental stage of the feature.
-- Motivation: why destination-level egress policy is not enough for content-aware controls.
-- Initial use cases: user stories that introduce Privacy Guard as a motivating example without making the RFC a Privacy Guard product spec.
-- Non-goals: model routing, full generic middleware framework, OpenShell-owned detection engine, and deferred deployment models.
-- Proposal: chosen architecture and the minimal contract between supervisor, policy, and external middleware service.
-- Implementation plan: phased implementation once the proposal is stable.
-- Risks: latency, availability, policy ambiguity, transformation semantics, metadata stability, and audit expectations.
-- Alternatives: brief summary with links to appendices.
-- Prior art: short summary with links to supporting notes.
-- Open questions: unresolved design decisions that need reviewer input.
+- [done] Summary.
+- [done] Motivation: why destination-level egress policy is not enough for content-aware controls.
+- [done] Use-case: Privacy Guard (folded under Motivation as the motivating example, not a product spec).
+- [done] Non-goals. Final set: model routing; general-purpose middleware framework; constraining/sandboxing the middleware itself; runtime management of middleware; guaranteeing detection correctness; support for multiple deployment modes.
+- [done] Proposal: architecture, hooks/placement, contract (+ proto sketch), registration/delivery, policy integration, ordering, metadata, audit/logging.
+- [done] Prior art (kept inline in the README, not a separate appendix).
+- [todo] Terminology.
+- [todo] Implementation plan.
+- [todo] Risks.
+- [todo] Alternatives.
+- [todo] Open questions.
 
 ## Planned Appendices
 
-- `appendices/deployment-options.md`: external service decision and future options such as WASM, OpenShell-managed image middleware, and bundled first-party guards.
-- `appendices/request-response-contract.md`: proposed middleware request/response schema, decision model, metadata fields, and transformation semantics.
-- `appendices/policy-integration.md`: how sandbox policy selects middleware, expresses required versus optional behavior, and composes with existing L4/L7 rules.
-- `appendices/pipeline-placement.md`: exact placement in the supervisor relay path, including relationship to network policy, L7 policy, credential injection, upstream forwarding, and model routing metadata.
-- `appendices/failure-and-audit.md`: fail-open/fail-closed choices, timeout behavior, retry guidance, OCSF audit events, and handling of sensitive values in logs.
-- `appendices/future-extensions.md`: deferred ideas, including response scanning, multi-middleware composition, local model enforcement, managed deployment, and richer model-routing integration.
-- `appendices/prior-art.md`: relevant external patterns and what OpenShell should or should not copy.
+- [done] `appendices/deployment-options.md`: external-service decision and future options (sandboxed middleware, WASM, managed image/sidecar).
+- [done] `appendices/protocol-extensions.md`: streaming (transport vs processing, 4 MB limit, now-or-never oneof), additional hooks, semantic context, content preview, portable capabilities, header rules. (Subsumes much of the old `future-extensions.md` idea.)
+- [todo] `appendices/request-response-contract.md`: full request/response schema, decision model, metadata fields, transformation semantics. (README has only a simplified sketch.)
+- [todo] `appendices/policy-integration.md`: full policy schema and composition with existing OPA/Rego evaluation.
+- [todo] `appendices/pipeline-placement.md`: exact placement in the supervisor relay path vs network/L7 policy and credential injection (credential handling is interleaved with L7 today; verify against real relay code).
+- [todo] `appendices/failure-and-audit.md`: fail-open/closed, timeout/retry, OCSF field mappings, sensitive-value handling.
+- Dropped: `appendices/prior-art.md` (prior art lives inline in the README). `appendices/future-extensions.md` folded into `protocol-extensions.md`.
 
 ## Visuals To Include
 
@@ -55,47 +68,57 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 
 ## Required RFC Pieces
 
-- Terminology: define `middleware`, `hook`, `egress`, `finding`, `metadata`, `transformation`, `registered middleware`, and `middleware config`. Decide whether `egress` needs an OpenShell-specific definition or can use the ordinary network meaning.
-- Gateway configuration: describe how operators register external middleware services with the gateway, including endpoint, identity/auth material if needed, timeout defaults, and expected capabilities.
-- Supervisor configuration delivery: document how the supervisor receives middleware registration and policy binding data. Investigate whether `GetSandboxBundle` is the right existing path to extend.
-- Middleware capability discovery: define an initial gRPC shape for capability negotiation. The actual proto should be included or sketched in the RFC, but simplified enough for review.
-- Capability response fields: include version, description, supported hook types, supported payload/content types, supported decision types, config schema or validation mechanism, and any limits needed by policy validation.
-- Middleware inspection RPC: define the request and response shape for an egress hook invocation, including request metadata, body handling, decision, transformed content, findings, and audit-safe messages.
-- Policy shape: describe how policies reference registered middleware from gateway configuration, how middleware-specific config is attached, and how that config is validated by the service.
-- Middleware section in policy: decide whether policies have a top-level `middlewares` section, rule-level middleware references, or both. Capture the chosen shape and rejected alternatives.
-- Failure behavior: define required versus optional middleware behavior, timeout handling, service errors, unsupported capability responses, and default fail-closed semantics.
-- Audit/logging: describe the OCSF events or event categories for allow, block, transform, service unavailable, config validation failure, and capability mismatch.
-- Model routing handoff: state which metadata is intended for future model routing without designing the router in this RFC.
+- [todo] Terminology: define `middleware`, `hook`, `egress`, `finding`, `metadata`, `transformation`, `registered middleware`, and `middleware config`. Decide whether `egress` needs an OpenShell-specific definition. Not yet written.
+- [done] Gateway configuration: operators register middleware via `[[openshell.proxy.middleware]]` (name + endpoint). Auth material and timeout defaults not yet fully specified.
+- [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. The `GetSandboxBundle` question is not yet explicitly resolved.
+- [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
+- [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list deferred to the request-response-contract appendix.
+- [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{verdict, body}`).
+- [done] Policy shape + middleware section: top-level `network_middlewares` list referenced by `middleware: [...]` on network policies; chains; `on_error`.
+- [done] Failure behavior: `on_error` per middleware, fail-closed by default; capability validation fails the config load.
+- [done] Audit/logging: OCSF categories (HttpActivity, DetectionFinding, ConfigStateChange) + safety rules. Field mappings deferred to failure-and-audit appendix.
+- [done] Model routing handoff: metadata section; router out of scope (#1734).
 
-## Initial Decisions
+## Decisions
 
-- The summary should describe the initial experimental stage in plain language without version labels.
-- Middleware deployment uses an external service managed by the user.
-- Future deployment models remain explicitly open for evaluation instead of being designed into the initial contract.
-- The main RFC describes the chosen path; appendices preserve alternatives and tradeoffs.
-- Middleware findings should become structured metadata that future model routing can consume.
-- Model routing is out of scope for this RFC and tracked separately in https://github.com/NVIDIA/OpenShell/issues/1734.
+- Deployment: externally managed service; other modes deferred (deployment-options appendix).
+- Decision vocabulary is `allow`/`deny` (consistent with the rest of the policy system).
+- Single hook in v1: `request.before_upstream`; the design is extensible to more hooks.
+- Hook runs only on L7-introspected (HTTP) traffic; opaque/L4 is out of scope.
+- Middleware is opt-in via policy; existing usage is unaffected and pays no hot-path cost.
+- Registration is operator-owned (gateway config, name + endpoint); policy references by name only (preserves trust boundary). Endpoint sees raw payloads.
+- Built-in middleware ships in the supervisor, served in-process over the same gRPC contract; reserved `openshell-` name prefix.
+- Multiple middleware run as an ordered chain (chains are in v1; supersedes thought-01's single-middleware decision). Order = policy `middleware: [...]` list; globally-included middleware run before, in `network_middlewares` order; each runs at most once.
+- Top-level policy section is `network_middlewares` (chosen over `request_middlewares` for the umbrella/`network_policies` pairing).
+- Hot-path RPC is declared as a bidi stream but exchanges a single message each way in v1 (cardinality cannot change compatibly; streaming added later). Messages stay flat with nested `RequestContext`/`Verdict` (no phase `oneof` - that is a now-or-never choice we declined).
+- Capability validation runs at gateway config load, on policy reference, and at supervisor startup; failure fails the load.
+- Findings become structured, namespaced metadata for a future model router; router out of scope (#1734).
+- Model routing tracked separately: https://github.com/NVIDIA/OpenShell/issues/1734.
 
 ## Open Drafting Questions
 
-- What is the smallest useful middleware request/response contract?
-- Should the first iteration target all HTTP egress, only model-bound HTTP egress, or any relay-supported protocol with protocol-specific payloads?
-- How should OpenShell validate middleware capabilities before a sandbox starts?
-- Should optional middleware exist, or should the first version only support required fail-closed middleware?
-- What metadata must be stable for composition with model routing?
-- Which audit events belong in the RFC versus later architecture documentation?
-- Is `GetSandboxBundle` the right supervisor delivery path for middleware configuration, or should middleware registration travel through a separate API?
-- Should middleware config validation happen at gateway startup, policy load time, sandbox creation time, or all of the above?
-- Should middleware capability discovery be mandatory before accepting policy that references a middleware service?
+Resolved this round:
 
-## Drafting Queue
+- Smallest useful contract -> sketched (`GetCapabilities`, `ValidateConfig`, `ProcessRequestBeforeUpstream`).
+- Optional vs required middleware -> per-middleware `on_error` (`allow`/`deny`), fail-closed default.
+- Capability validation timing / "before sandbox starts" -> gateway load + policy reference + supervisor startup.
+- Which audit events belong in the RFC -> event categories in the RFC, field mappings in an appendix.
 
-- Fill the pipeline placement section from the real supervisor relay path.
-- Define the deployment contract for external middleware services.
-- Sketch the request/response contract.
-- Define policy attachment syntax at the concept level before choosing exact TOML/YAML fields.
-- Add the deployment-options appendix first, since it captures the deployment decision and future paths.
+Still open:
+
+- Should v1 target all HTTP egress, only model-bound HTTP egress, or any relay-supported protocol? (Currently: all L7-introspected HTTP.)
+- Is `GetSandboxBundle` the right delivery path, or a separate API?
+- Exact metadata namespacing scheme (leaning: derive from middleware name) - deferred until a consumer exists.
+- Is the two-selector surface (`requests:` on a middleware entry vs the per-policy `middleware: [...]`) both needed, or should one win?
+- Should middleware capability discovery be strictly mandatory before accepting referencing policy? (Leaning yes.)
+
+## Drafting Queue (next)
+
+- Write Terminology, Implementation plan, Risks, Alternatives, Open questions sections.
+- Fill the pipeline-placement appendix from the real supervisor relay path.
+- Expand the request-response-contract and policy-integration appendices beyond the README sketches.
+- Write the failure-and-audit appendix (OCSF field mappings).
 
 ## Potential ideas to explore
 
-- For the hook that runs post-credential injection (e.g. the sigv4), only allow first-party build in hooks, so the credentials don't leave the sandbox.
+- For a hook that runs post-credential injection (e.g. SigV4), only allow first-party (built-in) implementations, so credentials never leave the sandbox.
