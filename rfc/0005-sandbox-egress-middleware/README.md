@@ -101,19 +101,86 @@ There is no request hook in the supervisor proxy today, so this is a net-new, sy
 
 ### The middleware contract
 
-The contract has two parts: a configuration-time handshake and a request-time hook.
+The contract has two parts: a configuration-time handshake and a request-time hook. The request-time hook runs on the *hot path* -- the synchronous, per-request path through the supervisor proxy, as opposed to the control-plane path used to fetch config. Middleware only sits on this path for sandboxes whose policy configures it: a sandbox with no middleware in its policy is unaffected and pays no per-request cost. Middleware is therefore an explicit opt-in, and this change is transparent to existing usage.
 
 Configuration-time:
 
-- `GetCapabilities` initially, it reports the service identity and version, the hook stages it implements.
+- `GetCapabilities` reports the service identity and version, the hook stages it implements, and operational limits such as max body size and timeout.
 - `ValidateConfig` lets the service validate its own service-specific configuration fragment.
 
 Request-time:
 
-- A single hot-path RPC carries the request plus context: request identity, endpoint and header context, the bounded body, and the middleware's configuration from policy.
+- `ProcessRequestBeforeUpstream` carries the request plus context: request identity, endpoint and header context, the bounded body, and the middleware's configuration from policy.
 - The response is a decision OpenShell can apply directly: `allow` or `deny`, optional replacement content and allowed header mutations, findings (labels, counts, confidence, never raw matched values), and namespaced metadata.
 
-The hot-path interface is gRPC. v1 may buffer bounded request bodies and use a unary call, with the contract shaped so streaming for large payloads can be added later without a breaking change. A baseline middleware ships in the supervisor and communicates over in-memory channel. The full request/response schema and capability fields live in the request/response-contract appendix.
+A simplified sketch of the gRPC contract:
+
+```protobuf
+service Middleware {
+  // Configuration-time
+  rpc GetCapabilities(CapabilitiesRequest) returns (Capabilities);
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+
+  // Request-time hook. Declared as a bidirectional stream so large bodies can be
+  // chunked later; v1 exchanges exactly one ProcessRequest and one ProcessResponse.
+  rpc ProcessRequestBeforeUpstream(stream ProcessRequest) returns (stream ProcessResponse);
+}
+
+message Capabilities {
+  string name = 1;
+  string version = 2;
+  repeated string hooks = 3;            // e.g. "request.before_upstream"
+  uint64 max_body_bytes = 4;
+  uint32 timeout_ms = 5;
+  repeated string metadata_namespaces = 6;
+}
+
+// Context plus body as two top-level fields, so the body is cleanly separable.
+// v1 sets both in one message; a future stream sends body-only follow-ups.
+message ProcessRequest {
+  RequestContext context = 1;
+  bytes body = 2;                       // bounded
+}
+
+message RequestContext {
+  string request_id = 1;
+  string sandbox_id = 2;
+  Endpoint endpoint = 3;                // scheme, host, port, method, path
+  map<string, string> headers = 4;      // safe subset
+  google.protobuf.Struct config = 5;    // service-specific, from policy
+}
+
+// Verdict plus optional replacement body.
+message ProcessResponse {
+  Verdict verdict = 1;
+  bytes body = 2;                       // replacement content when transformed
+}
+
+message Verdict {
+  Decision decision = 1;                // ALLOW or DENY
+  string deny_reason = 2;               // safe, machine-readable
+  map<string, string> set_headers = 3;  // subject to an OpenShell allow-list
+  map<string, string> metadata = 4;     // namespaced, no raw values
+  repeated Finding finding = 5;         // labels, counts, confidence
+}
+
+message ProcessResponse {
+  Decision decision = 1;                // ALLOW or DENY
+  bytes body = 2;                       // replacement content when transformed
+  map<string, string> set_headers = 3;  // subject to an OpenShell allow-list
+  string deny_reason = 4;               // safe, machine-readable
+  map<string, string> metadata = 5;     // namespaced, no raw values
+  repeated Finding finding = 6;         // labels, counts, confidence
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+}
+```
+
+The interface is gRPC. The hot-path RPC is declared as a bidirectional stream, but v1 exchanges exactly one `ProcessRequest` and one `ProcessResponse` over it: the supervisor buffers the bounded body and the middleware replies once. Declaring it as a stream now is deliberate, because gRPC method cardinality cannot change compatibly. It lets a later version chunk large payloads without altering the method signature. Possible extensions (chunked streaming, additional hooks, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md), including what streaming does and does not buy. The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The full request/response schema and capability fields live in the request/response-contract appendix.
 
 ### Registration and delivery
 
@@ -131,7 +198,7 @@ name = "agent-traces-exporter"
 grpc_endpoint = "https://127.0.0.1:1235"
 ```
 
-Built-in middleware ships in the supervisor binary and needs no registration. Built-in names are prefixed `openshell-` (for example `openshell-secrets`), and that prefix is reserved so user-defined middleware cannot shadow it.
+Built-in middleware ships in the supervisor binary and needs no registration. Built-in names are prefixed `openshell-` (for example `openshell-secrets`), and that prefix is reserved so user-defined middleware cannot use it.
 
 Supervisors receive the effective configuration over the same authenticated config path they already use for policy, provider, and inference config. Because the registered endpoint is reachable from both the gateway and the supervisors, capability validation runs at the gateway (at config load and when a policy references a middleware) and again at the supervisor before traffic flows; a validation failure fails the load rather than silently disabling the middleware. This gateway-side reachability is a property of the service deployment mode - a future sidecar mode would shift validation entirely to the supervisor.
 
