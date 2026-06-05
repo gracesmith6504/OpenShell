@@ -40,7 +40,7 @@ A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the sty
 
 ## Additional hooks
 
-v1 defines a single hook, `request.before_upstream`. The same service interface can host more hook stages, each advertised through `GetCapabilities.hooks` and invoked by its own RPC:
+v1 defines a single hook, `http.request.pre_credentials`. The same service interface can host more hook stages, each advertised through `GetCapabilities.hooks` and invoked by its own RPC:
 
 - `response.before_return` - inspect or redact upstream responses before they reach the sandbox.
 - `message.before_forward` / `message.before_return` - WebSocket or streaming message processing after protocol upgrade.

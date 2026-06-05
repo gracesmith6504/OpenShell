@@ -49,7 +49,7 @@ This RFC uses the following terms with specific meanings.
 - **Middleware.** A service that inspects, transforms, blocks, or annotates egress requests through the contract defined in this RFC. A middleware owns its detection and transformation logic and never makes the upstream call itself; the supervisor always owns the upstream call.
 - **Registered middleware.** A middleware an operator declares in gateway configuration as a name plus an endpoint. Registration is an administrative action that establishes which endpoints may receive raw request content; policy authors can bind middleware configs to registered middleware by name but cannot point traffic at an arbitrary endpoint.
 - **Built-in middleware.** A middleware that ships inside the supervisor binary and is served in-process over the same gRPC contract, with no network hop and no gateway registration. Built-in names are reserved with the `openshell-` prefix.
-- **Hook.** A defined point in the supervisor proxy flow where the supervisor invokes a middleware. This version defines a single hook, `request.before_upstream`, which runs after network and L7 policy admit a request and before credential injection and upstream forwarding. The design allows more hooks later.
+- **Hook.** A defined point in the supervisor proxy flow where the supervisor invokes a middleware. This version defines a single hook, `http.request.pre_credentials`, which runs in the HTTP relay after network and L7 policy admit a request and before credential injection. The design allows more hooks later.
 - **Middleware config.** A named policy entry that binds a middleware implementation (`middleware`) to service-specific configuration. The entry name is the reusable policy reference; the `middleware` value identifies the registered or built-in implementation that validates and runs the config.
 - **Capabilities.** The self-description a middleware returns from `GetCapabilities`: its identity and version, the contract version it implements, and the hooks it supports. OpenShell validates that a registered middleware's capabilities support every config that binds to it.
 - **Decision.** The allow-or-deny outcome a middleware returns for a request. `allow` lets the request proceed (possibly transformed); `deny` short-circuits it. This vocabulary matches the rest of the OpenShell policy system.
@@ -93,14 +93,14 @@ graph LR
 
 ### Hooks and placement
 
-A middleware service provides hook implementations that the supervisor invokes at defined points in the proxy flow. This version defines a single hook, `request.before_upstream`, and is structured so more hooks can be added later. The supervisor invokes the hook after network and L7 policy have allowed the request and before OpenShell injects upstream credentials or forwards the request.
+A middleware service provides hook implementations that the supervisor invokes at defined points in the proxy flow. This version defines a single hook, `http.request.pre_credentials`, and is structured so more hooks can be added later. The supervisor invokes the hook in the HTTP relay after network and L7 policy have allowed the request and before OpenShell injects upstream credentials.
 
 ```mermaid
 graph LR
     REQ["Sandbox request"] --> L4["Network / L4 policy"]
     L4 --> SSRF["SSRF checks"]
     SSRF --> L7["L7 policy"]
-    L7 --> HOOK["request.before_upstream<br/>(middleware)"]
+    L7 --> HOOK["http.request.pre_credentials<br/>(middleware)"]
     HOOK -->|"deny"| DENY["Request denied"]
     HOOK -->|"allow + transformed content"| ROUTE["Routing"]
     ROUTE --> CRED["Credential injection"]
@@ -114,7 +114,7 @@ This ordering is deliberate:
 - Routing runs after the hook, so later model-router work has a clear handoff point for any middleware findings or metadata it chooses to consume.
 - The upstream call stays owned by the supervisor, never the middleware.
 
-The hook operates on a parsed L7 request, so it runs only on traffic OpenShell introspects at L7 (HTTP today). Opaque TCP or TLS passthrough carries no parsed request for a middleware to act on and is outside the scope of the hook. Because OpenShell fails closed when a required middleware cannot process a request, attaching middleware to traffic implies that traffic must be L7-introspected; this RFC may require that explicitly so a policy cannot silently bypass a middleware by falling back to L4.
+The hook operates on a parsed HTTP request, so it runs only on traffic OpenShell introspects at L7. Opaque TCP or TLS passthrough carries no parsed request for a middleware to act on and is outside the scope of the hook. Because OpenShell fails closed when a required middleware cannot process a request, attaching middleware to traffic implies that traffic must be L7-introspected; this RFC may require that explicitly so a policy cannot silently bypass a middleware by falling back to L4.
 
 There is no request hook in the supervisor proxy today, so this is a net-new, synchronous, per-request call. Timeout and failure behavior are therefore load-bearing parts of the design rather than afterthoughts. In the current relay path, credential injection is interleaved with L7 forwarding - request headers and body are rewritten as the request is sent upstream - so the hook runs earlier in that path, on the admitted request and before any credential rewrite, which is what keeps OpenShell-managed credentials away from a middleware. Other hook stages such as pre-policy classification, response inspection, and streaming message hooks are possible future extensions and are out of scope for v1.
 
@@ -129,7 +129,7 @@ Configuration-time:
 
 Request-time:
 
-- `ProcessRequestBeforeUpstream` carries the request plus context: request identity, endpoint and header context, the originating process (the binary, pid, and ancestor chain OpenShell already resolves for network policy and audit), the bounded body, and the middleware's configuration from policy.
+- `ProcessHttpRequestPreCredentials` carries the request plus context: request identity, endpoint and header context, the originating process (the binary, pid, and ancestor chain OpenShell already resolves for network policy and audit), the bounded body, and the middleware's configuration from policy.
 - The response is a decision OpenShell can apply directly: `allow` or `deny`, optional replacement content and allowed header mutations, findings (labels, counts, confidence, never raw matched values), and namespaced metadata.
 
 A simplified sketch of the gRPC contract:
@@ -140,16 +140,16 @@ service ProxyMiddleware {
   rpc GetCapabilities(CapabilitiesRequest) returns (Capabilities);
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
-  // Request-time hook. Declared as a bidirectional stream so large bodies can be
-  // chunked later; v1 exchanges exactly one ProcessRequest and one ProcessResponse.
-  rpc ProcessRequestBeforeUpstream(stream ProcessRequest) returns (stream ProcessResponse);
+  // http.request.pre_credentials. Declared as a bidirectional stream so large bodies
+  // can be chunked later; v1 exchanges exactly one ProcessRequest and one ProcessResponse.
+  rpc ProcessHttpRequestPreCredentials(stream ProcessRequest) returns (stream ProcessResponse);
 }
 
 message Capabilities {
   string name = 1;
   string version = 2;                   // service implementation version
   string contract_version = 3;          // middleware contract major version, e.g. "v1"
-  repeated string hooks = 4;            // e.g. "request.before_upstream"
+  repeated string hooks = 4;            // e.g. "http.request.pre_credentials"
   repeated string metadata_namespaces = 5;
 }
 
@@ -345,7 +345,7 @@ This mirrors the middleware response contract, which already forbids the service
 
 Egress middleware stays opt-in throughout: until a policy attaches a middleware config, no sandbox calls one and the proxy hot path is unchanged. It ships in two phases, the first proving the entire contract in-process before any networking, registration, or auth exists.
 
-**Phase 1 - in-process middleware.** Define the `Middleware` gRPC contract (`GetCapabilities`, `ValidateConfig`, `ProcessRequestBeforeUpstream`), implement its server side in the supervisor, and ship one built-in middleware (for example `openshell-secrets`) behind the reserved `openshell-` prefix. The supervisor invokes the `request.before_upstream` hook in the L7 relay's per-request path - after policy admits the request and before credential injection - buffering the bounded body, enforcing the decision, applying transformation, running a chain in order, applying `on_error`, and accumulating metadata. Policy gains the top-level `network_middlewares` config list plus policy-level and endpoint-level `middleware: [...]` attachments, and decisions are recorded as the OCSF events described above. This exercises the whole contract, policy integration, and hot-path enforcement end to end with no external dependencies.
+**Phase 1 - in-process middleware.** Define the `Middleware` gRPC contract (`GetCapabilities`, `ValidateConfig`, `ProcessHttpRequestPreCredentials`), implement its server side in the supervisor, and ship one built-in middleware (for example `openshell-secrets`) behind the reserved `openshell-` prefix. The supervisor invokes the `http.request.pre_credentials` hook in the L7 relay's per-request path - after policy admits the request and before credential injection - buffering the bounded body, enforcing the decision, applying transformation, running a chain in order, applying `on_error`, and accumulating metadata. Policy gains the top-level `network_middlewares` config list plus policy-level and endpoint-level `middleware: [...]` attachments, and decisions are recorded as the OCSF events described above. This exercises the whole contract, policy integration, and hot-path enforcement end to end with no external dependencies.
 
 **Phase 2 - external middleware service.** Open the same contract to operator-run services. The gateway gains the `[openshell.proxy]` configuration table (name, gRPC endpoint, `allow_insecure`), runs capability validation at config load and on policy reference, and delivers the effective middleware configuration to supervisors over the existing authenticated control-plane gRPC channel, where it is re-validated before traffic flows. This phase adds the registration trust boundary, the insecure research-preview mode, and the deployment guidance in [appendices/deployment-options.md](appendices/deployment-options.md) - none of which Phase 1 requires.
 
@@ -383,7 +383,7 @@ The cost of *not* doing this is leaving content-level egress control entirely ou
 
 Calling an external service from a proxy to inspect, transform, or block in-flight traffic is well-established. The closest analogs:
 
-- **Envoy `ext_proc` (External Processing).** The primary model for this RFC. Envoy streams request headers and body to an external gRPC service that can mutate the body (for example redaction), allow, or deny, and the proxy and the processing service scale independently. Our `request.before_upstream` hook is effectively a buffered, single-hook v1 of the same boundary, with the proto shaped to grow toward `ext_proc`-style streaming later.
+- **Envoy `ext_proc` (External Processing).** The primary model for this RFC. Envoy streams request headers and body to an external gRPC service that can mutate the body (for example redaction), allow, or deny, and the proxy and the processing service scale independently. Our `http.request.pre_credentials` hook is effectively a buffered, single-hook v1 of the same boundary, with the proto shaped to grow toward `ext_proc`-style streaming later.
 - **Envoy `ext_authz` (External Authorization).** A narrower sibling: an external service returns an allow/deny decision per request. It validates the "delegate the per-request decision to an external service in the hot path" pattern, without the content-transformation half that this RFC needs.
 - **ICAP (RFC 3507).** HTTP proxies offload content adaptation, virus scanning, DLP, and content filtering to external ICAP servers that can modify or block request/response content. It is the closest *functional* precedent for content-aware egress control. Two details map directly onto our design: ICAP supports **pipelining** multiple servers (our middleware chain) and a **content preview** of the first bytes before full processing (our bounded-body buffering). What we avoid is its dated, text-based wire protocol; gRPC gives us typed contracts and a path to streaming.
 - **HashiCorp `go-plugin` (Terraform, Vault).** Third-party plugins run as separate processes and communicate with the core exclusively over gRPC. It shows a strictly typed gRPC contract is a robust way to manage cross-language third-party extensions, which informs our registration plus capability handshake (`GetCapabilities`, `ValidateConfig`).
