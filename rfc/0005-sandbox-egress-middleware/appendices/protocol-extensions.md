@@ -12,8 +12,8 @@ The hot-path RPC is already declared as a bidirectional stream (see the contract
 
 These are different concepts and are easy to conflate:
 
-- **Transport streaming** -- the gRPC call carries multiple messages (chunks). This is what a service advertises in its capabilities and what the supervisor negotiates.
-- **Processing streaming** -- the middleware can act on partial content before it has the whole body.
+- **Transport streaming** - the gRPC call carries multiple messages (chunks). This is what a service advertises in its capabilities and what the supervisor negotiates.
+- **Processing streaming** - the middleware can act on partial content before it has the whole body.
 
 The capability governs only the transport. It does not promise the middleware can process incrementally.
 
@@ -36,15 +36,19 @@ A service advertises chunked-transport support (and limits) in `GetCapabilities`
 
 Because the method is already a stream, chunking is field-additive rather than a signature change. Within a single streamed request, the first message carries the request context plus the first body bytes, and subsequent messages carry only further `body` bytes that the middleware appends; stream close marks end of request. This keeps the v1 messages flat and lets v1 stay a true single-message exchange.
 
-A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc` -- is the alternative, but it is a now-or-never choice rather than a later add-on. v1's flat message sets the context fields and `body` together, which a phase `oneof` forbids (only one member may be set), so a `oneof` cannot be retrofitted over the v1 message compatibly. We keep the flat shape because the append convention already covers the memory and message-size goals without forcing v1 into a multi-message exchange.
+A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc` - is the alternative, but it is a now-or-never choice rather than a later add-on. v1's flat message sets the context fields and `body` together, which a phase `oneof` forbids (only one member may be set), so a `oneof` cannot be retrofitted over the v1 message compatibly. We keep the flat shape because the append convention already covers the memory and message-size goals without forcing v1 into a multi-message exchange.
 
 ## Additional hooks
 
-v1 defines a single hook, `http.request.pre_credentials`. The same service interface can host more hook stages, each advertised through `GetCapabilities.hooks` and invoked by its own RPC:
+v1 defines a single hook, `http.request.pre_credentials`, which runs after network/L7 policy admits a request and before credential injection. The same service interface can host more hook stages, each advertised through `GetCapabilities.hooks` and invoked by its own RPC. Each name encodes a different position in the proxy flow:
 
-- `response.before_return` - inspect or redact upstream responses before they reach the sandbox.
-- `message.before_forward` / `message.before_return` - WebSocket or streaming message processing after protocol upgrade.
-- `connection.before_policy` / `request.before_policy` - earlier classification. Riskier, because request content reaches a service before policy has allowed the request.
+- `connection.before_policy` / `request.before_policy` - *before* network/L7 policy admits the request, for earlier classification. Riskier, because request content reaches a service before policy has allowed the request.
+- `http.request.pre_credentials` (v1) - after policy admits the request, before credential injection.
+- `http.request.post_credentials` - after credential injection, immediately before the relay writes the request upstream. This hook is credential-visible, so it is built-in-only: OpenShell marks it as a restricted hook and rejects any externally registered middleware that advertises it during capability validation. The motivating use is request signing that must run after credentials are injected - for example a built-in `openshell-sigv4` that signs the finalized request just before it is sent upstream.
+- `response.before_return` - on the return path, after the upstream responds and before the response reaches the sandbox; inspect or redact upstream responses.
+- `message.before_forward` / `message.before_return` - after a WebSocket or streaming protocol upgrade, on each forwarded or returned message, well past the one-shot request path.
+
+Pre-policy hooks run earliest, the two request hooks (`pre_credentials` and `post_credentials`) bracket credential injection, and response and message hooks run later - some on a different path entirely. Of these, only `http.request.pre_credentials` is part of v1; `http.request.post_credentials` is the nearest planned follow-up, kept built-in-only because it sees injected credentials.
 
 ## Semantic context
 
