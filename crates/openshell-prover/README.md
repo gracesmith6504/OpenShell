@@ -61,14 +61,20 @@ modeled yet. It returns:
   is broader.
 - `Unsupported` when either policy uses a surface not modeled yet, such
   as deny rules, query constraints, GraphQL controls, MCP controls,
-  endpoint path scoping, or CIDR-only `allowed_ips`.
+  endpoint path scoping, CIDR-only `allowed_ips`, or L4-only endpoints.
 
 Unsupported is intentionally fail-closed. Future work can flip those
 fixtures to modeled results as deny rules, MCP, GraphQL, and richer
-symbolic path/query encodings land. See
+symbolic path/query encodings land.
+
+The spike also includes a narrowness-budget check for candidate updates
+against the current policy. It uses the same symbolic action model to
+prove whether candidate grants add reach, then scores the shape of the
+delta so exact grants can fit a small budget while broad globs such as
+`**` exceed it. See
 [`MAXIMUM_POLICY_ENVELOPE_SPIKE.md`](MAXIMUM_POLICY_ENVELOPE_SPIKE.md)
-for a walkthrough of the current spike behavior and the companion
-narrowness-budget direction.
+for a walkthrough of the current maximum-policy and narrowness-budget
+behavior.
 
 ## Evidence shape
 

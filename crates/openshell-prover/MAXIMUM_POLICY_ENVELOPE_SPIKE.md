@@ -151,10 +151,13 @@ These candidate changes all exceed a narrower maximum:
 host: api.github.com       -> *.github.com
 binary: /usr/bin/gh        -> /usr/bin/*
 port: 443                  -> [443, 8443]
-L7 REST maximum            -> L4-only candidate
 ```
 
 Why: each change creates at least one action that the maximum does not allow.
+
+L4-only endpoints are not modeled in this spike. They fail closed as
+`Unsupported` rather than being compared against the REST-only symbolic action
+domain.
 
 ## Demo 5: Unsupported Surfaces Fail Closed
 
@@ -171,7 +174,7 @@ Result:
 
 ```text
 Unsupported {
-  reason: "maximum policy rule 'github' uses deny_rules, which maximum containment does not model yet"
+  reason: "maximum policy rule 'github' uses deny_rules, which policy envelope checks do not model yet"
 }
 ```
 
@@ -186,6 +189,7 @@ GraphQL operation and field constraints
 MCP tool/resource constraints
 CIDR-only allowed_ips
 endpoint path scoping
+L4-only endpoints
 ```
 
 ## Narrowness Companion
@@ -206,16 +210,119 @@ delta = candidate_allows(x) AND NOT current_allows(x)
 score(delta) <= budget
 ```
 
-This could support:
+The current spike includes a first narrowness check. Z3 proves whether each
+modeled candidate grant adds any action outside the current policy:
 
-- per-update budgets, such as "one new REST method" or "one new concrete path";
-- total sandbox budgets, such as "no more than N endpoint families";
-- hard caps, such as rejecting `**` unless the maximum explicitly grants it;
-- reviewer-facing explanations that identify why a change is too broad.
+```text
+exists x:
+  candidate_grant_allows(x)
+  AND NOT current_policy_allows(x)
+```
+
+Rust then scores the shape of each delta grant. This is deliberately coarse for
+the spike:
+
+```text
+exact new grant:        +1
+single path wildcard:   +2
+host/binary wildcard:   +3
+recursive glob (**):    +6
+```
+
+A conservative budget can allow one exact grant and reject recursive globs:
+
+```rust
+NarrownessBudget {
+    max_delta_grants: 1,
+    max_total_score: 1,
+    allow_recursive_globs: false,
+}
+```
+
+## Demo 6: One Exact Path Fits A Narrow Budget
+
+Current:
+
+```yaml
+rules:
+  - allow:
+      method: GET
+      path: /repos/NVIDIA/OpenShell/issues/123
+```
+
+Candidate:
+
+```yaml
+rules:
+  - allow:
+      method: GET
+      path: /repos/NVIDIA/OpenShell/issues/123
+  - allow:
+      method: GET
+      path: /repos/NVIDIA/OpenShell/issues/456
+```
+
+Result:
+
+```text
+WithinBudget {
+  total_score: 1,
+  delta_grants: [
+    {
+      method: "GET",
+      path: "/repos/NVIDIA/OpenShell/issues/456",
+      reasons: [NewGrant]
+    }
+  ]
+}
+```
+
+Why: the candidate adds one exact modeled grant. The grant allows both `GET` and
+runtime-implied `HEAD`, but the budget counts the source grant once.
+
+## Demo 7: Lazy Recursive Path Exceeds A Narrow Budget
+
+Current:
+
+```yaml
+rules:
+  - allow:
+      method: GET
+      path: /repos/NVIDIA/OpenShell/issues/123
+```
+
+Candidate:
+
+```yaml
+rules:
+  - allow:
+      method: GET
+      path: /repos/NVIDIA/**
+```
+
+Result:
+
+```text
+ExceedsBudget {
+  total_score: 7,
+  delta_grants: [
+    {
+      method: "GET",
+      path: "/repos/NVIDIA/**",
+      reasons: [NewGrant, RecursivePathGlob]
+    }
+  ]
+}
+```
+
+Why: the candidate still fits under a maximum policy if that maximum is broad
+enough, but it is not a narrow update over the current policy. This is the
+mechanism that can pressure agents away from requesting lazy `**` access.
 
 This spike should not over-design the product surface yet. The useful next proof
-is a small set of tests showing whether Z3 can produce and classify policy
-deltas well enough to enforce simple budgets.
+is validating whether this budget shape is useful enough for policy proposal
+auto-approval, or whether we need richer semantic categories before productizing
+it.
 
 ## Current Test Command
 
@@ -236,12 +343,16 @@ envelope::tests::l4_candidate_exceeds_l7_maximum
 envelope::tests::maximum_wildcards_cover_exact_candidate
 envelope::tests::deny_rules_are_unsupported_until_modeled
 envelope::tests::query_graphql_cidr_and_mcp_surfaces_are_unsupported
+envelope::tests::narrowness_allows_one_exact_path_delta_within_budget
+envelope::tests::narrowness_allows_one_exact_method_delta_within_budget
+envelope::tests::narrowness_rejects_multiple_exact_grants_over_budget
+envelope::tests::narrowness_rejects_recursive_path_glob_as_too_broad
 ```
 
 ## Readout
 
 This validates the product shape for REST/path/binary/host/port maximum-policy
-envelopes with a symbolic Z3 counterexample query. The next research step on
-this branch is a narrowness budget proof over policy deltas. Deny rules, MCP,
-GraphQL, query constraints, and CIDR can land as follow-on modeled surfaces once
-the containment and delta mechanics are proven useful.
+envelopes and narrowness budgets with symbolic Z3 counterexample queries. Deny
+rules, MCP, GraphQL, query constraints, CIDR, and L4-only endpoints can land as
+follow-on modeled surfaces once the containment and delta mechanics are proven
+useful.

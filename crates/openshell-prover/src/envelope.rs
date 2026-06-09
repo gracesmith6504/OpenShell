@@ -7,7 +7,7 @@
 //! given a security-approved maximum policy and a candidate policy, does the
 //! candidate allow any modeled action outside the maximum envelope?
 
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use crate::policy::{Endpoint, L7Rule, NetworkPolicyRule, PolicyModel};
 use z3::ast::{Bool, Int, Regexp, String as Z3String};
@@ -46,6 +46,102 @@ pub struct PolicyCounterexample {
     pub reason: String,
 }
 
+/// Budget for a candidate policy's modeled scope increase over the current policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrownessBudget {
+    /// Maximum number of modeled candidate grants that add new reach.
+    pub max_delta_grants: usize,
+    /// Maximum total score across all modeled delta grants.
+    pub max_total_score: u32,
+    /// Whether candidate delta grants may use modeled recursive globs (`**`).
+    pub allow_recursive_globs: bool,
+}
+
+impl NarrownessBudget {
+    /// Conservative spike budget: one small exact grant, no recursive globs.
+    pub const fn one_exact_grant() -> Self {
+        Self {
+            max_delta_grants: 1,
+            max_total_score: 1,
+            allow_recursive_globs: false,
+        }
+    }
+}
+
+/// Result of checking whether a candidate policy is a narrow update over current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NarrownessCheck {
+    /// The candidate adds no modeled reach over the current policy.
+    NoIncrease,
+    /// The candidate adds modeled reach, but it fits the supplied budget.
+    WithinBudget {
+        /// Summary of the modeled scope increase.
+        summary: NarrownessSummary,
+    },
+    /// The candidate adds modeled reach outside the supplied budget.
+    ExceedsBudget {
+        /// Summary of the modeled scope increase.
+        summary: NarrownessSummary,
+    },
+    /// The policy uses a surface the first narrowness slice does not model.
+    Unsupported {
+        /// Human-readable reason. The check must fail closed at callers.
+        reason: String,
+    },
+}
+
+/// Summary of the modeled scope increase from current policy to candidate policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrownessSummary {
+    pub total_score: u32,
+    pub delta_grants: Vec<ScopeDelta>,
+}
+
+/// One modeled candidate grant that adds reach over the current policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeDelta {
+    pub rule_name: String,
+    pub binary: String,
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+    pub method: String,
+    pub path: String,
+    pub score: u32,
+    pub reasons: Vec<ScopeIncreaseReason>,
+    pub counterexample: PolicyCounterexample,
+}
+
+/// Coarse reasons used by the spike budget scorer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeIncreaseReason {
+    NewGrant,
+    PathWildcard,
+    HostWildcard,
+    BinaryWildcard,
+    RecursivePathGlob,
+    RecursiveHostGlob,
+    RecursiveBinaryGlob,
+}
+
+impl ScopeIncreaseReason {
+    fn score(self) -> u32 {
+        match self {
+            Self::NewGrant => 1,
+            Self::PathWildcard => 2,
+            Self::HostWildcard | Self::BinaryWildcard => 3,
+            Self::RecursivePathGlob | Self::RecursiveHostGlob | Self::RecursiveBinaryGlob => 6,
+        }
+    }
+
+    fn is_recursive(self) -> bool {
+        matches!(
+            self,
+            Self::RecursivePathGlob | Self::RecursiveHostGlob | Self::RecursiveBinaryGlob
+        )
+    }
+}
+
 struct SymbolicAction {
     binary: Z3String,
     host: Z3String,
@@ -53,6 +149,18 @@ struct SymbolicAction {
     protocol: Z3String,
     method: Z3String,
     path: Z3String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ModeledGrant {
+    rule_name: String,
+    binary: String,
+    host: String,
+    port: u16,
+    protocol: String,
+    method_label: String,
+    methods: Vec<String>,
+    path: String,
 }
 
 /// Check whether `candidate` is semantically contained by `maximum` for the
@@ -74,6 +182,72 @@ pub fn check_within_maximum(maximum: &PolicyModel, candidate: &PolicyModel) -> M
     }
 }
 
+/// Check whether `candidate` is a narrow modeled update over `current`.
+///
+/// The spike budget is intentionally coarse: Z3 proves whether each candidate
+/// grant adds any action outside the current policy, then Rust scores the shape
+/// of those delta grants so broad globs consume more budget than exact grants.
+pub fn check_narrowness(
+    current: &PolicyModel,
+    candidate: &PolicyModel,
+    budget: &NarrownessBudget,
+) -> NarrownessCheck {
+    if let Some(reason) = unsupported_reason("current", current) {
+        return NarrownessCheck::Unsupported { reason };
+    }
+    if let Some(reason) = unsupported_reason("candidate", candidate) {
+        return NarrownessCheck::Unsupported { reason };
+    }
+
+    let mut delta_grants = Vec::new();
+    for grant in modeled_grants(candidate) {
+        match find_z3_grant_delta(current, &grant) {
+            Z3GrantDelta::NoIncrease => {}
+            Z3GrantDelta::Increases { counterexample } => {
+                let (score, reasons) = score_grant(&grant);
+                delta_grants.push(ScopeDelta {
+                    rule_name: grant.rule_name,
+                    binary: grant.binary,
+                    host: grant.host,
+                    port: grant.port,
+                    protocol: grant.protocol,
+                    method: grant.method_label,
+                    path: grant.path,
+                    score,
+                    reasons,
+                    counterexample,
+                });
+            }
+            Z3GrantDelta::Unsupported { reason } => {
+                return NarrownessCheck::Unsupported { reason };
+            }
+        }
+    }
+
+    if delta_grants.is_empty() {
+        return NarrownessCheck::NoIncrease;
+    }
+
+    let total_score = delta_grants.iter().map(|delta| delta.score).sum();
+    let exceeds_budget = delta_grants.len() > budget.max_delta_grants
+        || total_score > budget.max_total_score
+        || (!budget.allow_recursive_globs
+            && delta_grants
+                .iter()
+                .flat_map(|delta| delta.reasons.iter())
+                .any(|reason| reason.is_recursive()));
+    let summary = NarrownessSummary {
+        total_score,
+        delta_grants,
+    };
+
+    if exceeds_budget {
+        NarrownessCheck::ExceedsBudget { summary }
+    } else {
+        NarrownessCheck::WithinBudget { summary }
+    }
+}
+
 enum Z3EnvelopeResult {
     WithinMax,
     ExceedsMax {
@@ -84,29 +258,20 @@ enum Z3EnvelopeResult {
     },
 }
 
-fn find_z3_violation(maximum: &PolicyModel, candidate: &PolicyModel) -> Z3EnvelopeResult {
-    let _ctx = Context::thread_local();
-    let solver = Solver::new();
-    let action = SymbolicAction {
-        binary: Z3String::new_const("action_binary"),
-        host: Z3String::new_const("action_host"),
-        port: Int::new_const("action_port"),
-        protocol: Z3String::new_const("action_protocol"),
-        method: Z3String::new_const("action_method"),
-        path: Z3String::new_const("action_path"),
-    };
+enum Z3GrantDelta {
+    NoIncrease,
+    Increases {
+        counterexample: PolicyCounterexample,
+    },
+    Unsupported {
+        reason: String,
+    },
+}
 
-    solver.assert(action.binary.regex_matches(&glob_regex("/**", "/")));
-    solver.assert(action.host.regex_matches(&Regexp::full()));
-    solver.assert(Int::from_u64(1).le(&action.port));
-    solver.assert(action.port.le(65535));
-    solver.assert(str_eq_any(&action.protocol, &["rest"]));
-    solver.assert(str_eq_any(&action.method, ALL_METHODS));
-    solver.assert(
-        Z3String::from_str("/")
-            .expect("literal")
-            .prefix(&action.path),
-    );
+fn find_z3_violation(maximum: &PolicyModel, candidate: &PolicyModel) -> Z3EnvelopeResult {
+    let solver = Solver::new();
+    let action = symbolic_action("action");
+    assert_action_domain(&solver, &action);
 
     let candidate_allows = policy_allows(candidate, &action);
     let maximum_allows = policy_allows(maximum, &action);
@@ -125,7 +290,11 @@ fn find_z3_violation(maximum: &PolicyModel, candidate: &PolicyModel) -> Z3Envelo
                         .to_owned(),
                 };
             };
-            let Some(counterexample) = counterexample_from_model(&model, &action) else {
+            let Some(counterexample) = counterexample_from_model(
+                &model,
+                &action,
+                "candidate allows an action outside the maximum policy",
+            ) else {
                 return Z3EnvelopeResult::Unsupported {
                     reason: "Z3 returned sat but the model could not be decoded into a maximum-policy counterexample".to_owned(),
                 };
@@ -133,6 +302,66 @@ fn find_z3_violation(maximum: &PolicyModel, candidate: &PolicyModel) -> Z3Envelo
             Z3EnvelopeResult::ExceedsMax { counterexample }
         }
     }
+}
+
+fn find_z3_grant_delta(current: &PolicyModel, grant: &ModeledGrant) -> Z3GrantDelta {
+    let solver = Solver::new();
+    let action = symbolic_action("narrowness_action");
+    assert_action_domain(&solver, &action);
+
+    let current_allows = policy_allows(current, &action);
+    let grant_allows = grant_allows(grant, &action);
+    solver.assert(Bool::and(&[grant_allows, !current_allows]));
+
+    match solver.check() {
+        SatResult::Unsat => Z3GrantDelta::NoIncrease,
+        SatResult::Unknown => Z3GrantDelta::Unsupported {
+            reason: "Z3 returned unknown while checking policy narrowness".to_owned(),
+        },
+        SatResult::Sat => {
+            let Some(model) = solver.get_model() else {
+                return Z3GrantDelta::Unsupported {
+                    reason: "Z3 returned sat without a model for policy narrowness".to_owned(),
+                };
+            };
+            let Some(counterexample) = counterexample_from_model(
+                &model,
+                &action,
+                "candidate grant allows an action outside the current policy",
+            ) else {
+                return Z3GrantDelta::Unsupported {
+                    reason: "Z3 returned sat but the model could not be decoded into a policy narrowness counterexample".to_owned(),
+                };
+            };
+            Z3GrantDelta::Increases { counterexample }
+        }
+    }
+}
+
+fn symbolic_action(name: &str) -> SymbolicAction {
+    let _ctx = Context::thread_local();
+    SymbolicAction {
+        binary: Z3String::new_const(format!("{name}_binary")),
+        host: Z3String::new_const(format!("{name}_host")),
+        port: Int::new_const(format!("{name}_port")),
+        protocol: Z3String::new_const(format!("{name}_protocol")),
+        method: Z3String::new_const(format!("{name}_method")),
+        path: Z3String::new_const(format!("{name}_path")),
+    }
+}
+
+fn assert_action_domain(solver: &Solver, action: &SymbolicAction) {
+    solver.assert(action.binary.regex_matches(&glob_regex("/**", "/")));
+    solver.assert(action.host.regex_matches(&Regexp::full()));
+    solver.assert(Int::from_u64(1).le(&action.port));
+    solver.assert(action.port.le(65535));
+    solver.assert(str_eq_any(&action.protocol, &["rest"]));
+    solver.assert(str_eq_any(&action.method, ALL_METHODS));
+    solver.assert(
+        Z3String::from_str("/")
+            .expect("literal")
+            .prefix(&action.path),
+    );
 }
 
 fn policy_allows(policy: &PolicyModel, action: &SymbolicAction) -> Bool {
@@ -187,9 +416,23 @@ fn endpoint_allows(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
     Bool::and(&constraints)
 }
 
+fn grant_allows(grant: &ModeledGrant, action: &SymbolicAction) -> Bool {
+    Bool::and(&[
+        action.binary.regex_matches(&glob_regex(&grant.binary, "/")),
+        action
+            .host
+            .regex_matches(&glob_regex(&grant.host.to_ascii_lowercase(), ".")),
+        action.port.eq(Int::from_u64(u64::from(grant.port))),
+        action.protocol.eq(grant.protocol.as_str()),
+        str_eq_any_owned(&action.method, &grant.methods),
+        action.path.regex_matches(&glob_regex(&grant.path, "/")),
+    ])
+}
+
 fn counterexample_from_model(
     model: &z3::Model,
     action: &SymbolicAction,
+    reason: &str,
 ) -> Option<PolicyCounterexample> {
     let port = model.eval(&action.port, true)?.as_u64()?;
     Some(PolicyCounterexample {
@@ -199,7 +442,7 @@ fn counterexample_from_model(
         protocol: model.eval(&action.protocol, true)?.as_string()?,
         method: model.eval(&action.method, true)?.as_string()?,
         path: model.eval(&action.path, true)?.as_string()?,
-        reason: "candidate allows an action outside the maximum policy".to_owned(),
+        reason: reason.to_owned(),
     })
 }
 
@@ -214,6 +457,10 @@ fn bool_or(values: impl IntoIterator<Item = Bool>) -> Bool {
 
 fn str_eq_any(value: &Z3String, options: &[&str]) -> Bool {
     bool_or(options.iter().map(|option| value.eq(*option)))
+}
+
+fn str_eq_any_owned(value: &Z3String, options: &[String]) -> Bool {
+    bool_or(options.iter().map(|option| value.eq(option.as_str())))
 }
 
 fn glob_regex(pattern: &str, separator: &str) -> Regexp {
@@ -255,7 +502,7 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
         for endpoint in &rule.endpoints {
             if !endpoint.path.is_empty() {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses endpoint path scoping, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses endpoint path scoping, which policy envelope checks do not model yet"
                 ));
             }
             if unsupported_glob_pattern(&endpoint.host) {
@@ -265,12 +512,12 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
             }
             if !endpoint.allowed_ips.is_empty() {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses allowed_ips/CIDR scoping, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses allowed_ips/CIDR scoping, which policy envelope checks do not model yet"
                 ));
             }
             if !endpoint.deny_rules.is_empty() {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses deny_rules, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses deny_rules, which policy envelope checks do not model yet"
                 ));
             }
             if endpoint.effective_ports().is_empty() {
@@ -281,7 +528,7 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
             }
             if !endpoint.tls.is_empty() {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses tls '{}', which maximum containment does not model yet",
+                    "{prefix} policy rule '{rule_name}' uses tls '{}', which policy envelope checks do not model yet",
                     endpoint.tls
                 ));
             }
@@ -290,7 +537,7 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                 || endpoint.request_body_credential_rewrite
             {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses endpoint behavior flags that maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses endpoint behavior flags that policy envelope checks do not model yet"
                 ));
             }
             if !endpoint.persisted_queries.is_empty()
@@ -298,7 +545,7 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                 || endpoint.graphql_max_body_bytes != 0
             {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses GraphQL persisted-query controls, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses GraphQL persisted-query controls, which policy envelope checks do not model yet"
                 ));
             }
             if !endpoint.mcp_server.is_empty()
@@ -306,18 +553,23 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                 || !endpoint.mcp_resource.is_empty()
             {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses MCP controls, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses MCP controls, which policy envelope checks do not model yet"
                 ));
             }
             if normalized_protocol(&endpoint.protocol) == "graphql" {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses GraphQL protocol controls, which maximum containment does not model yet"
+                    "{prefix} policy rule '{rule_name}' uses GraphQL protocol controls, which policy envelope checks do not model yet"
                 ));
             }
             let protocol = normalized_protocol(&endpoint.protocol);
+            if protocol.is_empty() {
+                return Some(format!(
+                    "{prefix} policy rule '{rule_name}' uses L4-only endpoint, which policy envelope checks do not model beyond REST yet"
+                ));
+            }
             if !protocol.is_empty() && !protocol.eq_ignore_ascii_case("rest") {
                 return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses protocol '{}', which maximum containment does not model yet",
+                    "{prefix} policy rule '{rule_name}' uses protocol '{}', which policy envelope checks do not model yet",
                     endpoint.protocol
                 ));
             }
@@ -330,12 +582,12 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
             for rule in &endpoint.rules {
                 if l7_rule_is_unsupported(rule) {
                     return Some(format!(
-                        "{prefix} policy rule '{rule_name}' uses L7 query, SQL, or GraphQL allow controls, which maximum containment does not model yet"
+                        "{prefix} policy rule '{rule_name}' uses L7 query, SQL, or GraphQL allow controls, which policy envelope checks do not model yet"
                     ));
                 }
                 if !rule.method.is_empty() && !modeled_rest_method(&rule.method) {
                     return Some(format!(
-                        "{prefix} policy rule '{rule_name}' uses REST method '{}', which maximum containment does not model yet",
+                        "{prefix} policy rule '{rule_name}' uses REST method '{}', which policy envelope checks do not model yet",
                         rule.method
                     ));
                 }
@@ -355,6 +607,144 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
         }
     }
     None
+}
+
+fn modeled_grants(policy: &PolicyModel) -> Vec<ModeledGrant> {
+    let mut grants = BTreeSet::new();
+    for (rule_name, rule) in &policy.network_policies {
+        for binary in &rule.binaries {
+            for endpoint in &rule.endpoints {
+                for port in endpoint.effective_ports() {
+                    for (method_label, methods, path) in grant_method_groups(endpoint) {
+                        grants.insert(ModeledGrant {
+                            rule_name: rule_name.clone(),
+                            binary: binary.path.clone(),
+                            host: endpoint.host.clone(),
+                            port,
+                            protocol: "rest".to_owned(),
+                            method_label,
+                            methods,
+                            path,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    grants.into_iter().collect()
+}
+
+fn grant_method_groups(endpoint: &Endpoint) -> Vec<(String, Vec<String>, String)> {
+    if normalized_protocol(&endpoint.protocol).is_empty() {
+        return vec![(
+            "*".to_owned(),
+            ALL_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+            "**".to_owned(),
+        )];
+    }
+
+    match endpoint.access.as_str() {
+        "read-only" => vec![(
+            "read-only".to_owned(),
+            READ_ONLY_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+            "**".to_owned(),
+        )],
+        "read-write" => vec![(
+            "read-write".to_owned(),
+            READ_WRITE_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+            "**".to_owned(),
+        )],
+        "full" => vec![(
+            "full".to_owned(),
+            ALL_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+            "**".to_owned(),
+        )],
+        _ if endpoint.rules.is_empty() => Vec::new(),
+        _ => endpoint
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                if rule.method.is_empty() {
+                    return None;
+                }
+                let path = if rule.path.is_empty() {
+                    "**".to_owned()
+                } else {
+                    rule.path.clone()
+                };
+                let method = rule.method.to_ascii_uppercase();
+                if method == "*" {
+                    Some((
+                        "*".to_owned(),
+                        ALL_METHODS
+                            .iter()
+                            .map(|method| (*method).to_owned())
+                            .collect(),
+                        path,
+                    ))
+                } else if method == "GET" {
+                    Some((
+                        "GET".to_owned(),
+                        vec!["GET".to_owned(), "HEAD".to_owned()],
+                        path,
+                    ))
+                } else {
+                    Some((method.clone(), vec![method], path))
+                }
+            })
+            .collect(),
+    }
+}
+
+fn score_grant(grant: &ModeledGrant) -> (u32, Vec<ScopeIncreaseReason>) {
+    let mut reasons = vec![ScopeIncreaseReason::NewGrant];
+
+    add_glob_reasons(
+        &mut reasons,
+        &grant.path,
+        ScopeIncreaseReason::PathWildcard,
+        ScopeIncreaseReason::RecursivePathGlob,
+    );
+    add_glob_reasons(
+        &mut reasons,
+        &grant.host,
+        ScopeIncreaseReason::HostWildcard,
+        ScopeIncreaseReason::RecursiveHostGlob,
+    );
+    add_glob_reasons(
+        &mut reasons,
+        &grant.binary,
+        ScopeIncreaseReason::BinaryWildcard,
+        ScopeIncreaseReason::RecursiveBinaryGlob,
+    );
+
+    let score = reasons.iter().map(|reason| reason.score()).sum();
+    (score, reasons)
+}
+
+fn add_glob_reasons(
+    reasons: &mut Vec<ScopeIncreaseReason>,
+    pattern: &str,
+    wildcard: ScopeIncreaseReason,
+    recursive: ScopeIncreaseReason,
+) {
+    if pattern.contains("**") {
+        reasons.push(recursive);
+    } else if pattern.contains('*') {
+        reasons.push(wildcard);
+    }
 }
 
 fn l7_rule_is_unsupported(rule: &L7Rule) -> bool {
@@ -667,12 +1057,12 @@ network_policies:
 
         assert!(matches!(
             check_within_maximum(&maximum, &candidate),
-            MaximumPolicyCheck::ExceedsMax { .. }
+            MaximumPolicyCheck::Unsupported { .. }
         ));
     }
 
     #[test]
-    fn maximum_l4_covers_l7_candidate() {
+    fn l4_maximum_is_unsupported_until_modeled() {
         let maximum = policy(
             r"      - host: api.github.com
         port: 443",
@@ -683,10 +1073,26 @@ network_policies:
             gh_binary(),
         );
 
-        assert_eq!(
+        assert!(matches!(
             check_within_maximum(&maximum, &candidate),
-            MaximumPolicyCheck::WithinMax
+            MaximumPolicyCheck::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn rest_full_maximum_does_not_silently_cover_l4_candidate() {
+        let maximum = policy(&one_rest_endpoint("        access: full"), gh_binary());
+        let candidate = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
         );
+
+        let MaximumPolicyCheck::Unsupported { reason } = check_within_maximum(&maximum, &candidate)
+        else {
+            panic!("expected L4 candidate to fail closed");
+        };
+        assert!(reason.contains("L4-only endpoint"));
     }
 
     #[test]
@@ -881,5 +1287,225 @@ network_policies:
             check_within_maximum(&maximum, &candidate),
             MaximumPolicyCheck::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn narrowness_reports_no_increase_for_same_policy() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+
+        assert_eq!(
+            check_narrowness(&current, &current, &NarrownessBudget::one_exact_grant()),
+            NarrownessCheck::NoIncrease
+        );
+    }
+
+    #[test]
+    fn narrowness_allows_one_exact_path_delta_within_budget() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+        let candidate = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/456",
+            ),
+            gh_binary(),
+        );
+
+        let NarrownessCheck::WithinBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected one exact path delta to fit budget");
+        };
+        assert_eq!(summary.total_score, 1);
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.delta_grants[0].method, "GET");
+        assert_eq!(
+            summary.delta_grants[0].path,
+            "/repos/NVIDIA/OpenShell/issues/456"
+        );
+        assert_eq!(
+            summary.delta_grants[0].reasons,
+            vec![ScopeIncreaseReason::NewGrant]
+        );
+    }
+
+    #[test]
+    fn narrowness_allows_one_exact_method_delta_within_budget() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+        let candidate = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123
+          - allow:
+              method: POST
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+
+        let NarrownessCheck::WithinBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected one exact method delta to fit budget");
+        };
+        assert_eq!(summary.total_score, 1);
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.delta_grants[0].method, "POST");
+        assert_eq!(
+            summary.delta_grants[0].counterexample.reason,
+            "candidate grant allows an action outside the current policy"
+        );
+    }
+
+    #[test]
+    fn narrowness_rejects_multiple_exact_grants_over_budget() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+        let candidate = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/456
+          - allow:
+              method: POST
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+
+        let NarrownessCheck::ExceedsBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected two exact deltas to exceed one-grant budget");
+        };
+        assert_eq!(summary.total_score, 2);
+        assert_eq!(summary.delta_grants.len(), 2);
+    }
+
+    #[test]
+    fn narrowness_rejects_recursive_path_glob_as_too_broad() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+        let candidate = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/**",
+            ),
+            gh_binary(),
+        );
+
+        let NarrownessCheck::ExceedsBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected recursive path glob to exceed budget");
+        };
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.total_score, 7);
+        assert_eq!(
+            summary.delta_grants[0].reasons,
+            vec![
+                ScopeIncreaseReason::NewGrant,
+                ScopeIncreaseReason::RecursivePathGlob
+            ]
+        );
+    }
+
+    #[test]
+    fn narrowness_recursive_glob_can_fit_when_budget_explicitly_allows_it() {
+        let current = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/OpenShell/issues/123",
+            ),
+            gh_binary(),
+        );
+        let candidate = policy(
+            &one_rest_endpoint(
+                r"        rules:
+          - allow:
+              method: GET
+              path: /repos/NVIDIA/**",
+            ),
+            gh_binary(),
+        );
+        let budget = NarrownessBudget {
+            max_delta_grants: 1,
+            max_total_score: 7,
+            allow_recursive_globs: true,
+        };
+
+        assert!(matches!(
+            check_narrowness(&current, &candidate, &budget),
+            NarrownessCheck::WithinBudget { .. }
+        ));
+    }
+
+    #[test]
+    fn narrowness_l4_candidate_is_unsupported_until_modeled() {
+        let current = policy(&one_rest_endpoint("        access: full"), gh_binary());
+        let candidate = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+
+        let NarrownessCheck::Unsupported { reason } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected L4 candidate to fail closed");
+        };
+        assert!(reason.contains("L4-only endpoint"));
     }
 }
