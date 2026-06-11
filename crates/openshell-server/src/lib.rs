@@ -222,26 +222,11 @@ pub(crate) async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+    config
+        .validate_gateway_auth_posture()
+        .map_err(Error::config)?;
 
     let store = Arc::new(Store::connect(database_url).await?);
-
-    let oidc_cache = if let Some(ref oidc) = config.oidc {
-        // Validate RBAC configuration before starting.
-        let policy = auth::authz::AuthzPolicy {
-            admin_role: oidc.admin_role.clone(),
-            user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
-        };
-        policy.validate().map_err(Error::config)?;
-
-        let cache = auth::oidc::JwksCache::new(oidc)
-            .await
-            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
-        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
-        Some(Arc::new(cache))
-    } else {
-        None
-    };
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
@@ -263,6 +248,28 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    config
+        .validate_gateway_auth_posture_with_extra_bind_addresses(compute.gateway_bind_addresses())
+        .map_err(Error::config)?;
+
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
+        // Validate RBAC configuration before starting.
+        let policy = auth::authz::AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        };
+        policy.validate().map_err(Error::config)?;
+
+        let cache = auth::oidc::JwksCache::new(oidc)
+            .await
+            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
+        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
