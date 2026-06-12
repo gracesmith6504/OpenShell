@@ -242,6 +242,11 @@ impl ProxyHandle {
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
+                        let dynamic_credentials = provider_credentials.as_ref().map(|state| {
+                            Arc::new(std::sync::RwLock::new(
+                                state.snapshot().dynamic_credentials.clone(),
+                            ))
+                        });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         tokio::spawn(async move {
@@ -255,6 +260,7 @@ impl ProxyHandle {
                                 policy_local,
                                 gw,
                                 resolver,
+                                dynamic_credentials,
                                 dtx,
                                 atx,
                             )
@@ -411,6 +417,13 @@ async fn handle_tcp_connection(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
 ) -> Result<()> {
@@ -458,6 +471,7 @@ async fn handle_tcp_connection(
             policy_local_ctx,
             trusted_host_gateway,
             secret_resolver,
+            dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
         )
@@ -953,6 +967,10 @@ async fn handle_tcp_connection(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.clone(),
+        dynamic_credentials: dynamic_credentials.clone(),
+        token_grant_resolver: dynamic_credentials
+            .as_ref()
+            .map(|_| crate::l7::token_grant_injection::default_resolver()),
     };
 
     if effective_tls_skip {
@@ -1666,6 +1684,35 @@ async fn route_inference_request(
             return Ok(true);
         }
 
+        // Buffered protocols (embeddings, model discovery) return a single JSON
+        // object, not an SSE token stream. Serve them buffered with an accurate
+        // Content-Length: the streaming path would append an SSE error frame to
+        // the body on a size-cap or idle-timeout truncation, corrupting a
+        // payload the client parses as one JSON object. Framing is declared per
+        // protocol on the matched pattern.
+        if pattern.is_buffered() {
+            match ctx
+                .router
+                .proxy_with_candidates(
+                    &pattern.protocol,
+                    &request.method,
+                    &normalized_path,
+                    request.headers.clone(),
+                    bytes::Bytes::from(request.body.clone()),
+                    &routes,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let resp_headers = sanitize_inference_response_headers(resp.headers);
+                    let response = format_http_response(resp.status, &resp_headers, &resp.body);
+                    write_all(tls_client, &response).await?;
+                }
+                Err(e) => write_inference_router_error(tls_client, &e).await?,
+            }
+            return Ok(true);
+        }
+
         match ctx
             .router
             .proxy_with_candidates_streaming(
@@ -1760,29 +1807,7 @@ async fn route_inference_request(
                 // Terminate the chunked stream.
                 write_all(tls_client, format_chunk_terminator()).await?;
             }
-            Err(e) => {
-                {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                        .message(format!(
-                            "inference endpoint detected but upstream service failed: {e}"
-                        ))
-                        .build();
-                    ocsf_emit!(event);
-                }
-                let (status, msg) = router_error_to_http(&e);
-                let body = serde_json::json!({"error": msg});
-                let body_bytes = body.to_string();
-                let response = format_http_response(
-                    status,
-                    &[("content-type".to_string(), "application/json".to_string())],
-                    body_bytes.as_bytes(),
-                );
-                write_all(tls_client, &response).await?;
-            }
+            Err(e) => write_inference_router_error(tls_client, &e).await?,
         }
         Ok(true)
     } else {
@@ -1814,11 +1839,42 @@ async fn route_inference_request(
     }
 }
 
+/// Emit an OCSF failure event and write a buffered JSON error response for a
+/// router error hit while proxying an inference request.
+///
+/// Shared by the streaming and buffered routing paths so both surface upstream
+/// failures with the same status mapping and the same audit record.
+async fn write_inference_router_error(
+    tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
+    err: &openshell_router::RouterError,
+) -> Result<()> {
+    use crate::l7::inference::format_http_response;
+
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+        .message(format!(
+            "inference endpoint detected but upstream service failed: {err}"
+        ))
+        .build();
+    ocsf_emit!(event);
+
+    let (status, msg) = router_error_to_http(err);
+    let body = serde_json::json!({ "error": msg }).to_string();
+    let response = format_http_response(
+        status,
+        &[("content-type".to_string(), "application/json".to_string())],
+        body.as_bytes(),
+    );
+    write_all(tls_client, &response).await
+}
+
 /// Map router errors to HTTP status codes and sanitized messages.
 ///
-/// Returns generic error messages instead of verbatim internal details.
-/// Full error context (upstream URLs, hostnames, TLS details) is logged
-/// server-side by the caller at `warn` level for debugging.
+/// Returns generic, client-safe messages instead of verbatim internal details;
+/// the full error is recorded in the OCSF failure event by the caller.
 fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     use openshell_router::RouterError;
     match err {
@@ -2870,6 +2926,33 @@ where
     .await
 }
 
+async fn inject_token_grant_for_forward_request(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+    l7_ctx: &crate::l7::relay::L7EvalContext,
+) -> Result<Vec<u8>> {
+    let header_end = forward_request_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(forward_request_bytes.len(), |p| p + 4);
+    let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("Forward HTTP headers contain invalid UTF-8"))?;
+    let body_length = crate::l7::rest::parse_body_length(header_str)?;
+    let forward_request_for_token_grant = crate::l7::provider::L7Request {
+        action: method.to_string(),
+        target: upstream_target.to_string(),
+        query_params: std::collections::HashMap::new(),
+        raw_header: forward_request_bytes,
+        body_length,
+    };
+
+    crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
+        .await
+        .map(|req| req.raw_header)
+}
+
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
 ///
 /// Public IPs are allowed through when the endpoint passes OPA evaluation.
@@ -2891,6 +2974,13 @@ async fn handle_forward_proxy(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
@@ -3120,6 +3210,10 @@ async fn handle_forward_proxy(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.cloned(),
+        dynamic_credentials: dynamic_credentials.clone(),
+        token_grant_resolver: dynamic_credentials
+            .as_ref()
+            .map(|_| crate::l7::token_grant_injection::default_resolver()),
     };
     let mut l7_activity_pending = false;
 
@@ -3790,6 +3884,36 @@ async fn handle_forward_proxy(
     }
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
+    forward_request_bytes = match inject_token_grant_for_forward_request(
+        method,
+        &upstream_target,
+        forward_request_bytes,
+        &l7_ctx,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %e,
+                "token grant failed in forward proxy"
+            );
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "token_grant_failed",
+                    "dynamic token grant failed",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
         &forward_request_bytes,
@@ -4136,6 +4260,53 @@ mod tests {
             .map_err(|e| miette::miette!("upstream task failed: {e}"))
     }
 
+    fn forward_token_grant_context(
+        resolver_response: std::result::Result<&str, &str>,
+    ) -> (
+        crate::l7::relay::L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture = match resolver_response {
+            Ok(token) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                    provider_key,
+                    token,
+                )
+            }
+            Err(error) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure(
+                    provider_key,
+                    error,
+                )
+            }
+        };
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+        };
+
+        (ctx, fixture)
+    }
+
+    fn authorization_header_count(headers: &str) -> usize {
+        headers
+            .lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            })
+            .count()
+    }
+
     fn forward_websocket_policy_parts(
         data: &str,
         host: &str,
@@ -4177,6 +4348,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4343,6 +4516,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: resolver,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4384,6 +4559,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
@@ -5433,6 +5610,313 @@ network_policies:
         }
     }
 
+    fn embeddings_inference_route(endpoint: String) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "text-embedding-3-small".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["openai_embeddings".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        }
+    }
+
+    /// Embeddings responses are a single buffered JSON object, not an SSE
+    /// stream. They must be framed with `Content-Length` and must never be sent
+    /// through the chunked streaming path, whose truncation handlers would
+    /// append an SSE `proxy_stream_error` frame into the JSON body.
+    #[tokio::test]
+    async fn inference_embeddings_served_buffered_with_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"text-embedding-3-small"}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            // Buffered upstream response with Content-Length (no chunked TE).
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![embeddings_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        let body = r#"{"model":"text-embedding-3-small","input":"hello"}"#;
+        let request = format!(
+            "POST /v1/embeddings HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        server_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected buffered 200 response, got: {response}"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length:"),
+            "embeddings response must be Content-Length framed, got: {response}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding: chunked"),
+            "embeddings response must NOT be chunked, got: {response}"
+        );
+        assert!(
+            !response.contains("proxy_stream_error"),
+            "embeddings response must not carry an SSE error frame, got: {response}"
+        );
+        assert!(
+            response.contains(r#""object":"list""#),
+            "embeddings JSON body must be forwarded intact, got: {response}"
+        );
+    }
+
+    fn model_discovery_inference_route(
+        endpoint: String,
+    ) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "text-embedding-3-small".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["model_discovery".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        }
+    }
+
+    /// `GET /v1/models` (model discovery) returns one JSON object — a model
+    /// list — exactly like embeddings. It must be served buffered with
+    /// `Content-Length`, never through the chunked streaming path whose
+    /// truncation handlers would append an SSE `proxy_stream_error` frame into
+    /// the JSON body. This guards the framing classification for the protocol.
+    #[tokio::test]
+    async fn inference_model_discovery_served_buffered_with_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body =
+            r#"{"object":"list","data":[{"id":"text-embedding-3-small","object":"model"}]}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        // GET model discovery carries no request body.
+        let request = "GET /v1/models HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        server_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected buffered 200 response, got: {response}"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length:"),
+            "model discovery response must be Content-Length framed, got: {response}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding: chunked"),
+            "model discovery response must NOT be chunked, got: {response}"
+        );
+        assert!(
+            !response.contains("proxy_stream_error"),
+            "model discovery response must not carry an SSE error frame, got: {response}"
+        );
+        assert!(
+            response.contains(r#""object":"list""#),
+            "model discovery JSON body must be forwarded intact, got: {response}"
+        );
+    }
+
+    /// `GET /v1/models/{id}` (model discovery glob) must forward the model id in
+    /// the path through the buffered path with the id intact, never streamed.
+    #[tokio::test]
+    async fn inference_model_discovery_glob_path_served_buffered() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body = r#"{"id":"gpt-4.1","object":"model"}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            let forwarded = read_forwarded_request_line(&mut upstream).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+            forwarded
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        let request = "GET /v1/models/gpt-4.1 HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        server_task.await.unwrap().unwrap();
+        let (method, forwarded_path) = upstream_task.await.unwrap();
+
+        assert_eq!(method, "GET");
+        assert_eq!(
+            forwarded_path, "/v1/models/gpt-4.1",
+            "the model id in the glob path must be forwarded intact"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n")
+                && lower.contains("content-length:")
+                && !lower.contains("transfer-encoding: chunked")
+                && !response.contains("proxy_stream_error"),
+            "glob model discovery must be buffered and Content-Length framed, got: {response}"
+        );
+    }
+
+    /// A failed model-discovery upstream must produce a buffered, Content-Length
+    /// framed JSON error, never a chunked SSE `proxy_stream_error` frame.
+    #[tokio::test]
+    async fn inference_model_discovery_error_served_buffered() {
+        // A port with no listener so the upstream connection is refused.
+        let dead_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{dead_addr}"
+            ))],
+            vec![],
+        );
+
+        let request = "GET /v1/models HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        server_task.await.unwrap().unwrap();
+
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            response.starts_with("HTTP/1.1 5"),
+            "a refused upstream should yield a 5xx, got: {response}"
+        );
+        assert!(
+            lower.contains("content-length:")
+                && !lower.contains("transfer-encoding: chunked")
+                && !response.contains("proxy_stream_error"),
+            "buffered model-discovery error must be Content-Length framed JSON, got: {response}"
+        );
+        assert!(
+            response.contains("error"),
+            "error response should carry a JSON error body, got: {response}"
+        );
+    }
+
     async fn read_forwarded_inference_request<S: AsyncRead + Unpin>(stream: &mut S) {
         use crate::l7::inference::{ParseResult, try_parse_http_request};
 
@@ -5445,6 +5929,28 @@ network_policies:
 
             match try_parse_http_request(&buf) {
                 ParseResult::Complete(_, _) => return,
+                ParseResult::Incomplete => continue,
+                ParseResult::Invalid(reason) => {
+                    panic!("forwarded request should parse cleanly: {reason}");
+                }
+            }
+        }
+    }
+
+    /// Like [`read_forwarded_inference_request`] but returns the forwarded
+    /// request line (method, path) so a test can assert the upstream URL path.
+    async fn read_forwarded_request_line<S: AsyncRead + Unpin>(stream: &mut S) -> (String, String) {
+        use crate::l7::inference::{ParseResult, try_parse_http_request};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream request closed before completion");
+            buf.extend_from_slice(&chunk[..n]);
+
+            match try_parse_http_request(&buf) {
+                ParseResult::Complete(req, _) => return (req.method, req.path),
                 ParseResult::Incomplete => continue,
                 ParseResult::Invalid(reason) => {
                     panic!("forwarded request should parse cleanly: {reason}");
@@ -6123,6 +6629,40 @@ network_policies:
     }
 
     // --- rewrite_forward_request tests ---
+
+    #[tokio::test]
+    async fn forward_proxy_injects_token_grant_before_rewriting_request() {
+        let (ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
+
+        let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect("forward token grant should inject");
+        let rewritten =
+            rewrite_forward_request(&with_token, with_token.len(), "/v1/projects", None, false)
+                .expect("forward request should rewrite");
+        let rewritten = String::from_utf8_lossy(&rewritten);
+
+        assert!(rewritten.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!rewritten.contains("stale-token"));
+        assert_eq!(authorization_header_count(&rewritten), 1);
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_token_grant_failure_returns_error_before_rewrite() {
+        let (ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
+
+        let err = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect_err("forward token grant failure should stop request rewriting");
+
+        assert!(err.to_string().contains("Token grant failed"));
+        assert!(err.to_string().contains("oauth unavailable"));
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
 
     #[test]
     fn test_rewrite_get_request() {

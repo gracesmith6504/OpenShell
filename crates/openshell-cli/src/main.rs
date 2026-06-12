@@ -716,7 +716,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -727,22 +727,26 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with_all = ["from_existing", "from_gcloud_adc"]
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
         )]
         credentials: Vec<String>,
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Only valid for google-vertex-ai providers.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
         from_gcloud_adc: bool,
+
+        /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        runtime_credentials: bool,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -1208,16 +1212,8 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        /// GPU intent is also inferred automatically for known GPU-designated
-        /// image names such as `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
-
-        /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
-        /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
-        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long, requires = "gpu")]
-        gpu_device: Option<String>,
 
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
@@ -1226,6 +1222,14 @@ enum SandboxCommands {
         /// Memory limit for the sandbox (for example: 512Mi, 4Gi, 8G).
         #[arg(long)]
         memory: Option<String>,
+
+        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Validation behavior is not yet finalized.
+        ///
+        /// For Kubernetes, pass a value such as
+        /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
 
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
@@ -1266,6 +1270,10 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Environment variables to inject into the sandbox (KEY=VALUE format, repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
 
         /// Approval mode for agent-authored policy proposals.
         ///
@@ -1372,6 +1380,10 @@ enum SandboxCommands {
         /// Disable pseudo-terminal allocation.
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
+
+        /// Environment variables to set for the command (KEY=VALUE format, repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -2538,9 +2550,9 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
-                    gpu_device,
                     cpu,
                     memory,
+                    driver_config_json,
                     providers,
                     policy,
                     forward,
@@ -2549,6 +2561,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    envs,
                     approval_mode,
                     command,
                 } => {
@@ -2582,6 +2595,9 @@ async fn main() -> Result<()> {
                         }
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
+
+                    // Parse --env flags into a HashMap<String, String>.
+                    let env_map = run::parse_env_pairs(&envs)?;
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -2618,9 +2634,9 @@ async fn main() -> Result<()> {
                         &upload_specs,
                         keep,
                         gpu,
-                        gpu_device.as_deref(),
                         cpu.as_deref(),
                         memory.as_deref(),
+                        driver_config_json.as_deref(),
                         editor,
                         &providers,
                         policy.as_deref(),
@@ -2629,6 +2645,7 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &env_map,
                         &approval_mode,
                         &tls,
                     ))
@@ -2654,20 +2671,26 @@ async fn main() -> Result<()> {
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
                     if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
-                        run::sandbox_sync_up_files(
-                            &ctx.endpoint,
-                            &name,
-                            &base_dir,
-                            &files,
-                            local,
-                            sandbox_dest,
-                            &tls,
-                        )
-                        .await?;
-                        eprintln!("{} Upload complete", "✓".green().bold());
-                        return Ok(());
+                        if !files.is_empty() {
+                            run::sandbox_sync_up_files(
+                                &ctx.endpoint,
+                                &name,
+                                &base_dir,
+                                &files,
+                                local,
+                                sandbox_dest,
+                                &tls,
+                            )
+                            .await?;
+                            eprintln!("{} Upload complete", "✓".green().bold());
+                            return Ok(());
+                        }
+                        eprintln!(
+                            "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                            "⚠".yellow().bold(),
+                            local.display(),
+                        );
                     }
-                    // Fallback: upload without git filtering
                     run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
                     eprintln!("{} Upload complete", "✓".green().bold());
                 }
@@ -2741,6 +2764,7 @@ async fn main() -> Result<()> {
                             timeout,
                             tty,
                             no_tty,
+                            envs,
                             command,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -2752,6 +2776,7 @@ async fn main() -> Result<()> {
                             } else {
                                 None // auto-detect
                             };
+                            let env_map = run::parse_env_pairs(&envs)?;
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
                                 &name,
@@ -2759,6 +2784,7 @@ async fn main() -> Result<()> {
                                 workdir.as_deref(),
                                 timeout,
                                 tty_override,
+                                &env_map,
                                 &tls,
                             )
                             .await?;
@@ -2804,15 +2830,17 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    runtime_credentials,
                     config,
                 } => {
-                    run::provider_create(
+                    run::provider_create_with_options(
                         endpoint,
                         &name,
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
                         from_gcloud_adc,
+                        runtime_credentials,
                         &config,
                         &tls,
                     )
@@ -3883,6 +3911,60 @@ mod tests {
     }
 
     #[test]
+    fn provider_create_requires_credential_source() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+        ])
+        .expect_err("provider create should require a credential source");
+
+        assert!(err.to_string().contains("--runtime-credentials"));
+    }
+
+    #[test]
+    fn provider_create_accepts_runtime_credentials() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+            "--runtime-credentials",
+        ])
+        .expect("provider create should parse runtime credentials");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_existing,
+                        credentials,
+                        from_gcloud_adc,
+                        runtime_credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "spiffe-token-demo");
+                assert_eq!(provider_type, "spiffe-token-demo");
+                assert!(!from_existing);
+                assert!(credentials.is_empty());
+                assert!(!from_gcloud_adc);
+                assert!(runtime_credentials);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn provider_create_rejects_from_gcloud_adc_with_from_existing() {
         let err = Cli::try_parse_from([
             "openshell",
@@ -4330,6 +4412,32 @@ mod tests {
                 assert_eq!(cpu.as_deref(), Some("500m"));
                 assert_eq!(memory.as_deref(), Some("2Gi"));
                 assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_driver_config_json_flag_parses() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--driver-config-json",
+            json,
+        ])
+        .expect("sandbox create driver config JSON flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        driver_config_json, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(driver_config_json.as_deref(), Some(json));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }

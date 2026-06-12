@@ -21,8 +21,11 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
     extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    load_user_active_gateway, remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway,
+    save_last_sandbox, store_gateway_metadata,
+};
+use openshell_bootstrap::{
+    GatewayMetadataSource, ListedGateway, gateway_metadata_source, list_gateways_with_source,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -83,6 +86,7 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
+    GitFilteredEmpty,
 }
 
 /// Convert a sandbox phase integer to a human-readable string.
@@ -922,21 +926,24 @@ pub async fn gateway_add(
         &derived_name
     };
 
-    // Fail if a gateway with this name already exists.
-    if get_gateway_metadata(name).is_some() {
-        return Err(miette::miette!(
-            "Gateway '{}' already exists.\n\
-             Remove it first with: openshell gateway remove {}\n\
-             Or choose a different name with: --name <name>",
-            name,
-            name,
-        ));
+    match gateway_metadata_source(name)? {
+        Some(GatewayMetadataSource::User) => {
+            return Err(miette::miette!(
+                "Gateway '{}' already exists.\n\
+                 Remove it first with: openshell gateway remove {}\n\
+                 Or choose a different name with: --name <name>",
+                name,
+                name,
+            ));
+        }
+        Some(GatewayMetadataSource::System) | None => {}
     }
 
     // OIDC takes precedence over plaintext/mTLS/edge detection — the user
     // explicitly opted in with --oidc-issuer regardless of scheme.
     if let Some(issuer) = oidc_issuer {
-        let previous_active = load_active_gateway();
+        let previous_active = load_user_active_gateway();
+
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -1127,7 +1134,8 @@ pub async fn gateway_add(
         eprintln!("{} TLS certificates present", "✓".green().bold());
     } else {
         // Cloud (edge-authenticated) gateway.
-        let previous_active = load_active_gateway();
+        let previous_active = load_user_active_gateway();
+
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -1283,31 +1291,11 @@ pub fn gateway_logout(name: &str) -> Result<()> {
 
 /// List all registered gateways.
 pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
-    let gateways = list_gateways()?;
+    let gateways = list_gateways_with_source()?;
     let active = gateway_flag.clone().or_else(load_active_gateway);
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &gateways, |g| gateway_to_json(g, &active))? {
+        return Ok(());
     }
 
     if gateways.is_empty() {
@@ -1323,41 +1311,52 @@ pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
     // Calculate column widths
     let name_width = gateways
         .iter()
-        .map(|g| g.name.len())
+        .map(|g| g.metadata.name.len())
         .max()
         .unwrap_or(4)
         .max(4);
     let endpoint_width = gateways
         .iter()
-        .map(|g| g.gateway_endpoint.len())
+        .map(|g| g.metadata.gateway_endpoint.len())
         .max()
         .unwrap_or(8)
         .max(8);
     let type_width = gateways
         .iter()
-        .map(|g| gateway_type_label(g).len())
+        .map(|g| gateway_type_label(&g.metadata).len())
         .max()
         .unwrap_or(4)
         .max(4);
+    let source_width = gateways
+        .iter()
+        .map(|g| g.source.label().len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
 
     // Print header
     println!(
-        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "SOURCE".bold(),
         "AUTH".bold(),
     );
 
     // Print rows
-    for gateway in &gateways {
-        let is_active = active.as_deref() == Some(&gateway.name);
+    for gateway in gateways {
+        let metadata = &gateway.metadata;
+        let is_active = active.as_deref() == Some(&metadata.name);
         let marker = if is_active { "*" } else { " " };
-        let gw_type = gateway_type_label(gateway);
-        let gw_auth = gateway_auth_label(gateway);
+        let gw_type = gateway_type_label(metadata);
+        let gw_auth = gateway_auth_label(metadata);
         let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {gw_auth}",
-            gateway.name, gateway.gateway_endpoint, gw_type,
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {gw_auth}",
+            metadata.name,
+            metadata.gateway_endpoint,
+            gw_type,
+            gateway.source.label(),
         );
         if is_active {
             println!("{}", line.green());
@@ -1369,13 +1368,15 @@ pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
     Ok(())
 }
 
-fn gateway_to_json(gateway: &GatewayMetadata, active: &Option<String>) -> serde_json::Value {
+fn gateway_to_json(gateway: &ListedGateway, active: &Option<String>) -> serde_json::Value {
+    let metadata = &gateway.metadata;
     serde_json::json!({
-        "name": gateway.name,
-        "endpoint": gateway.gateway_endpoint,
-        "type": gateway_type_label(gateway),
-        "auth": gateway_auth_label(gateway),
-        "active": active.as_deref() == Some(&gateway.name),
+        "name": metadata.name,
+        "endpoint": metadata.gateway_endpoint,
+        "type": gateway_type_label(metadata),
+        "source": gateway.source.label(),
+        "auth": gateway_auth_label(metadata),
+        "active": active.as_deref() == Some(&metadata.name),
     })
 }
 
@@ -1474,11 +1475,20 @@ fn remove_gateway_registration(name: &str) {
 
 /// Remove a local gateway registration without touching the gateway service.
 pub fn gateway_remove(name: &str) -> Result<()> {
-    if get_gateway_metadata(name).is_none() {
-        return Err(miette::miette!(
-            "No gateway metadata found for '{name}'.\n\
-             List available gateways: openshell gateway select"
-        ));
+    match gateway_metadata_source(name)? {
+        Some(GatewayMetadataSource::User) => {}
+        Some(GatewayMetadataSource::System) => {
+            return Err(miette::miette!(
+                "Gateway registration '{name}' is installed by the system and cannot be removed from user config.\n\
+                 Register a per-user gateway with the same name to override it, or select another gateway."
+            ));
+        }
+        None => {
+            return Err(miette::miette!(
+                "No gateway metadata found for '{name}'.\n\
+                 List available gateways: openshell gateway select"
+            ));
+        }
     }
 
     remove_gateway_registration(name);
@@ -1607,6 +1617,52 @@ fn build_sandbox_resource_limits(
     Ok(Some(Struct { fields }))
 }
 
+fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json must be valid JSON")?;
+
+    let serde_json::Value::Object(fields) = parsed else {
+        return Err(miette!(
+            "--driver-config-json must be a JSON object keyed by driver name"
+        ));
+    };
+
+    Ok(prost_types::Struct {
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(value) => Kind::BoolValue(value),
+        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
+            miette!("--driver-config-json contains a number that cannot be represented")
+        })?),
+        serde_json::Value::String(value) => Kind::StringValue(value),
+        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
+            values: values
+                .into_iter()
+                .map(json_to_protobuf_value)
+                .collect::<Result<_>>()?,
+        }),
+        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
+                .collect::<Result<_>>()?,
+        }),
+    };
+
+    Ok(Value { kind: Some(kind) })
+}
+
 fn validate_cpu_quantity(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1698,9 +1754,9 @@ pub async fn sandbox_create(
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
     gpu: bool,
-    gpu_device: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    driver_config_json: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
     policy: Option<&str>,
@@ -1709,6 +1765,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    environment: &HashMap<String, String>,
     approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1752,7 +1809,7 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
+    let requested_gpu = gpu;
 
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
@@ -1770,11 +1827,15 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
+    let driver_config = driver_config_json
+        .map(parse_driver_config_json)
+        .transpose()?;
 
-    let template = if image.is_some() || resource_limits.is_some() {
+    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
+            driver_config,
             ..SandboxTemplate::default()
         })
     } else {
@@ -1784,7 +1845,7 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
-            gpu_device: gpu_device.unwrap_or_default().to_string(),
+            environment: environment.clone(),
             policy,
             providers: configured_providers,
             template,
@@ -2092,6 +2153,21 @@ pub async fn sandbox_create(
                         )
                         .await?;
                     }
+                    SandboxUploadPlan::GitFilteredEmpty => {
+                        eprintln!(
+                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                            "⚠".yellow().bold(),
+                            local.display(),
+                        );
+                        sandbox_sync_up(
+                            &effective_server,
+                            &sandbox_name,
+                            local,
+                            dest,
+                            &effective_tls,
+                        )
+                        .await?;
+                    }
                     SandboxUploadPlan::Regular => {
                         sandbox_sync_up(
                             &effective_server,
@@ -2339,19 +2415,6 @@ fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
     !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
 }
 
-fn image_requests_gpu(image: &str) -> bool {
-    let image_name = image
-        .rsplit('/')
-        .next()
-        .unwrap_or(image)
-        .split([':', '@'])
-        .next()
-        .unwrap_or(image)
-        .to_ascii_lowercase();
-
-    image_name.contains("gpu")
-}
-
 fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
     !metadata.is_some_and(|metadata| metadata.is_remote)
 }
@@ -2587,6 +2650,7 @@ const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
     name: &str,
@@ -2594,6 +2658,7 @@ pub async fn sandbox_exec_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     tty_override: Option<bool>,
+    environment: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2648,8 +2713,15 @@ pub async fn sandbox_exec_grpc(
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
     if tty_override == Some(true) && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(client, &sandbox, command, workdir, timeout_seconds)
-            .await;
+        return sandbox_exec_interactive_grpc(
+            client,
+            &sandbox,
+            command,
+            workdir,
+            timeout_seconds,
+            environment,
+        )
+        .await;
     }
 
     // Make the streaming gRPC call.
@@ -2658,7 +2730,7 @@ pub async fn sandbox_exec_grpc(
             sandbox_id: sandbox.object_id().to_string(),
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
-            environment: HashMap::new(),
+            environment: environment.clone(),
             timeout_seconds,
             stdin: stdin_payload,
             tty,
@@ -3004,6 +3076,7 @@ async fn sandbox_exec_interactive_grpc(
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
+    environment: &HashMap<String, String>,
 ) -> Result<i32> {
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3019,7 +3092,7 @@ async fn sandbox_exec_interactive_grpc(
                 sandbox_id: sandbox.object_id().to_string(),
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
-                environment: HashMap::new(),
+                environment: environment.clone(),
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,
@@ -3212,22 +3285,8 @@ pub async fn sandbox_list(
 
     let sandboxes = response.into_inner().sandboxes;
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+        return Ok(());
     }
 
     if sandboxes.is_empty() {
@@ -3837,7 +3896,7 @@ async fn auto_create_provider(
     Ok(())
 }
 
-fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
+pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
     for item in items {
@@ -3854,6 +3913,34 @@ fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String,
     }
 
     Ok(map)
+}
+
+pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let map = parse_key_value_pairs(items, "--env")?;
+    for key in map.keys() {
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn is_valid_env_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
 }
 
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
@@ -4408,7 +4495,8 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
 
     miette::miette!(
         "no credentials resolved for provider type '{provider_type}'. \
-         Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+         Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, \
+         or --from-existing with the appropriate env vars set."
     )
 }
 
@@ -4423,14 +4511,45 @@ pub async fn provider_create(
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
-    if from_gcloud_adc && (from_existing || !credentials.is_empty()) {
+    provider_create_with_options(
+        server,
+        name,
+        provider_type,
+        from_existing,
+        credentials,
+        from_gcloud_adc,
+        false,
+        config,
+        tls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn provider_create_with_options(
+    server: &str,
+    name: &str,
+    provider_type: &str,
+    from_existing: bool,
+    credentials: &[String],
+    from_gcloud_adc: bool,
+    runtime_credentials: bool,
+    config: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
+    if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing or --credential"
+            "--from-gcloud-adc cannot be combined with --from-existing or --credential; it also cannot be combined with --runtime-credentials"
         ));
     }
-    if from_existing && !credentials.is_empty() {
+    if from_existing && (!credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential"
+            "--from-existing cannot be combined with --credential or --runtime-credentials"
+        ));
+    }
+    if runtime_credentials && !credentials.is_empty() {
+        return Err(miette::miette!(
+            "--runtime-credentials cannot be combined with --credential"
         ));
     }
 
@@ -4493,11 +4612,25 @@ pub async fn provider_create(
         if from_existing {
             return Err(missing_credentials_error(&provider_type));
         }
-        let allows_refresh_bootstrap = fetch_provider_profile(&mut client, &provider_type)
-            .await
-            .ok()
-            .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
-        if !allows_refresh_bootstrap {
+        if !from_gcloud_adc && !runtime_credentials {
+            return Err(missing_credentials_error(&provider_type));
+        }
+        let allows_empty_credentials = if runtime_credentials {
+            provider_profile_allows_empty_credentials(
+                &fetch_provider_profile(&mut client, &provider_type).await?,
+            )
+        } else {
+            fetch_provider_profile(&mut client, &provider_type)
+                .await
+                .ok()
+                .is_some_and(|profile| provider_profile_allows_empty_credentials(&profile))
+        };
+        if !allows_empty_credentials {
+            if runtime_credentials {
+                return Err(miette::miette!(
+                    "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
+                ));
+            }
             return Err(missing_credentials_error(&provider_type));
         }
     }
@@ -4592,8 +4725,8 @@ pub async fn provider_create(
     Ok(())
 }
 
-fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
-    ProviderTypeProfile::from_proto(profile).allows_gateway_refresh_bootstrap()
+fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
+    ProviderTypeProfile::from_proto(profile).allows_empty_provider_credentials()
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -4727,17 +4860,12 @@ pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions
         .map(ProviderTypeProfile::from_proto)
         .collect::<Vec<_>>();
 
-    match output {
-        "yaml" => {
-            print!("{}", profiles_to_yaml(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "json" => {
-            println!("{}", profiles_to_json(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_direct(
+        output,
+        || profiles_to_json(&dto_profiles).into_diagnostic(),
+        || profiles_to_yaml(&dto_profiles).into_diagnostic(),
+    )? {
+        return Ok(());
     }
 
     if profiles.is_empty() {
@@ -4778,15 +4906,14 @@ pub async fn provider_profile_export(
         .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
-    match output {
-        "yaml" => print!("{}", profile_to_yaml(&profile).into_diagnostic()?),
-        "json" => println!("{}", profile_to_json(&profile).into_diagnostic()?),
-        "table" => {
-            return Err(miette!(
-                "profile export supports '-o yaml' and '-o json'; table output is not supported"
-            ));
-        }
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if !crate::output::print_output_direct(
+        output,
+        || profile_to_json(&profile).into_diagnostic(),
+        || profile_to_yaml(&profile).into_diagnostic(),
+    )? {
+        return Err(miette!(
+            "profile export supports '-o yaml' and '-o json'; table output is not supported"
+        ));
     }
     Ok(())
 }
@@ -5753,6 +5880,9 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         && !metadata.file_type().is_symlink()
         && let Ok((base_dir, files)) = git_sync_files(local_path)
     {
+        if files.is_empty() {
+            return Ok(SandboxUploadPlan::GitFilteredEmpty);
+        }
         return Ok(SandboxUploadPlan::GitAware { base_dir, files });
     }
 
@@ -7467,19 +7597,18 @@ mod tests {
         ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
+        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
-        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
+        progress_step_from_metadata, provider_profile_allows_empty_credentials,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
-    use openshell_bootstrap::{load_active_gateway, load_gateway_metadata, store_gateway_metadata};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -7488,15 +7617,18 @@ mod tests {
     use std::thread;
     use tonic::Status;
 
-    use openshell_bootstrap::GatewayMetadata;
+    use openshell_bootstrap::{
+        GatewayMetadata, GatewayMetadataSource, ListedGateway, load_active_gateway,
+        load_gateway_metadata, load_user_active_gateway, store_gateway_metadata,
+    };
     use openshell_core::progress::{
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
         Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-        SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -7548,6 +7680,22 @@ mod tests {
         );
         f();
         drop(guard);
+    }
+    fn with_tmp_xdg_and_system<F: FnOnce()>(tmp: &Path, system: &Path, f: F) {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let xdg_guard = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            tmp.to_str().expect("temp path should be utf-8"),
+        );
+        let system_guard = EnvVarGuard::set(
+            "OPENSHELL_SYSTEM_GATEWAY_DIR",
+            system.to_str().expect("system path should be utf-8"),
+        );
+        f();
+        drop(system_guard);
+        drop(xdg_guard);
     }
 
     fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -7723,7 +7871,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_bootstrap_requires_all_required_credentials_to_be_gateway_mintable() {
+    fn empty_provider_credentials_require_all_required_credentials_to_be_runtime_resolvable() {
         let refresh_token_profile = ProviderProfile {
             credentials: vec![ProviderProfileCredential {
                 name: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -7736,8 +7884,24 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(provider_profile_allows_refresh_bootstrap(
+        assert!(provider_profile_allows_empty_credentials(
             &refresh_token_profile
+        ));
+
+        let token_grant_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                token_grant: Some(ProviderCredentialTokenGrant {
+                    token_endpoint: "https://auth.example.com/token".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(provider_profile_allows_empty_credentials(
+            &token_grant_profile
         ));
 
         let mixed_static_profile = ProviderProfile {
@@ -7760,7 +7924,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(!provider_profile_allows_refresh_bootstrap(
+        assert!(!provider_profile_allows_empty_credentials(
             &mixed_static_profile
         ));
 
@@ -7776,7 +7940,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(provider_profile_allows_refresh_bootstrap(
+        assert!(provider_profile_allows_empty_credentials(
             &optional_refresh_profile
         ));
     }
@@ -7874,6 +8038,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_driver_config_json_accepts_driver_keyed_object() {
+        let config =
+            parse_driver_config_json(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#)
+                .expect("driver config should parse");
+
+        let kubernetes = config
+            .fields
+            .get("kubernetes")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("kubernetes block should be a struct");
+        let pod = kubernetes
+            .fields
+            .get("pod")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("pod block should be a struct");
+
+        assert!(pod.fields.contains_key("node_selector"));
+    }
+
+    #[test]
+    fn parse_driver_config_json_rejects_non_object() {
+        let err = parse_driver_config_json(r#"["kubernetes"]"#)
+            .expect_err("top-level array should be rejected");
+
+        assert!(
+            err.to_string().contains("keyed by driver name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_driver_config_json_rejects_invalid_json() {
+        let err = parse_driver_config_json(r#"{"kubernetes":"#)
+            .expect_err("invalid JSON should be rejected");
+
+        assert!(
+            err.to_string().contains("must be valid JSON"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn inferred_provider_type_returns_type_for_known_command() {
         let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
         assert_eq!(result, Some("claude-code".to_string()));
@@ -7922,36 +8136,6 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
-    }
-
-    #[test]
-    fn image_requests_gpu_matches_known_gpu_image_names() {
-        for image in [
-            "ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest",
-            "registry.example.com/team/gpu:dev",
-            "nvcr.io/example/my-gpu-image@sha256:deadbeef",
-        ] {
-            assert!(
-                image_requests_gpu(image),
-                "expected GPU detection for {image}"
-            );
-        }
-    }
-
-    #[test]
-    fn image_requests_gpu_ignores_non_gpu_image_names() {
-        for image in [
-            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
-            "registry.example.com/gpu/team/base:latest",
-            "registry.example.com/team/notebook:latest",
-            "cuda-toolkit:latest",
-            "registry.example.com/team/graphics:latest",
-        ] {
-            assert!(
-                !image_requests_gpu(image),
-                "did not expect GPU detection for {image}"
-            );
-        }
     }
 
     #[test]
@@ -8264,6 +8448,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("runs")).expect("create repo");
+        init_git_repo(&repo);
+        fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
+        fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
+
+        let plan =
+            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+
+        assert_eq!(
+            plan,
+            super::SandboxUploadPlan::GitFilteredEmpty,
+            "gitignored directory should fall back with GitFilteredEmpty"
+        );
+    }
+
+    #[test]
     fn git_sync_files_ignores_inherited_git_env() {
         let _lock = TEST_ENV_LOCK
             .lock()
@@ -8420,6 +8623,26 @@ mod tests {
         assert!(items[1].contains("local"));
         assert!(items[1].contains("plaintext"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn gateway_to_json_includes_config_source() {
+        let gateway = ListedGateway {
+            metadata: GatewayMetadata {
+                name: "local-vm".to_string(),
+                gateway_endpoint: "http://127.0.0.1:17670".to_string(),
+                auth_mode: Some("plaintext".to_string()),
+                ..Default::default()
+            },
+            source: GatewayMetadataSource::System,
+        };
+
+        let json = gateway_to_json(&gateway, &Some("local-vm".to_string()));
+
+        assert_eq!(json["source"], "system");
+        assert_eq!(json["type"], "local");
+        assert_eq!(json["auth"], "plaintext");
+        assert_eq!(json["active"], true);
     }
 
     #[test]
@@ -8787,7 +9010,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_bootstrap_allows_oauth2_refresh_token() {
+    fn empty_provider_credentials_allow_oauth2_refresh_token() {
         use openshell_core::proto::{
             ProviderCredentialRefresh, ProviderCredentialRefreshStrategy, ProviderProfile,
             ProviderProfileCredential,
@@ -8806,7 +9029,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            provider_profile_allows_refresh_bootstrap(&profile),
+            provider_profile_allows_empty_credentials(&profile),
             "Oauth2RefreshToken should be allowed for refresh bootstrap"
         );
     }
@@ -8868,12 +9091,54 @@ mod tests {
             );
         });
     }
+    #[test]
+    fn gateway_add_oidc_rollback_keeps_system_active_fallback_userless() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let user = tempfile::tempdir().expect("create user tmpdir");
+        let system = tempfile::tempdir().expect("create system tmpdir");
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            fs::write(system.path().join("active_gateway"), "system-default")
+                .expect("write system active gateway");
+            assert_eq!(load_user_active_gateway(), None);
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "https://gateway.example.com",
+                    Some("oidc-fail"),
+                    None,
+                    false,
+                    Some("http://127.0.0.1:1/realms/nonexistent"),
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            assert!(
+                load_gateway_metadata("oidc-fail").is_err(),
+                "failed OIDC gateway should be removed after auth failure"
+            );
+            assert_eq!(
+                load_user_active_gateway(),
+                None,
+                "rollback should not persist the system fallback into user config"
+            );
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+        });
+    }
 
     #[test]
     fn gateway_add_cloud_rolls_back_on_auth_failure() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
+            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
+            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
 
             // Register a working plaintext gateway first.
@@ -8894,12 +9159,9 @@ mod tests {
             });
             assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
 
-            // Attempt cloud gateway add. The browser flow will fail because
-            // OPENSHELL_NO_BROWSER is NOT set but the /auth/connect endpoint
-            // is unreachable (connection refused), so the 120s timeout would
-            // kick in. To keep the test fast, set OPENSHELL_NO_BROWSER=0
-            // (explicitly not suppressed) and use a port that refuses connections.
-            // The CF auth flow will fail quickly on connection refused.
+            // Attempt cloud gateway add. Keep browser suppression disabled so
+            // auth failure still rolls back the registration, but use the
+            // test-only auth failure hook instead of opening the OS browser.
             runtime.block_on(async {
                 gateway_add(
                     "https://127.0.0.1:1",
@@ -8926,6 +9188,48 @@ mod tests {
                 Some("existing-gw"),
                 "active gateway should be restored after rollback"
             );
+        });
+    }
+    #[test]
+    fn gateway_add_cloud_rollback_keeps_system_active_fallback_userless() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let user = tempfile::tempdir().expect("create user tmpdir");
+        let system = tempfile::tempdir().expect("create system tmpdir");
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
+            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
+            fs::write(system.path().join("active_gateway"), "system-default")
+                .expect("write system active gateway");
+            assert_eq!(load_user_active_gateway(), None);
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "https://127.0.0.1:1",
+                    Some("cloud-fail"),
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            assert!(
+                load_gateway_metadata("cloud-fail").is_err(),
+                "failed cloud gateway should be removed after auth failure"
+            );
+            assert_eq!(
+                load_user_active_gateway(),
+                None,
+                "rollback should not persist the system fallback into user config"
+            );
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
         });
     }
 }

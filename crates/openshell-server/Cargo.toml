@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
@@ -35,7 +35,7 @@ k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC
-tonic = { workspace = true, features = ["channel", "tls"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
@@ -86,6 +86,7 @@ sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 async-trait = "0.1"
 url = { workspace = true }
+glob = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand = { workspace = true }
@@ -96,6 +97,11 @@ rustix = { workspace = true }
 x509-parser = "0.16"
 
 [features]
+default = ["telemetry"]
+## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
+## On by default; build with `--no-default-features` for a telemetry-free gateway
+## that contains no telemetry endpoint, HTTP client, or emission code.
+telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
 test-support = []

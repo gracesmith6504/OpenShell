@@ -4,6 +4,7 @@
 suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
+  - templates/deployment.yaml
   - templates/statefulset.yaml
 release:
   name: openshell
@@ -17,6 +18,29 @@ tests:
     asserts:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
+
+  - it: renders a StatefulSet by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
+
+  - it: treats a null workload map as the default StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      workload: null
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
+
+  - it: uses a stable gateway container name
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
 
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
@@ -70,6 +94,22 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_secrets\s*=\s*\["regcred", "backup-regcred"\]'
 
+  - it: renders the default sandbox AppArmor profile under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?app_armor_profile\s*=\s*"Unconfined"'
+
+  - it: omits sandbox AppArmor profile when disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.appArmorProfile: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'app_armor_profile\s*='
+
   - it: does not reuse gateway image pull secrets for sandbox pods
     template: templates/gateway-config.yaml
     set:
@@ -102,6 +142,64 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_unauthenticated_users\s*=\s*true'
+
+  - it: omits the gRPC rate limit by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'grpc_rate_limit_requests\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'grpc_rate_limit_window_seconds\s*='
+
+  - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
+    template: templates/gateway-config.yaml
+    set:
+      server.grpcRateLimit.requests: 120
+      server.grpcRateLimit.windowSeconds: 60
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?grpc_rate_limit_requests\s*=\s*120'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?grpc_rate_limit_window_seconds\s*=\s*60'
+
+  # The validation lives in gateway-config.yaml but surfaces through the
+  # statefulset checksum include, so the failure is asserted against that
+  # template (mirrors the postgres serviceBindings failure test below).
+  - it: fails to render when only requests is positive
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.requests: 120
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
+
+  - it: fails to render when only windowSeconds is positive
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.windowSeconds: 60
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
+
+  - it: fails to render when requests is negative
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.requests: -1
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
+
+  - it: fails to render when windowSeconds is negative
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.windowSeconds: -5
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
 
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
@@ -154,15 +252,95 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
 
-  - it: does not pass --db-url in args when postgres.enabled is true
+  - it: fails when legacy postgres.enabled is set
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.auth.password: test-pw
     asserts:
+      - failedTemplate:
+          errorPattern: "postgres.enabled was removed"
+
+  - it: fails when multiple replicas use the default SQLite database
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount > 1 requires server.externalDbSecret"
+
+  - it: renders a Deployment for external database-backed gateway workloads
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - equal:
+          path: kind
+          value: Deployment
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
       - notContains:
-          path: spec.template.spec.containers[0].args
-          content: "--db-url"
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: openshell-data
+            mountPath: /var/openshell
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-secret
+                key: uri
+
+  - it: fails when a Deployment uses the default SQLite database
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+    asserts:
+      - failedTemplate:
+          errorPattern: "workload.kind=deployment requires server.externalDbSecret"
+
+  - it: fails when multiple replicas use a StatefulSet without an override
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true"
+
+  - it: allows a multi-replica StatefulSet with an external database and explicit override
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+      workload.allowMultiReplicaStatefulSet: true
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 2
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: openshell-data
+            mountPath: /var/openshell
+
+  - it: fails when workload.kind is invalid
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: daemonset
+    asserts:
+      - failedTemplate:
+          errorPattern: "workload.kind must be one of: statefulset, deployment"
 
   - it: does not pass --db-url in args when externalDbSecret is set
     template: templates/statefulset.yaml
@@ -173,79 +351,7 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--db-url"
 
-  - it: references Bitnami service-binding Secret when postgres.enabled is true
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: openshell-postgres-svcbind-custom-user
-                key: uri
-
-  - it: respects postgres.fullnameOverride for bundled service-binding Secret
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      postgres.fullnameOverride: my-pg
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: my-pg-svcbind-custom-user
-                key: uri
-
-  - it: respects postgres.nameOverride for bundled service-binding Secret
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      postgres.nameOverride: pgdb
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: openshell-pgdb-svcbind-custom-user
-                key: uri
-
-  - it: fails when serviceBindings is disabled with bundled postgres
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.serviceBindings.enabled: false
-    asserts:
-      - failedTemplate:
-          errorMessage: "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL"
-
-  - it: allows serviceBindings disabled when externalDbSecret is set
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.serviceBindings.enabled: false
-      server.externalDbSecret: my-external-secret
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: my-external-secret
-                key: uri
-
-  - it: references externalDbSecret when set without postgres.enabled
+  - it: references externalDbSecret when set
     template: templates/statefulset.yaml
     set:
       server.externalDbSecret: my-pg-secret
@@ -259,18 +365,45 @@ tests:
                 name: my-pg-secret
                 key: uri
 
-  - it: externalDbSecret overrides bundled secret when both are set
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      server.externalDbSecret: my-external-secret
+  - it: renders HA external database configuration from the CI overlay as a Deployment
+    template: templates/deployment.yaml
+    values:
+      - ../ci/values-high-availability.yaml
     asserts:
+      - equal:
+          path: kind
+          value: Deployment
+      - equal:
+          path: spec.replicas
+          value: 2
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: OPENSHELL_DB_URL
             valueFrom:
               secretKeyRef:
-                name: my-external-secret
+                name: openshell-ha-pg
                 key: uri
+  - it: renders provider SPIFFE token grants while keeping gateway JWT auth
+    set:
+      server.providerTokenGrants.spiffe.enabled: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.gateway_jwt\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'provider_spiffe_workload_api_socket_path\s*=\s*"/spiffe-workload-api/spire-agent\.sock"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.spiffe\]'
+
+  - it: keeps the gateway sandbox JWT secret mounted when provider SPIFFE grants are enabled
+    set:
+      server.providerTokenGrants.spiffe.enabled: true
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.volumes[1].name
+          pattern: '^sandbox-jwt$'

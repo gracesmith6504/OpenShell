@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-prover = { path = "../openshell-prover" }
@@ -30,7 +30,7 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC client
-tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
 
 # CLI
 chrono = "0.4"

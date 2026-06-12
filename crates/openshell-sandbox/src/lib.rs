@@ -25,8 +25,10 @@ pub mod proxy;
 mod sandbox;
 mod secrets;
 mod skills;
+mod spiffe_endpoint;
 mod ssh;
 mod supervisor_session;
+mod token_grant;
 
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
@@ -370,59 +372,73 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env_revision, provider_env, provider_credential_expires_at_ms) =
-        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match grpc_client::fetch_provider_environment(endpoint, id).await {
-                Ok(result) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .message(format!(
-                                "Fetched provider environment [env_count:{}]",
-                                result.environment.len()
-                            ))
-                            .build()
-                    );
-                    (
-                        result.provider_env_revision,
-                        result.environment,
-                        result.credential_expires_at_ms,
-                    )
-                }
-                Err(e) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "degraded")
-                            .message(format!(
-                                "Failed to fetch provider environment, continuing without: {e}"
-                            ))
-                            .build()
-                    );
-                    (
-                        0,
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                    )
-                }
+    let (
+        provider_env_revision,
+        provider_env,
+        provider_credential_expires_at_ms,
+        dynamic_credentials,
+    ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+        match grpc_client::fetch_provider_environment(endpoint, id).await {
+            Ok(result) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .message(format!(
+                            "Fetched provider environment [env_count:{}]",
+                            result.environment.len()
+                        ))
+                        .build()
+                );
+                (
+                    result.provider_env_revision,
+                    result.environment,
+                    result.credential_expires_at_ms,
+                    result.dynamic_credentials,
+                )
             }
-        } else {
-            (
-                0,
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            )
-        };
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .message(format!(
+                            "Failed to fetch provider environment, continuing without: {e}"
+                        ))
+                        .build()
+                );
+                (
+                    0,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            }
+        }
+    } else {
+        (
+            0,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+    };
 
     let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
         provider_env_revision,
         provider_env,
         provider_credential_expires_at_ms,
+        dynamic_credentials,
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
+
+    let user_environment: std::collections::HashMap<String, String> =
+        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -590,6 +606,13 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
+
+    // Prepare the child-only mount namespace before the supervisor seccomp
+    // prelude blocks mount operations. Children enter this namespace with
+    // `setns` in pre_exec so supervisor identity sockets stay hidden from
+    // untrusted code while remaining available to the supervisor for refresh.
+    #[cfg(target_os = "linux")]
+    process::prepare_supervisor_identity_mount_namespace_from_env()?;
 
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
@@ -806,6 +829,7 @@ pub async fn run_sandbox(
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
+        let user_env_clone = user_environment.clone();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -819,6 +843,7 @@ pub async fn run_sandbox(
                 proxy_url,
                 ca_paths,
                 provider_credentials_clone,
+                user_env_clone,
             )
             .await
             {
@@ -2623,6 +2648,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         env_result.provider_env_revision,
                         env_result.environment,
                         env_result.credential_expires_at_ms,
+                        env_result.dynamic_credentials,
                     );
                     current_provider_env_revision = env_result.provider_env_revision;
                     ocsf_emit!(
@@ -3345,6 +3371,7 @@ filesystem_policy:
         });
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn telemetry_enabled_creates_activity_collection_and_flush_channel() {
         let _guard = ENV_LOCK.lock().unwrap();
