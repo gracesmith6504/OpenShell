@@ -1,0 +1,47 @@
+name: Nested Virtualization Probe
+
+on:
+  push:
+    branches:
+      - "alangou/test-nested-virtualization-shared-runner"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label to probe"
+        required: false
+        type: string
+        default: "linux-amd64-cpu8"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    name: Probe nested virtualization
+    runs-on: ${{ inputs.runner || 'linux-amd64-cpu8' }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Print CPU virtualization signals
+        run: |
+          set -euo pipefail
+
+          echo "runner_name=${RUNNER_NAME}"
+          echo "runner_os=${RUNNER_OS}"
+          echo "runner_arch=${RUNNER_ARCH}"
+          uname -a
+
+          echo "vmx_count=$(grep -cw vmx /proc/cpuinfo || true)"
+          echo "svm_count=$(grep -cw svm /proc/cpuinfo || true)"
+
+          echo "::group::/dev/kvm"
+          ls -l /dev/kvm || true
+          echo "::endgroup::"
+
+          echo "::group::/proc/cpuinfo"
+          cat /proc/cpuinfo
+          echo "::endgroup::"
