@@ -25,9 +25,8 @@ trap cleanup EXIT
 
 mkdir -p "${TMP_DIR}/bundle/policies" "${TMP_DIR}/bundle/providers"
 cp "${SCRIPT_DIR}/bundle/policies/default.yaml" "${TMP_DIR}/bundle/policies/default.yaml"
-cp "${SCRIPT_DIR}/bundle/policies/gitlab.yaml" "${TMP_DIR}/bundle/policies/gitlab.yaml"
-cp "${SCRIPT_DIR}/bundle/policies/github.yaml" "${TMP_DIR}/bundle/policies/github.yaml"
-cp "${SCRIPT_DIR}/bundle/providers/example.yaml" "${TMP_DIR}/bundle/providers/example.yaml"
+cp "${SCRIPT_DIR}/bundle/providers/gitlab.yaml" "${TMP_DIR}/bundle/providers/gitlab.yaml"
+cp "${SCRIPT_DIR}/bundle/providers/github.yaml" "${TMP_DIR}/bundle/providers/github.yaml"
 
 echo "Building policy source example binaries"
 RUSTC_WRAPPER= cargo build \
@@ -59,12 +58,11 @@ if [[ ! -S "${SOCKET}" ]]; then
   exit 1
 fi
 
-echo "Checking default, gitlab, and github policy documents over gRPC"
+echo "Checking the default policy and github/gitlab providers over gRPC"
 "${TARGET_DIR}/policy-source-check" \
   --socket "${SOCKET}" \
   --expect-policy default \
-  --expect-policy gitlab \
-  --expect-policy github \
-  --expect-provider example
+  --expect-provider gitlab \
+  --expect-provider github
 
 echo "Policy source smoke test passed"

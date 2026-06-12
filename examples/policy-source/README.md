@@ -10,10 +10,9 @@ can be loaded directly from the filesystem or served over local gRPC.
 bundle/
   policies/
     default.yaml
-    gitlab.yaml
-    github.yaml
   providers/
-    example.yaml
+    github.yaml
+    gitlab.yaml
 ```
 
 The source service listens on a Unix domain socket and implements
@@ -56,9 +55,9 @@ examples/policy-source/smoke.sh
 ```
 
 The script builds `policy-source-server` and `policy-source-check`, creates a
-temporary source root, adds `default`, `gitlab`, and `github` policy documents,
-starts the Unix-socket gRPC server, and verifies those policies through the
-gRPC API.
+temporary source root, adds the `default` policy and the `github` and `gitlab`
+provider profiles, starts the Unix-socket gRPC server, and verifies those
+documents through the gRPC API.
 
 Run the server directly:
 
