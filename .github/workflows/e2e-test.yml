@@ -23,8 +23,38 @@ permissions:
   packages: read
 
 jobs:
+  e2e-binaries:
+    name: E2E binaries
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - name: Build gateway and CLI
+        run: |
+          cargo build -p openshell-server --bin openshell-gateway --features openshell-core/dev-settings
+          cargo build -p openshell-cli --bin openshell --features openshell-core/dev-settings
+
+      - name: Upload e2e binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-e2e-binaries
+          path: |
+            target/debug/openshell
+            target/debug/openshell-gateway
+
   e2e:
     name: "E2E (${{ matrix.suite }})"
+    needs: e2e-binaries
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     strategy:
@@ -66,11 +96,22 @@ jobs:
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
+      - name: Download OpenShell e2e binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-e2e-binaries
+          path: target/debug
+
+      - name: Mark OpenShell e2e binaries executable
+        run: chmod +x target/debug/openshell target/debug/openshell-gateway
+
       - name: Install OS test dependencies
         if: matrix.apt_packages != ''
         env:
           APT_PACKAGES: ${{ matrix.apt_packages }}
-        run: apt-get update && apt-get install -y ${APT_PACKAGES} && rm -rf /var/lib/apt/lists/*
+        run: |
+          # shellcheck disable=SC2086
+          apt-get update && apt-get install -y ${APT_PACKAGES} && rm -rf /var/lib/apt/lists/*
 
       - name: Log in to GHCR with Docker
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -104,6 +145,8 @@ jobs:
       - name: Run tests
         env:
           OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+          OPENSHELL_E2E_PREBUILT_GATEWAY_BIN: ${{ github.workspace }}/target/debug/openshell-gateway
+          OPENSHELL_E2E_PREBUILT_CLI_BIN: ${{ github.workspace }}/target/debug/openshell
           E2E_CMD: ${{ matrix.cmd }}
         run: |
           if [ "${{ matrix.rootless }}" = "true" ]; then
@@ -122,6 +165,8 @@ jobs:
               OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
               OPENSHELL_REGISTRY_USERNAME="${OPENSHELL_REGISTRY_USERNAME}" \
               OPENSHELL_REGISTRY_PASSWORD="${OPENSHELL_REGISTRY_PASSWORD}" \
+              OPENSHELL_E2E_PREBUILT_GATEWAY_BIN="${OPENSHELL_E2E_PREBUILT_GATEWAY_BIN}" \
+              OPENSHELL_E2E_PREBUILT_CLI_BIN="${OPENSHELL_E2E_PREBUILT_CLI_BIN}" \
               IMAGE_TAG="${IMAGE_TAG}" \
               MISE_GITHUB_TOKEN="${MISE_GITHUB_TOKEN}" \
               bash -c "${E2E_CMD}"

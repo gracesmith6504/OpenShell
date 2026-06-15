@@ -12,7 +12,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
 
-cargo build -p openshell-cli --features openshell-core/dev-settings
+if [ -z "${OPENSHELL_E2E_PREBUILT_GATEWAY_BIN:-}" ] || [ -z "${OPENSHELL_E2E_PREBUILT_CLI_BIN:-}" ]; then
+  cargo build -p openshell-cli --features openshell-core/dev-settings
+fi
 
 TEST_ARGS=(
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"

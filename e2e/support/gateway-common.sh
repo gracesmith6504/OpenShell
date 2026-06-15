@@ -172,17 +172,47 @@ e2e_build_gateway_binaries() {
   local target_var=$2
   local gateway_var=$3
   local cli_var=$4
-  local target_dir
+  local resolved_target_dir
+  local prebuilt_gateway="${OPENSHELL_E2E_PREBUILT_GATEWAY_BIN:-}"
+  local prebuilt_cli="${OPENSHELL_E2E_PREBUILT_CLI_BIN:-}"
   local jobs=()
+
+  # CI workflows can build these once and share them across e2e jobs. When
+  # unset, keep the local developer path unchanged and build from source here.
+  if [ -n "${prebuilt_gateway}" ] || [ -n "${prebuilt_cli}" ]; then
+    local prebuilt_cli_dir
+
+    if [ -z "${prebuilt_gateway}" ] || [ -z "${prebuilt_cli}" ]; then
+      echo "ERROR: set both OPENSHELL_E2E_PREBUILT_GATEWAY_BIN and OPENSHELL_E2E_PREBUILT_CLI_BIN, or neither." >&2
+      exit 2
+    fi
+    if [ ! -x "${prebuilt_gateway}" ]; then
+      echo "ERROR: OPENSHELL_E2E_PREBUILT_GATEWAY_BIN is not executable: ${prebuilt_gateway}" >&2
+      exit 2
+    fi
+    if [ ! -x "${prebuilt_cli}" ]; then
+      echo "ERROR: OPENSHELL_E2E_PREBUILT_CLI_BIN is not executable: ${prebuilt_cli}" >&2
+      exit 2
+    fi
+
+    prebuilt_cli_dir="$(cd "$(dirname "${prebuilt_cli}")" && pwd)"
+    resolved_target_dir="${OPENSHELL_E2E_PREBUILT_TARGET_DIR:-$(cd "${prebuilt_cli_dir}/.." && pwd)}"
+    printf -v "${target_var}" '%s' "${resolved_target_dir}"
+    printf -v "${gateway_var}" '%s' "${prebuilt_gateway}"
+    printf -v "${cli_var}" '%s' "${prebuilt_cli}"
+    echo "Using prebuilt e2e gateway binary: ${prebuilt_gateway}"
+    echo "Using prebuilt e2e CLI binary: ${prebuilt_cli}"
+    return 0
+  fi
 
   if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
     jobs=(-j "${CARGO_BUILD_JOBS}")
   fi
 
-  target_dir="$(e2e_cargo_target_dir "${root}")"
-  printf -v "${target_var}" '%s' "${target_dir}"
-  printf -v "${gateway_var}" '%s' "${target_dir}/debug/openshell-gateway"
-  printf -v "${cli_var}" '%s' "${target_dir}/debug/openshell"
+  resolved_target_dir="$(e2e_cargo_target_dir "${root}")"
+  printf -v "${target_var}" '%s' "${resolved_target_dir}"
+  printf -v "${gateway_var}" '%s' "${resolved_target_dir}/debug/openshell-gateway"
+  printf -v "${cli_var}" '%s' "${resolved_target_dir}/debug/openshell"
 
   echo "Building openshell-gateway..."
   cargo build "${jobs[@]}" \
@@ -194,12 +224,12 @@ e2e_build_gateway_binaries() {
     -p openshell-cli --bin openshell \
     --features openshell-core/dev-settings
 
-  if [ ! -x "${target_dir}/debug/openshell-gateway" ]; then
-    echo "ERROR: expected openshell-gateway binary at ${target_dir}/debug/openshell-gateway" >&2
+  if [ ! -x "${resolved_target_dir}/debug/openshell-gateway" ]; then
+    echo "ERROR: expected openshell-gateway binary at ${resolved_target_dir}/debug/openshell-gateway" >&2
     exit 1
   fi
-  if [ ! -x "${target_dir}/debug/openshell" ]; then
-    echo "ERROR: expected openshell CLI binary at ${target_dir}/debug/openshell" >&2
+  if [ ! -x "${resolved_target_dir}/debug/openshell" ]; then
+    echo "ERROR: expected openshell CLI binary at ${resolved_target_dir}/debug/openshell" >&2
     exit 1
   fi
 }

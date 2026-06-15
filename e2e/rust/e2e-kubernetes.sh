@@ -21,7 +21,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
 
-cargo build -p openshell-cli --features openshell-core/dev-settings
+if [ -z "${OPENSHELL_E2E_PREBUILT_GATEWAY_BIN:-}" ] || [ -z "${OPENSHELL_E2E_PREBUILT_CLI_BIN:-}" ]; then
+  cargo build -p openshell-cli --features openshell-core/dev-settings
+fi
 
 test_filter=()
 if [ -n "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
