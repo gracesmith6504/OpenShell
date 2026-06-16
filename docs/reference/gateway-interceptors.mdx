@@ -1,0 +1,114 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Interceptors"
+sidebar-title: "Interceptors"
+description: "Configure external gateway operation interceptors for sandbox, provider, and policy writes."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Interceptors, Policy, Reference"
+position: 6
+---
+
+Gateway interceptors let operators run external gRPC services around selected gateway write operations. Use them for organization policy checks, request normalization, and audit hooks that must run before the gateway persists state or asks a compute driver to create a sandbox.
+
+Interceptors are disabled unless `[[openshell.gateway.interceptors]]` entries exist in the gateway TOML file.
+
+## Configuration
+
+```toml
+[[openshell.gateway.interceptors]]
+name           = "org-controls"
+endpoint       = "unix:///run/openshell/interceptors/org-controls.sock"
+order          = 100
+timeout        = "750ms"
+failure_policy = "fail_closed"
+
+[openshell.gateway.interceptors.config]
+org_id = "example-org"
+
+[[openshell.gateway.interceptors.overrides]]
+binding_id = "sandbox-names"
+phases     = ["modify_object", "validate_object"]
+
+[openshell.gateway.interceptors.overrides.match]
+labels = { "openshell.dev/team" = "platform" }
+```
+
+Each configured interceptor service must implement `openshell.interceptor.v1.GatewayInterceptor`.
+
+| RPC | Purpose |
+|---|---|
+| `Describe(InterceptorDescribeRequest) -> InterceptorManifest` | Runs once at gateway startup. Returns supported bindings. |
+| `Review(InterceptorReview) -> InterceptorDecision` | Runs during matched operation phases. Allows, denies, or patches the reviewed object. |
+
+The gateway refuses to start if `Describe` fails, if a manifest uses an unsupported API version, or if configuration overrides expand beyond what the manifest declares.
+
+## Endpoints
+
+| Scheme | Use |
+|---|---|
+| `unix://` | Unix domain socket on the gateway host or pod filesystem. |
+| `grpc://` | Plaintext gRPC over TCP. Use loopback endpoints for plaintext services. |
+| `grpcs://` | gRPC over TLS with native root certificates. |
+
+Plaintext non-loopback TCP endpoints emit a warning because review payloads can include operational metadata.
+
+## Bindings
+
+The service manifest returns bindings. Each binding declares the phases, resources, operations, selector, order, and failure policy it supports. The gateway then narrows those bindings with TOML overrides and computes a deterministic total order.
+
+Supported resources currently include:
+
+| Resource | Operations |
+|---|---|
+| `sandbox` | `create`, `attach_provider`, `detach_provider` |
+| `driver_sandbox` | `validate` |
+| `provider` | `create`, `update`, `delete` |
+| `provider_profile` | `import`, `delete` |
+| `config` | `update`, `delete`, `merge` |
+
+Bindings can match labels and compute driver names. Label selectors only match labels present on the reviewed object or request payload.
+
+## Phases
+
+| Phase | When it runs |
+|---|---|
+| `pre_request` | After authentication and basic request checks, before converting the request into a persisted object. |
+| `modify_object` | After the gateway builds an object that has a safe JSON/protobuf round trip. This phase can return JSON Patch operations. |
+| `validate_object` | Before persistence. This phase can deny but cannot patch. |
+| `validate_driver` | Before compute driver validation for sandbox creates, with the driver-facing sandbox shape. |
+| `post_commit` | After successful persistence or provisioning. Failures are ignored by default. |
+
+Validation phases that return patches are protocol errors. The gateway applies patches only when the phase supports modification and the target resource has an explicit adapter.
+
+## Decisions
+
+`Review` returns an `InterceptorDecision`.
+
+| Field | Behavior |
+|---|---|
+| `allowed` | `false` denies the operation. |
+| `reason` | Operator-visible denial or audit reason. |
+| `status_code` | Canonical gRPC code name for denials. Defaults to `permission_denied`. |
+| `patches` | JSON Patch operations for modification phases. |
+| `warnings` | Logged for operators. |
+| `audit_annotations` | Logged with the interceptor decision. |
+
+Provider credential values are redacted before they are sent to interceptors. The gateway rejects patches whose `path` or `from` targets provider credential fields.
+
+For sandbox creation, user-supplied request labels are validated with Kubernetes label-value limits before interceptors run. Interceptor patches that add sandbox metadata labels are treated as trusted gateway metadata and may use longer alphanumeric, `-`, `_`, and `.` values for stored attestations such as signatures. Compute driver labels remain separate and should still use platform-compatible values.
+
+## Failure Policies
+
+| Policy | Behavior |
+|---|---|
+| `fail_closed` | Abort the gateway operation on interceptor failures or invalid patches. This is the default for modifying and validation phases. |
+| `fail_open` | Log the failure and continue without applying invalid patches. |
+| `ignore` | Continue after failures. Valid only for `post_commit`; this is the default for that phase. |
+
+Denials are not failure-policy errors. A denial always aborts the operation with the selected gRPC status code.
+
+## Observability
+
+The gateway emits structured tracing for every interceptor decision with service name, binding ID, phase, resource, operation, decision, latency, and failure policy. Denials and security-relevant interceptor failures also emit gateway OCSF finding events.
+
+Metrics include review counts, latency, decisions, failures, and the failure policy used for failed reviews.

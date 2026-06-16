@@ -3499,6 +3499,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-interceptors"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "json-patch",
+ "metrics",
+ "openshell-core",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -3596,6 +3616,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "futures",
@@ -3621,6 +3642,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-podman",
+ "openshell-interceptors",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-prover",
@@ -4120,6 +4142,25 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "policy-governance-interceptor"
+version = "0.0.0"
+dependencies = [
+ "json-patch",
+ "jsonwebtoken 9.3.1",
+ "openshell-core",
+ "openshell-interceptors",
+ "openshell-policy",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "polling"

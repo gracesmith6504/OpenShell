@@ -573,6 +573,11 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
 // Object metadata validation
 // ---------------------------------------------------------------------------
 
+enum LabelValueMode {
+    Kubernetes,
+    Extended,
+}
+
 /// Validate that object metadata is present and contains required fields.
 ///
 /// This ensures that all resources have valid metadata with non-empty ID and name,
@@ -583,6 +588,21 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
 pub(super) fn validate_object_metadata(
     metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
     resource_type: &str,
+) -> Result<(), Status> {
+    validate_object_metadata_with_label_values(metadata, resource_type, LabelValueMode::Kubernetes)
+}
+
+pub(super) fn validate_object_metadata_with_extended_label_values(
+    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
+    resource_type: &str,
+) -> Result<(), Status> {
+    validate_object_metadata_with_label_values(metadata, resource_type, LabelValueMode::Extended)
+}
+
+fn validate_object_metadata_with_label_values(
+    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
+    resource_type: &str,
+    label_value_mode: LabelValueMode,
 ) -> Result<(), Status> {
     let metadata = metadata
         .ok_or_else(|| Status::invalid_argument(format!("{resource_type} metadata is required")))?;
@@ -602,7 +622,46 @@ pub(super) fn validate_object_metadata(
     // Validate all labels in metadata
     for (key, value) in &metadata.labels {
         validate_label_key(key)?;
-        validate_label_value(value)?;
+        match label_value_mode {
+            LabelValueMode::Kubernetes => validate_label_value(value)?,
+            LabelValueMode::Extended => validate_extended_label_value(value)?,
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_extended_label_value(value: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        return Ok(());
+    }
+
+    if value.len() > 4096 {
+        return Err(Status::invalid_argument(format!(
+            "label value exceeds 4096 characters: '{value}'"
+        )));
+    }
+
+    if !value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(Status::invalid_argument(format!(
+            "label value contains invalid characters (must be alphanumeric, '-', '_', or '.'): '{value}'"
+        )));
+    }
+
+    let first = value.chars().next().unwrap();
+    let last = value.chars().last().unwrap();
+    if !first.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label value must start with alphanumeric character: '{value}'"
+        )));
+    }
+    if !last.is_alphanumeric() {
+        return Err(Status::invalid_argument(format!(
+            "label value must end with alphanumeric character: '{value}'"
+        )));
     }
 
     Ok(())
@@ -1389,6 +1448,19 @@ mod tests {
     #[test]
     fn validate_label_value_rejects_invalid_characters() {
         let err = validate_label_value("value@123").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid characters"));
+    }
+
+    #[test]
+    fn validate_extended_label_value_accepts_jwt_shaped_values() {
+        let jwt = format!("{}.{}.{}", "e".repeat(80), "p".repeat(220), "s".repeat(43));
+        assert!(validate_extended_label_value(&jwt).is_ok());
+    }
+
+    #[test]
+    fn validate_extended_label_value_rejects_invalid_characters() {
+        let err = validate_extended_label_value("header.payload.signature/extra").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid characters"));
     }

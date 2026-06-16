@@ -132,6 +132,23 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 scopes_claim  = ""
+
+[[openshell.gateway.interceptors]]
+name           = "org-controls"
+endpoint       = "unix:///run/openshell/interceptors/org-controls.sock"
+order          = 100
+timeout        = "750ms"
+failure_policy = "fail_closed"
+
+[openshell.gateway.interceptors.config]
+org_id = "example-org"
+
+[[openshell.gateway.interceptors.overrides]]
+binding_id = "sandbox-names"
+phases     = ["modify_object", "validate_object"]
+
+[openshell.gateway.interceptors.overrides.match]
+labels = { "openshell.dev/team" = "platform" }
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -141,6 +158,24 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
+
+## Gateway Interceptors
+
+Use `[[openshell.gateway.interceptors]]` to call external gRPC services before or after selected gateway write operations. When the array is absent or empty, gateway interceptors are disabled. The gateway calls each configured service's `Describe` RPC during startup and refuses to start if the endpoint is unreachable or returns an invalid manifest.
+
+| Field | Description |
+|---|---|
+| `name` | Stable configured service name. Must be unique. |
+| `endpoint` | Interceptor service endpoint. Use `unix:///path/to/socket`, `grpc://host:port`, or `grpcs://host:port`. Plaintext `grpc://` endpoints should be loopback-local. |
+| `order` | Service-level ordering key. Lower values run first; binding order and names break ties. |
+| `timeout` | Per-review timeout such as `500ms` or `2s`. Defaults to `2s`. |
+| `failure_policy` | Service-wide default: `fail_closed`, `fail_open`, or `ignore`. `ignore` is valid only for `post_commit` bindings. |
+| `config` | Operator-defined TOML table passed to `Describe`. |
+| `overrides` | Optional binding narrowing by `binding_id`. Overrides can reduce phases, operations, resources, labels, or driver matches declared by the service manifest. |
+
+Interceptors can inspect sandbox lifecycle, provider/profile writes, and policy/config updates. Modification phases can return JSON Patch operations for safe round-trip resource adapters; validation phases must not return patches. Provider credential values are redacted in review payloads, and patches that target provider credential fields are rejected.
+
+See [Gateway Interceptors](/reference/gateway-interceptors) for the service protocol, phases, failure handling, and observability behavior.
 
 ## Driver References
 

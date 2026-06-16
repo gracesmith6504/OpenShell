@@ -28,6 +28,7 @@ mod defaults;
 mod grpc;
 mod http;
 mod inference;
+pub(crate) mod interceptors;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
@@ -45,6 +46,7 @@ mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_interceptors::InterceptorRuntime;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -135,6 +137,10 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Operation interceptor execution runtime. Empty when no interceptors are
+    /// configured.
+    pub(crate) interceptors: Arc<InterceptorRuntime>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -185,6 +191,7 @@ impl ServerState {
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            interceptors: Arc::new(InterceptorRuntime::empty()),
         }
     }
 }
@@ -243,6 +250,19 @@ pub async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let interceptor_configs = config_file.as_ref().map_or(&[][..], |file| {
+        file.openshell.gateway.interceptors.as_slice()
+    });
+    let interceptor_runtime = Arc::new(
+        InterceptorRuntime::from_config(interceptor_configs)
+            .await
+            .map_err(|err| Error::config(format!("gateway interceptor setup failed: {err}")))?,
+    );
+    if interceptor_runtime.is_empty() {
+        info!("Gateway interceptors disabled");
+    } else {
+        info!("Gateway interceptors enabled");
+    }
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -253,6 +273,7 @@ pub async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.interceptors = interceptor_runtime;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue

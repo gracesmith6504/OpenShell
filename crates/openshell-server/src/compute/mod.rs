@@ -430,9 +430,16 @@ impl ComputeRuntime {
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
         let driver_sandbox =
             driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
+        self.validate_driver_sandbox_create(&driver_sandbox).await
+    }
+
+    pub async fn validate_driver_sandbox_create(
+        &self,
+        driver_sandbox: &DriverSandbox,
+    ) -> Result<(), Status> {
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
-                sandbox: Some(driver_sandbox),
+                sandbox: Some(driver_sandbox.clone()),
             }))
             .await
             .map(|_| ())
@@ -1371,7 +1378,8 @@ impl ComputeRuntime {
     }
 }
 
-fn driver_sandbox_from_public(
+#[allow(clippy::redundant_pub_crate)]
+pub(super) fn driver_sandbox_from_public(
     sandbox: &Sandbox,
     driver_kind: Option<ComputeDriverKind>,
 ) -> Result<DriverSandbox, Box<Status>> {

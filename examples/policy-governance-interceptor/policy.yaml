@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  github_source_control:
+    name: github-source-control-readonly
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+      - host: api.github.com
+        path: /graphql
+        port: 443
+        protocol: graphql
+        access: read-only
+        enforcement: enforce
+      - host: github.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+    binaries:
+      - { path: /usr/bin/gh }
+      - { path: /usr/local/bin/gh }
+      - { path: /usr/bin/git }
+      - { path: /usr/local/bin/git }
+
+  gitlab_source_control:
+    name: gitlab-source-control-readonly
+    endpoints:
+      - host: gitlab.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+        allow_encoded_slash: true
+      - host: gitlab.com
+        path: /api/graphql
+        port: 443
+        protocol: graphql
+        access: read-only
+        enforcement: enforce
+      - host: gitlab.com
+        path: /api/v4
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+        allow_encoded_slash: true
+    binaries:
+      - { path: /usr/bin/glab }
+      - { path: /usr/local/bin/glab }
+      - { path: /usr/bin/git }
+      - { path: /usr/local/bin/git }

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "policy-governance-interceptor"
+description = "Example OpenShell gateway interceptor that enforces a fixed sandbox policy and provider set"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+openshell-core = { path = "../../crates/openshell-core", default-features = false }
+openshell-interceptors = { path = "../../crates/openshell-interceptors" }
+openshell-policy = { path = "../../crates/openshell-policy" }
+
+prost-types = { workspace = true }
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+json-patch = "1.4"
+
+[lints]
+workspace = true

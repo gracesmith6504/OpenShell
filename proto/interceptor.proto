@@ -1,0 +1,119 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.interceptor.v1;
+
+import "google/protobuf/struct.proto";
+
+// GatewayInterceptor is implemented by external operation interceptor services.
+service GatewayInterceptor {
+  // Describe returns the service-declared operation bindings for this
+  // configured interceptor instance.
+  rpc Describe(InterceptorDescribeRequest) returns (InterceptorManifest);
+
+  // Review evaluates one selected operation binding at a specific gateway
+  // operation phase.
+  rpc Review(InterceptorReview) returns (InterceptorDecision);
+}
+
+// Describe request sent once at gateway startup for each configured service.
+message InterceptorDescribeRequest {
+  // Contract version requested by the gateway.
+  string api_version = 1;
+  // Operator-configured interceptor service name.
+  string interceptor_name = 2;
+  // Operator-supplied service-specific config from gateway TOML.
+  google.protobuf.Struct config = 3;
+}
+
+// Service manifest returned by Describe.
+message InterceptorManifest {
+  // Contract version implemented by the service.
+  string api_version = 1;
+  // Service-declared operation bindings.
+  repeated InterceptorBinding bindings = 2;
+}
+
+// One service-declared operation binding.
+message InterceptorBinding {
+  // Service-owned binding identifier.
+  string id = 1;
+  // Operation phases this binding participates in.
+  repeated string phases = 2;
+  // Logical resources this binding selects.
+  repeated string resources = 3;
+  // Logical operations this binding selects.
+  repeated string operations = 4;
+  // Service-declared order within the interceptor service.
+  int32 order = 5;
+  // True when this binding intends to return JSON patches in modification phases.
+  bool modifies = 6;
+  // Default failure policy: fail_closed, fail_open, or ignore.
+  string default_failure_policy = 7;
+  // Additional selector constraints.
+  InterceptorSelector selector = 8;
+}
+
+// Selector fields for operation bindings. Empty fields match all values.
+message InterceptorSelector {
+  repeated string principal_kinds = 1;
+  repeated string principal_groups = 2;
+  map<string, string> labels = 3;
+  repeated string compute_drivers = 4;
+}
+
+// Operation review request sent for a selected binding.
+message InterceptorReview {
+  string api_version = 1;
+  string interceptor_name = 2;
+  string binding_id = 3;
+  string phase = 4;
+  string resource = 5;
+  string operation = 6;
+
+  InterceptorPrincipal principal = 7;
+  InterceptorRequestContext context = 8;
+
+  google.protobuf.Struct object = 9;
+  google.protobuf.Struct old_object = 10;
+  google.protobuf.Struct request = 11;
+}
+
+// Authenticated caller summary.
+message InterceptorPrincipal {
+  // user, service, sandbox, or anonymous.
+  string kind = 1;
+  // Stable subject identifier.
+  string subject = 2;
+  // Authenticated group or role names.
+  repeated string groups = 3;
+}
+
+// Gateway request context visible to interceptors.
+message InterceptorRequestContext {
+  string request_id = 1;
+  string gateway_replica_id = 2;
+  string compute_driver = 3;
+  bool dry_run = 4;
+  map<string, string> labels = 5;
+}
+
+// Operation interceptor decision.
+message InterceptorDecision {
+  bool allowed = 1;
+  string reason = 2;
+  string status_code = 3;
+  repeated JsonPatch patches = 4;
+  repeated string warnings = 5;
+  map<string, string> audit_annotations = 6;
+}
+
+// RFC 6902-style JSON patch operation.
+message JsonPatch {
+  string op = 1;
+  string path = 2;
+  string from = 3;
+  google.protobuf.Value value = 4;
+}

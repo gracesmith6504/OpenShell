@@ -1183,6 +1183,9 @@ use openshell_core::proto::{
     ProviderProfileResponse, ProviderResponse, RotateProviderCredentialRequest,
     RotateProviderCredentialResponse, StoredProviderProfile, UpdateProviderRequest,
 };
+use openshell_interceptors::{
+    PHASE_MODIFY_OBJECT, PHASE_POST_COMMIT, PHASE_PRE_REQUEST, PHASE_VALIDATE_OBJECT,
+};
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
     get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
@@ -1194,7 +1197,25 @@ pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
-    let req = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut req = request.into_inner();
+    let original_json = crate::interceptors::create_provider_request_to_json(&req, false);
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::create_provider_request_to_json(&req, true),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
+    crate::interceptors::provider_patch_targets_allowed(&reviewed.applied_patches)?;
+    let patched =
+        crate::interceptors::apply_patches_to_original(original_json, &reviewed.applied_patches)?;
+    req = crate::interceptors::create_provider_request_from_json(&patched)?;
     let Some(provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -1203,6 +1224,51 @@ pub(super) async fn handle_create_provider(
         );
         return Err(Status::invalid_argument("provider is required"));
     };
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_MODIFY_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::provider_to_json(&provider, true),
+        None,
+        Some(crate::interceptors::create_provider_request_to_json(
+            &CreateProviderRequest {
+                provider: Some(provider.clone()),
+            },
+            true,
+        )),
+        provider
+            .metadata
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |metadata| {
+                metadata.labels.clone()
+            }),
+    )
+    .await?;
+    crate::interceptors::provider_patch_targets_allowed(&reviewed.applied_patches)?;
+    let patched = crate::interceptors::apply_patches_to_original(
+        crate::interceptors::provider_to_json(&provider, false),
+        &reviewed.applied_patches,
+    )?;
+    let provider = crate::interceptors::provider_from_json(&patched)?;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::provider_to_json(&provider, true),
+        None,
+        None,
+        provider
+            .metadata
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |metadata| {
+                metadata.labels.clone()
+            }),
+    )
+    .await?;
     let provider_type = provider.r#type.clone();
     let result = create_provider_record(state.store.as_ref(), provider).await;
     match result {
@@ -1212,6 +1278,23 @@ pub(super) async fn handle_create_provider(
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
             );
+            crate::interceptors::review_json(
+                state,
+                &interceptor_info,
+                PHASE_POST_COMMIT,
+                crate::interceptors::RESOURCE_PROVIDER,
+                crate::interceptors::OP_CREATE,
+                crate::interceptors::provider_to_json(&provider, true),
+                None,
+                None,
+                provider
+                    .metadata
+                    .as_ref()
+                    .map_or_else(std::collections::HashMap::new, |metadata| {
+                        metadata.labels.clone()
+                    }),
+            )
+            .await?;
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
             }))
@@ -1295,7 +1378,33 @@ pub(super) async fn handle_import_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
-    let request = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut request = request.into_inner();
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_PROVIDER_PROFILE,
+        crate::interceptors::OP_IMPORT,
+        crate::interceptors::import_provider_profiles_request_to_json(&request),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
+    request = crate::interceptors::import_provider_profiles_request_from_json(&reviewed.object)?;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER_PROFILE,
+        crate::interceptors::OP_IMPORT,
+        crate::interceptors::import_provider_profiles_request_to_json(&request),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
@@ -1332,11 +1441,24 @@ pub(super) async fn handle_import_provider_profiles(
         imported.push(stored.profile.unwrap_or_default());
     }
 
-    Ok(Response::new(ImportProviderProfilesResponse {
+    let response = ImportProviderProfilesResponse {
         diagnostics: Vec::new(),
         profiles: imported,
         imported: true,
-    }))
+    };
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_PROVIDER_PROFILE,
+        crate::interceptors::OP_IMPORT,
+        crate::interceptors::import_provider_profiles_request_to_json(&request),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
+    Ok(Response::new(response))
 }
 
 pub(super) async fn handle_lint_provider_profiles(
@@ -1360,8 +1482,21 @@ pub(super) async fn handle_delete_provider_profile(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderProfileRequest>,
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+    let interceptor_info = crate::interceptors::request_info(&request);
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER_PROFILE,
+        crate::interceptors::OP_DELETE,
+        serde_json::json!({ "id": id }),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
     if get_default_profile(&id).is_some() {
         return Err(Status::failed_precondition(
             "built-in provider profiles cannot be deleted",
@@ -1390,6 +1525,19 @@ pub(super) async fn handle_delete_provider_profile(
         .delete_by_name(StoredProviderProfile::object_type(), &id)
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_PROVIDER_PROFILE,
+        crate::interceptors::OP_DELETE,
+        serde_json::json!({ "id": id, "deleted": deleted }),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
 
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
@@ -1721,7 +1869,25 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
-    let req = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut req = request.into_inner();
+    let original_json = crate::interceptors::update_provider_request_to_json(&req, false);
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_UPDATE,
+        crate::interceptors::update_provider_request_to_json(&req, true),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
+    crate::interceptors::provider_patch_targets_allowed(&reviewed.applied_patches)?;
+    let patched =
+        crate::interceptors::apply_patches_to_original(original_json, &reviewed.applied_patches)?;
+    req = crate::interceptors::update_provider_request_from_json(&patched)?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -1730,6 +1896,52 @@ pub(super) async fn handle_update_provider(
         );
         return Err(Status::invalid_argument("provider is required"));
     };
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_MODIFY_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_UPDATE,
+        crate::interceptors::provider_to_json(&provider, true),
+        None,
+        Some(crate::interceptors::update_provider_request_to_json(
+            &UpdateProviderRequest {
+                provider: Some(provider.clone()),
+                credential_expires_at_ms: req.credential_expires_at_ms.clone(),
+            },
+            true,
+        )),
+        provider
+            .metadata
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |metadata| {
+                metadata.labels.clone()
+            }),
+    )
+    .await?;
+    crate::interceptors::provider_patch_targets_allowed(&reviewed.applied_patches)?;
+    let patched = crate::interceptors::apply_patches_to_original(
+        crate::interceptors::provider_to_json(&provider, false),
+        &reviewed.applied_patches,
+    )?;
+    provider = crate::interceptors::provider_from_json(&patched)?;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_UPDATE,
+        crate::interceptors::provider_to_json(&provider, true),
+        None,
+        None,
+        provider
+            .metadata
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |metadata| {
+                metadata.labels.clone()
+            }),
+    )
+    .await?;
     let provider_type = provider.r#type.clone();
     provider
         .credential_expires_at_ms
@@ -1742,6 +1954,23 @@ pub(super) async fn handle_update_provider(
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
             );
+            crate::interceptors::review_json(
+                state,
+                &interceptor_info,
+                PHASE_POST_COMMIT,
+                crate::interceptors::RESOURCE_PROVIDER,
+                crate::interceptors::OP_UPDATE,
+                crate::interceptors::provider_to_json(&provider, true),
+                None,
+                None,
+                provider
+                    .metadata
+                    .as_ref()
+                    .map_or_else(std::collections::HashMap::new, |metadata| {
+                        metadata.labels.clone()
+                    }),
+            )
+            .await?;
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
             }))
@@ -2092,7 +2321,20 @@ pub(super) async fn handle_delete_provider(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
+    let interceptor_info = crate::interceptors::request_info(&request);
     let name = request.into_inner().name;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_PROVIDER,
+        crate::interceptors::OP_DELETE,
+        serde_json::json!({ "name": name }),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    )
+    .await?;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
     let result = delete_provider_record(state.store.as_ref(), &name).await;
     match result {
@@ -2103,6 +2345,18 @@ pub(super) async fn handle_delete_provider(
                 LifecycleOperation::Delete,
                 outcome,
             );
+            crate::interceptors::review_json(
+                state,
+                &interceptor_info,
+                PHASE_POST_COMMIT,
+                crate::interceptors::RESOURCE_PROVIDER,
+                crate::interceptors::OP_DELETE,
+                serde_json::json!({ "name": name, "deleted": deleted }),
+                None,
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await?;
             Ok(Response::new(DeleteProviderResponse { deleted }))
         }
         Err(err) => {

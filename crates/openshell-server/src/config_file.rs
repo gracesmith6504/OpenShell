@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
 use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
+use openshell_interceptors::InterceptorConfig;
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -150,6 +151,9 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    /// Operation interceptor services configured for the gateway.
+    #[serde(default)]
+    pub interceptors: Vec<InterceptorConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -360,6 +364,22 @@ supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
 service_account_name = "openshell-sandbox"
 
+[[openshell.gateway.interceptors]]
+name = "org-controls"
+endpoint = "unix:///run/openshell/interceptors/org-controls.sock"
+order = 100
+timeout = "500ms"
+failure_policy = "fail_closed"
+
+[openshell.gateway.interceptors.config]
+sandbox_name_prefix = "nvidia-"
+
+[[openshell.gateway.interceptors.overrides]]
+binding = "driver-config-validation"
+failure_policy = "fail_closed"
+[openshell.gateway.interceptors.overrides.match]
+compute_drivers = ["kubernetes"]
+
 [openshell.gateway.tls]
 cert_path = "/etc/openshell/certs/gateway.pem"
 key_path = "/etc/openshell/certs/gateway-key.pem"
@@ -383,6 +403,9 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
+        assert_eq!(gw.interceptors.len(), 1);
+        assert_eq!(gw.interceptors[0].name, "org-controls");
+        assert_eq!(gw.interceptors[0].overrides.len(), 1);
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));

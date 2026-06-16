@@ -45,6 +45,7 @@ use openshell_core::{
     VERSION,
     settings::{self, SettingValueKind},
 };
+use openshell_interceptors::{PHASE_POST_COMMIT, PHASE_PRE_REQUEST, PHASE_VALIDATE_OBJECT};
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
@@ -1438,12 +1439,15 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let interceptor_info = crate::interceptors::request_info(&request);
     let principal = request.extensions().get::<Principal>().cloned();
     let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, principal, sandbox_caller).await;
+    let result =
+        handle_update_config_inner(state, request, principal, sandbox_caller, interceptor_info)
+            .await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -1455,8 +1459,9 @@ async fn handle_update_config_inner(
     request: Request<UpdateConfigRequest>,
     principal: Option<Principal>,
     sandbox_caller: bool,
+    interceptor_info: crate::interceptors::InterceptorRequestInfo,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let req = request.into_inner();
+    let mut req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
@@ -1468,7 +1473,7 @@ async fn handle_update_config_inner(
         )
         .await?;
     }
-    let key = req.setting_key.trim();
+    let mut key = req.setting_key.trim().to_string();
     let has_policy = req.policy.is_some();
     let has_setting = !key.is_empty();
     let has_merge_ops = !req.merge_operations.is_empty();
@@ -1488,6 +1493,61 @@ async fn handle_update_config_inner(
         ));
     }
 
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_CONFIG,
+        update_config_operation(&req),
+        crate::interceptors::update_config_request_to_json(&req),
+        None,
+        None,
+        HashMap::new(),
+    )
+    .await?;
+    req = crate::interceptors::update_config_request_from_json(&reviewed.object)?;
+    if sandbox_caller {
+        validate_sandbox_caller_update(&req)?;
+        resolve_sandbox_by_name_for_principal(
+            state.store.as_ref(),
+            principal
+                .as_ref()
+                .expect("sandbox_caller implies principal"),
+            &req.name,
+        )
+        .await?;
+    }
+    key = req.setting_key.trim().to_string();
+    let has_policy = req.policy.is_some();
+    let has_setting = !key.is_empty();
+    let has_merge_ops = !req.merge_operations.is_empty();
+    let mut mutation_count = 0_u8;
+    mutation_count += u8::from(has_policy);
+    mutation_count += u8::from(has_setting);
+    mutation_count += u8::from(has_merge_ops);
+    if mutation_count > 1 {
+        return Err(Status::invalid_argument(
+            "policy, setting_key, and merge_operations are mutually exclusive",
+        ));
+    }
+    if mutation_count == 0 {
+        return Err(Status::invalid_argument(
+            "one of policy, setting_key, or merge_operations must be provided",
+        ));
+    }
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_CONFIG,
+        update_config_operation(&req),
+        crate::interceptors::update_config_request_to_json(&req),
+        None,
+        None,
+        HashMap::new(),
+    )
+    .await?;
+
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
 
@@ -1503,7 +1563,7 @@ async fn handle_update_config_inner(
                     "delete_setting cannot be combined with policy payload",
                 ));
             }
-            let mut new_policy = req.policy.ok_or_else(|| {
+            let mut new_policy = req.policy.clone().ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
@@ -1533,12 +1593,18 @@ async fn handle_update_config_inner(
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
                 }
-                return Ok(Response::new(UpdateConfigResponse {
-                    version: u32::try_from(current.version).unwrap_or(0),
-                    policy_hash: hash,
-                    settings_revision: global_settings.revision,
-                    deleted: false,
-                }));
+                return post_commit_update_config(
+                    state,
+                    &interceptor_info,
+                    &req,
+                    UpdateConfigResponse {
+                        version: u32::try_from(current.version).unwrap_or(0),
+                        policy_hash: hash,
+                        settings_revision: global_settings.revision,
+                        deleted: false,
+                    },
+                )
+                .await;
             }
 
             let next_version = latest.map_or(1, |r| r.version + 1);
@@ -1588,12 +1654,18 @@ async fn handle_update_config_inner(
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: u32::try_from(next_version).unwrap_or(0),
-                policy_hash: hash,
-                settings_revision: global_settings.revision,
-                deleted: false,
-            }));
+            return post_commit_update_config(
+                state,
+                &interceptor_info,
+                &req,
+                UpdateConfigResponse {
+                    version: u32::try_from(next_version).unwrap_or(0),
+                    policy_hash: hash,
+                    settings_revision: global_settings.revision,
+                    deleted: false,
+                },
+            )
+            .await;
         }
 
         // Global setting mutation.
@@ -1603,12 +1675,12 @@ async fn handle_update_config_inner(
             ));
         }
         if key != POLICY_SETTING_KEY {
-            validate_registered_setting_key(key)?;
+            validate_registered_setting_key(&key)?;
         }
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let changed = if req.delete_setting {
-            let removed = global_settings.settings.remove(key).is_some();
+            let removed = global_settings.settings.remove(&key).is_some();
             if removed
                 && key == POLICY_SETTING_KEY
                 && let Ok(Some(latest)) = state
@@ -1627,8 +1699,8 @@ async fn handle_update_config_inner(
                 .setting_value
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-            let stored = proto_setting_to_stored(key, setting)?;
-            upsert_setting_value(&mut global_settings.settings, key, stored)
+            let stored = proto_setting_to_stored(&key, setting)?;
+            upsert_setting_value(&mut global_settings.settings, &key, stored)
         };
 
         if changed {
@@ -1636,12 +1708,18 @@ async fn handle_update_config_inner(
             save_global_settings(state.store.as_ref(), &global_settings).await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: global_settings.revision,
-            deleted: req.delete_setting && changed,
-        }));
+        return post_commit_update_config(
+            state,
+            &interceptor_info,
+            &req,
+            UpdateConfigResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: global_settings.revision,
+                deleted: req.delete_setting && changed,
+            },
+        )
+        .await;
     }
 
     if req.name.is_empty() {
@@ -1669,7 +1747,7 @@ async fn handle_update_config_inner(
         }
 
         let global_settings = load_global_settings(state.store.as_ref()).await?;
-        let globally_managed = global_settings.settings.contains_key(key);
+        let globally_managed = global_settings.settings.contains_key(&key);
 
         if req.delete_setting {
             if globally_managed {
@@ -1680,7 +1758,7 @@ async fn handle_update_config_inner(
 
             let mut sandbox_settings =
                 load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
-            let removed = sandbox_settings.settings.remove(key).is_some();
+            let removed = sandbox_settings.settings.remove(&key).is_some();
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                 save_sandbox_settings(
@@ -1691,12 +1769,18 @@ async fn handle_update_config_inner(
                 .await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: 0,
-                policy_hash: String::new(),
-                settings_revision: sandbox_settings.revision,
-                deleted: removed,
-            }));
+            return post_commit_update_config(
+                state,
+                &interceptor_info,
+                &req,
+                UpdateConfigResponse {
+                    version: 0,
+                    policy_hash: String::new(),
+                    settings_revision: sandbox_settings.revision,
+                    deleted: removed,
+                },
+            )
+            .await;
         }
 
         if globally_managed {
@@ -1709,11 +1793,11 @@ async fn handle_update_config_inner(
             .setting_value
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-        let stored = proto_setting_to_stored(key, setting)?;
+        let stored = proto_setting_to_stored(&key, setting)?;
 
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
-        let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
+        let changed = upsert_setting_value(&mut sandbox_settings.settings, &key, stored);
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
             save_sandbox_settings(
@@ -1724,12 +1808,18 @@ async fn handle_update_config_inner(
             .await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: sandbox_settings.revision,
-            deleted: false,
-        }));
+        return post_commit_update_config(
+            state,
+            &interceptor_info,
+            &req,
+            UpdateConfigResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: sandbox_settings.revision,
+                deleted: false,
+            },
+        )
+        .await;
     }
 
     if has_merge_ops {
@@ -1788,17 +1878,24 @@ async fn handle_update_config_inner(
         );
         emit_config_update_policy_success(sandbox_caller);
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
+        return post_commit_update_config(
+            state,
+            &interceptor_info,
+            &req,
+            UpdateConfigResponse {
+                version: u32::try_from(version).unwrap_or(0),
+                policy_hash: hash,
+                settings_revision: 0,
+                deleted: false,
+            },
+        )
+        .await;
     }
 
     // Sandbox-scoped policy update.
     let mut new_policy = req
         .policy
+        .clone()
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
@@ -1856,12 +1953,18 @@ async fn handle_update_config_inner(
     if let Some(ref current) = latest
         && current.policy_hash == hash
     {
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(current.version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
+        return post_commit_update_config(
+            state,
+            &interceptor_info,
+            &req,
+            UpdateConfigResponse {
+                version: u32::try_from(current.version).unwrap_or(0),
+                policy_hash: hash,
+                settings_revision: 0,
+                deleted: false,
+            },
+        )
+        .await;
     }
 
     let next_version = latest.map_or(1, |r| r.version + 1);
@@ -1888,12 +1991,57 @@ async fn handle_update_config_inner(
     );
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    Ok(Response::new(UpdateConfigResponse {
-        version: u32::try_from(next_version).unwrap_or(0),
-        policy_hash: hash,
-        settings_revision: 0,
-        deleted: false,
-    }))
+    post_commit_update_config(
+        state,
+        &interceptor_info,
+        &req,
+        UpdateConfigResponse {
+            version: u32::try_from(next_version).unwrap_or(0),
+            policy_hash: hash,
+            settings_revision: 0,
+            deleted: false,
+        },
+    )
+    .await
+}
+
+fn update_config_operation(req: &UpdateConfigRequest) -> &'static str {
+    if !req.merge_operations.is_empty() {
+        crate::interceptors::OP_MERGE
+    } else if req.delete_setting {
+        crate::interceptors::OP_DELETE
+    } else {
+        crate::interceptors::OP_UPDATE
+    }
+}
+
+async fn post_commit_update_config(
+    state: &Arc<ServerState>,
+    interceptor_info: &crate::interceptors::InterceptorRequestInfo,
+    req: &UpdateConfigRequest,
+    response: UpdateConfigResponse,
+) -> Result<Response<UpdateConfigResponse>, Status> {
+    crate::interceptors::review_json(
+        state,
+        interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_CONFIG,
+        update_config_operation(req),
+        serde_json::json!({
+            "request": crate::interceptors::update_config_request_to_json(req),
+            "response": {
+                "version": response.version,
+                "policy_hash": response.policy_hash,
+                "settings_revision": response.settings_revision,
+                "deleted": response.deleted,
+            },
+        }),
+        None,
+        None,
+        HashMap::new(),
+    )
+    .await?;
+    Ok(Response::new(response))
 }
 
 // ---------------------------------------------------------------------------

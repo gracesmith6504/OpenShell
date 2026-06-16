@@ -28,11 +28,16 @@ use openshell_core::telemetry::{
     TelemetryOutcome,
 };
 use openshell_core::{ObjectId, ObjectName};
+use openshell_interceptors::{
+    PHASE_MODIFY_OBJECT, PHASE_POST_COMMIT, PHASE_PRE_REQUEST, PHASE_VALIDATE_DRIVER,
+    PHASE_VALIDATE_OBJECT,
+};
 use prost::Message;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -118,15 +123,40 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let request = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut request = request.into_inner();
     let spec = request
         .spec
+        .clone()
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
 
     // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::create_sandbox_request_to_json(&request),
+        None,
+        None,
+        request.labels.clone(),
+    )
+    .await?;
+    request = crate::interceptors::create_sandbox_request_from_json(&reviewed.object)?;
+    let spec = request
+        .spec
+        .clone()
+        .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+    validate_sandbox_spec(&request.name, &spec)?;
     for (key, value) in &request.labels {
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
@@ -179,12 +209,85 @@ async fn handle_create_sandbox_inner(
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
 
-    // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
-    super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
+    let request_json = crate::interceptors::create_sandbox_request_to_json(&request);
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_MODIFY_OBJECT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::sandbox_to_json(&sandbox),
+        None,
+        Some(request_json.clone()),
+        request.labels.clone(),
+    )
+    .await?;
+    sandbox = crate::interceptors::sandbox_from_json(&reviewed.object)?;
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("interceptor removed sandbox metadata"))?;
+    if metadata.id != id {
+        return Err(Status::invalid_argument(
+            "interceptor cannot modify sandbox metadata.id",
+        ));
+    }
+    if metadata.created_at_ms != now_ms {
+        return Err(Status::invalid_argument(
+            "interceptor cannot modify sandbox metadata.created_at_ms",
+        ));
+    }
+    if metadata.resource_version != 0 {
+        return Err(Status::invalid_argument(
+            "interceptor cannot modify sandbox metadata.resource_version",
+        ));
+    }
+    if let Some(spec) = sandbox.spec.as_ref() {
+        validate_sandbox_spec(sandbox.object_name(), spec)?;
+    }
+    let sandbox_labels = metadata.labels.clone();
+
+    // Interceptors are trusted gateway extensions and may attach metadata
+    // values that are useful in storage but too long for compute-platform
+    // labels, such as compact signatures. User-supplied request labels are
+    // still validated with Kubernetes label-value limits before this point.
+    super::validation::validate_object_metadata_with_extended_label_values(
+        sandbox.metadata.as_ref(),
+        "sandbox",
+    )?;
+
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::sandbox_to_json(&sandbox),
+        None,
+        Some(request_json.clone()),
+        sandbox_labels.clone(),
+    )
+    .await?;
+
+    let driver_sandbox =
+        crate::compute::driver_sandbox_from_public(&sandbox, state.compute.driver_kind())
+            .map_err(|status| *status)?;
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_DRIVER,
+        crate::interceptors::RESOURCE_DRIVER_SANDBOX,
+        crate::interceptors::OP_VALIDATE,
+        crate::interceptors::driver_sandbox_to_json(&driver_sandbox),
+        None,
+        Some(request_json),
+        sandbox_labels,
+    )
+    .await?;
 
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_driver_sandbox_create(&driver_sandbox)
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -213,9 +316,25 @@ async fn handle_create_sandbox_inner(
 
     let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_CREATE,
+        crate::interceptors::sandbox_to_json(&sandbox),
+        None,
+        None,
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or_else(HashMap::new, |metadata| metadata.labels.clone()),
+    )
+    .await?;
+
     info!(
-        sandbox_id = %id,
-        sandbox_name = %name,
+        sandbox_id = %sandbox.object_id(),
+        sandbox_name = %sandbox.object_name(),
         "CreateSandbox request completed successfully"
     );
     Ok(Response::new(SandboxResponse {
@@ -282,13 +401,46 @@ pub(super) async fn handle_attach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
-    let request = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut request = request.into_inner();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
 
     // Validate provider name would not violate sandbox spec constraints if added
     // (pre-validation ensures CAS mutations preserve invariants)
+    if request.provider_name.len() > super::MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider_name exceeds maximum length ({} > {})",
+            request.provider_name.len(),
+            super::MAX_NAME_LEN
+        )));
+    }
+
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_ATTACH_PROVIDER,
+        crate::interceptors::attach_provider_request_to_json(
+            &request.sandbox_name,
+            &request.provider_name,
+            request.expected_resource_version,
+        ),
+        None,
+        None,
+        HashMap::new(),
+    )
+    .await?;
+    let (sandbox_name, provider_name, expected_resource_version) =
+        crate::interceptors::attach_provider_request_from_json(&reviewed.object)?;
+    request.sandbox_name = sandbox_name;
+    request.provider_name = provider_name;
+    request.expected_resource_version = expected_resource_version;
+    if request.provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider_name is required"));
+    }
     if request.provider_name.len() > super::MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
             "provider_name exceeds maximum length ({} > {})",
@@ -350,6 +502,28 @@ pub(super) async fn handle_attach_sandbox_provider(
     validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
         .await?;
 
+    let mut candidate_sandbox = sandbox.clone();
+    candidate_sandbox.spec = Some(candidate_spec);
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_ATTACH_PROVIDER,
+        crate::interceptors::sandbox_to_json(&candidate_sandbox),
+        Some(crate::interceptors::sandbox_to_json(&sandbox)),
+        Some(crate::interceptors::attach_provider_request_to_json(
+            &request.sandbox_name,
+            &request.provider_name,
+            request.expected_resource_version,
+        )),
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or_else(HashMap::new, |metadata| metadata.labels.clone()),
+    )
+    .await?;
+
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
     let attached_clone = attached.clone();
@@ -386,6 +560,22 @@ pub(super) async fn handle_attach_sandbox_provider(
         "AttachSandboxProvider request completed successfully"
     );
 
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_ATTACH_PROVIDER,
+        crate::interceptors::sandbox_to_json(&sandbox),
+        None,
+        None,
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or_else(HashMap::new, |metadata| metadata.labels.clone()),
+    )
+    .await?;
+
     Ok(Response::new(AttachSandboxProviderResponse {
         sandbox: Some(sandbox),
         attached,
@@ -396,12 +586,37 @@ pub(super) async fn handle_detach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
-    let request = request.into_inner();
+    let interceptor_info = crate::interceptors::request_info(&request);
+    let mut request = request.into_inner();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
 
     // Validate provider name (pre-validation ensures CAS mutations preserve invariants)
+    if request.provider_name.len() > super::MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider_name exceeds maximum length ({} > {})",
+            request.provider_name.len(),
+            super::MAX_NAME_LEN
+        )));
+    }
+
+    let reviewed = crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_PRE_REQUEST,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_DETACH_PROVIDER,
+        crate::interceptors::detach_provider_request_to_json(&request),
+        None,
+        None,
+        HashMap::new(),
+    )
+    .await?;
+    request = crate::interceptors::detach_provider_request_from_json(&reviewed.object)?;
+    if request.provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider_name is required"));
+    }
     if request.provider_name.len() > super::MAX_NAME_LEN {
         return Err(Status::invalid_argument(format!(
             "provider_name exceeds maximum length ({} > {})",
@@ -424,6 +639,29 @@ pub(super) async fn handle_detach_sandbox_provider(
         .spec
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
+
+    let mut candidate_sandbox = sandbox.clone();
+    if let Some(ref mut spec) = candidate_sandbox.spec {
+        spec.providers.retain(|name| name != &request.provider_name);
+        dedupe_provider_names(&mut spec.providers);
+    }
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_VALIDATE_OBJECT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_DETACH_PROVIDER,
+        crate::interceptors::sandbox_to_json(&candidate_sandbox),
+        Some(crate::interceptors::sandbox_to_json(&sandbox)),
+        Some(crate::interceptors::detach_provider_request_to_json(
+            &request,
+        )),
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or_else(HashMap::new, |metadata| metadata.labels.clone()),
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let detached = Arc::new(AtomicBool::new(false));
@@ -460,6 +698,22 @@ pub(super) async fn handle_detach_sandbox_provider(
         detached,
         "DetachSandboxProvider request completed successfully"
     );
+
+    crate::interceptors::review_json(
+        state,
+        &interceptor_info,
+        PHASE_POST_COMMIT,
+        crate::interceptors::RESOURCE_SANDBOX,
+        crate::interceptors::OP_DETACH_PROVIDER,
+        crate::interceptors::sandbox_to_json(&sandbox),
+        None,
+        None,
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or_else(HashMap::new, |metadata| metadata.labels.clone()),
+    )
+    .await?;
 
     Ok(Response::new(DetachSandboxProviderResponse {
         sandbox: Some(sandbox),
@@ -1040,8 +1294,8 @@ async fn validate_ssh_forward_token(
 }
 
 fn acquire_ssh_connection_slots(
-    token_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    token_counts: &Mutex<HashMap<String, u32>>,
+    sandbox_counts: &Mutex<HashMap<String, u32>>,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
@@ -1074,10 +1328,7 @@ fn acquire_ssh_connection_slots(
     Ok(())
 }
 
-fn decrement_ssh_connection_count(
-    counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    key: &str,
-) {
+fn decrement_ssh_connection_count(counts: &Mutex<HashMap<String, u32>>, key: &str) {
     let mut counts = counts.lock().unwrap();
     if let Some(count) = counts.get_mut(key) {
         *count = count.saturating_sub(1);
@@ -1350,7 +1601,7 @@ pub(super) async fn handle_create_ssh_session(
             id: token.clone(),
             name: generate_name(),
             created_at_ms: now_ms,
-            labels: std::collections::HashMap::new(),
+            labels: HashMap::new(),
             resource_version: 0,
         }),
         sandbox_id: req.sandbox_id.clone(),

@@ -107,6 +107,31 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+## Interceptors
+
+Gateway interceptors are an optional operation-review boundary for deployments
+that need organization-specific controls outside the gateway binary. They are
+disabled unless configured in gateway TOML. At startup, the gateway connects to
+each configured gRPC or Unix-socket service, calls `Describe`, validates the
+returned manifest, applies any local narrowing overrides, and builds a
+deterministically ordered review plan. Invalid manifests or unreachable
+interceptors fail gateway startup.
+
+Handlers call the interceptor runtime only after authentication and basic
+request validation. The covered write paths are sandbox create and provider
+attach/detach, provider and provider-profile writes, policy/config updates, and
+the driver-facing sandbox create shape before compute-driver validation. The
+runtime supports `pre_request`, `modify_object`, `validate_object`,
+`validate_driver`, and `post_commit` phases. Modification phases are available
+only where the gateway owns explicit protobuf-to-JSON round-trip adapters;
+validation phases may deny but cannot patch.
+
+Provider credentials are treated as secret-bearing fields. Review payloads
+redact credential values, and patches that read or write provider credential
+paths are rejected before they can modify persisted state. Interceptor denials
+and security-relevant failures are visible through structured tracing, gateway
+OCSF finding events, and metrics.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store
@@ -149,6 +174,11 @@ Domain code should depend on the object-store contract, not SQL dialect details.
 This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
+
+User-supplied labels are validated with Kubernetes label-value limits at API
+boundaries. Trusted gateway extensions, such as interceptors, may attach longer
+stored metadata values when those values are not projected to compute-platform
+labels.
 
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
@@ -421,6 +451,11 @@ The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
 Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
+
+Gateway interceptors are configured under
+`[[openshell.gateway.interceptors]]`. They do not inherit into driver tables.
+Interceptor service manifests are validated at startup before the gateway
+accepts traffic.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

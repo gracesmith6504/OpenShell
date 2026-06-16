@@ -86,6 +86,7 @@ workspace = true
 
 [features]
 bundled-z3 = ["openshell-prover/bundled-z3"]
+gh-release-z3 = ["openshell-prover/gh-release-z3"]
 dev-settings = ["openshell-core/dev-settings"]
 
 [dev-dependencies]
