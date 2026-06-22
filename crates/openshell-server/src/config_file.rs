@@ -61,6 +61,11 @@ pub struct OpenShellRoot {
     /// independently of this crate.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
+
+    /// `[openshell.credential_drivers.<name>]` tables — passed verbatim to
+    /// credential driver implementations after gateway-level selection.
+    #[serde(default)]
+    pub credential_drivers: BTreeMap<String, toml::Value>,
 }
 
 /// `[openshell.gateway]` section.
@@ -88,6 +93,10 @@ pub struct GatewayFileSection {
     // ── Drivers ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub compute_drivers: Option<Vec<ComputeDriverKind>>,
+    #[serde(default)]
+    pub credential_drivers: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_credential_driver: Option<String>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
@@ -352,6 +361,7 @@ bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_drivers = ["kubernetes"]
+credential_drivers = ["kubernetes-secrets"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
@@ -372,6 +382,9 @@ audience = "openshell-cli"
 [openshell.drivers.kubernetes]
 namespace = "agents"
 grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
+
+[openshell.credential_drivers.kubernetes-secrets]
+namespace = "agents"
 "#;
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid file parses");
@@ -385,7 +398,17 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
+        assert_eq!(
+            gw.credential_drivers.as_deref(),
+            Some(&["kubernetes-secrets".to_string()][..])
+        );
+        assert!(gw.default_credential_driver.is_none());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+        assert!(
+            file.openshell
+                .credential_drivers
+                .contains_key("kubernetes-secrets")
+        );
     }
 
     #[test]

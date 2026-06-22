@@ -103,6 +103,13 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
+Namespace where Kubernetes Secret-backed provider credentials live.
+*/}}
+{{- define "openshell.credentialKubernetesSecretsNamespace" -}}
+{{- .Values.server.credentialDrivers.kubernetesSecrets.namespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
 Name of the Secret holding gateway-minted sandbox JWT signing material.
 */}}
 {{- define "openshell.sandboxJwtSecretName" -}}
@@ -177,5 +184,18 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
+{{- end -}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.openbao.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "openbao" -}}
+{{- end -}}
+{{- if gt (len $credentialDrivers) 1 -}}
+{{- fail "only one server.credentialDrivers backend can be enabled at a time." -}}
+{{- end -}}
+{{- if and .Values.server.credentialDrivers.default (not (has .Values.server.credentialDrivers.default $credentialDrivers)) -}}
+{{- fail "server.credentialDrivers.default must name an enabled credential driver." -}}
 {{- end -}}
 {{- end }}

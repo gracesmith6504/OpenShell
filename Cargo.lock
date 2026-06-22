@@ -3517,6 +3517,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-kubernetes-secrets"
+version = "0.0.0"
+dependencies = [
+ "k8s-openapi",
+ "kube",
+ "openshell-core",
+ "serde",
+ "sha2 0.10.9",
+ "toml",
+ "tonic",
+]
+
+[[package]]
+name = "openshell-driver-openbao"
+version = "0.0.0"
+dependencies = [
+ "openshell-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "wiremock",
+]
+
+[[package]]
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
@@ -3698,6 +3727,8 @@ dependencies = [
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
+ "openshell-driver-kubernetes-secrets",
+ "openshell-driver-openbao",
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
