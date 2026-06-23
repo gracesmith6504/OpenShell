@@ -220,7 +220,7 @@ service-declared binding that selected the evaluation.
 ### Gateway interceptor endpoints
 
 The framework uses one protobuf/gRPC service contract. The gateway derives the
-endpoint type and TLS mode from the gateway interceptor endpoint URI:
+endpoint type and TLS mode from the gateway interceptor `grpc_endpoint` URI:
 
 - `grpc://host:port` connects to a plaintext gRPC gateway interceptor service
   over TCP.
@@ -240,10 +240,10 @@ phase/RPC routes. Operators should normally configure a small number of these
 services and service-specific settings. The service tells the gateway which RPC
 bindings it supports.
 
-A `[[gateway_interceptors]]` table in the gateway config TOML represents one
-gateway interceptor service instance. During gateway startup or config reload,
-the gateway calls a `Describe` RPC on the service. The response describes the
-service's default bindings:
+A `[[openshell.gateway.interceptors]]` table in the gateway config TOML
+represents one gateway interceptor service instance. During gateway startup or
+config reload, the gateway calls a `Describe` RPC on the service. The response
+describes the service's default bindings:
 
 ```proto
 message InterceptorManifest {
@@ -279,9 +279,9 @@ service-declared selector, such as limiting a binding to a specific RPC.
 Gateway config example for a remote policy provider:
 
 ```toml
-[[gateway_interceptors]]
+[[openshell.gateway.interceptors]]
 name = "policy-provider"
-endpoint = "grpcs://policy-provider.example.com:8443"
+grpc_endpoint = "grpcs://policy-provider.example.com:8443"
 order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
@@ -424,9 +424,9 @@ The gateway config can stay small because the service manifest declares the
 bindings:
 
 ```toml
-[[gateway_interceptors]]
+[[openshell.gateway.interceptors]]
 name = "policy-provider"
-endpoint = "grpcs://policy-provider.example.com:8443"
+grpc_endpoint = "grpcs://policy-provider.example.com:8443"
 order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
@@ -451,8 +451,8 @@ This example illustrates the general gateway interceptor design loop:
 2. Add gateway interceptor configuration parsing to gateway config and validate
    it at startup.
 3. Implement gRPC gateway interceptor clients that derive TCP or Unix domain
-   socket transport from the configured endpoint URI and call `Describe` during
-   startup or config reload.
+   socket transport from the configured `grpc_endpoint` URI and call `Describe`
+   during startup or config reload.
 4. Build an execution plan from service manifests plus gateway-configured
    overrides.
 5. Wire gateway interceptor execution into the gateway API operation pipeline so
