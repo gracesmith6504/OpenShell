@@ -6,7 +6,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/1919
 ---
 
-# RFC 0006 - Gateway Interceptors
+# RFC 0010 - Gateway Interceptors
 
 ## Summary
 
