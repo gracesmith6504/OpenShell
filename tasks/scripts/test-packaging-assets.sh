@@ -28,6 +28,21 @@ assert_not_contains() {
   fi
 }
 
+assert_occurrences() {
+  local file=$1
+  local expected=$2
+  local count=$3
+  local actual
+
+  actual=$(grep -F "$expected" "$file" | wc -l | tr -d '[:space:]')
+  if [[ "$actual" != "$count" ]]; then
+    echo "FAIL: ${file} expected ${count} occurrences of:" >&2
+    echo "  ${expected}" >&2
+    echo "found ${actual}" >&2
+    exit 1
+  fi
+}
+
 assert_file_exists() {
   local file=$1
 
@@ -39,9 +54,11 @@ assert_file_exists() {
 
 service="${ROOT}/deploy/deb/openshell-gateway.service"
 spec="${ROOT}/openshell.spec"
+snapcraft="${ROOT}/snapcraft.yaml"
 
 assert_file_exists "$service"
 assert_file_exists "$spec"
+assert_file_exists "$snapcraft"
 
 assert_contains \
   "$service" \
@@ -58,5 +75,10 @@ assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
 assert_not_contains "$spec" '%%S/openshell/tls'
+
+assert_contains "$snapcraft" 'confinement: strict'
+assert_occurrences "$snapcraft" 'XDG_CONFIG_HOME: "$SNAP_USER_COMMON/xdg-config"' 2
+assert_occurrences "$snapcraft" 'XDG_DATA_HOME: "$SNAP_USER_COMMON/xdg-data"' 2
+assert_occurrences "$snapcraft" 'XDG_STATE_HOME: "$SNAP_USER_COMMON/xdg-state"' 2
 
 echo "packaging asset tests passed"
