@@ -160,26 +160,46 @@ service GatewayInterceptor {
   rpc Describe(google.protobuf.Empty) returns (InterceptorManifest);
   rpc Evaluate(InterceptorEvaluation) returns (InterceptorResult);
 }
+
+enum GatewayInterceptorPhase {
+  GATEWAY_INTERCEPTOR_PHASE_UNSPECIFIED = 0;
+  GATEWAY_INTERCEPTOR_PHASE_PRE_REQUEST = 1;
+  GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION = 2;
+  GATEWAY_INTERCEPTOR_PHASE_VALIDATE = 3;
+  GATEWAY_INTERCEPTOR_PHASE_POST_COMMIT = 4;
+}
 ```
 
-The gateway interceptor request should be stable and tied to the public gateway
+The gateway interceptor request must be stable and tied to public gateway
 API, not to Rust handler internals.
 
 ```proto
 message InterceptorEvaluation {
-  string api_version = 1;
-  string interceptor_name = 2;
-  string binding_id = 3;
-  string phase = 4;
-  string rpc_service = 5;
-  string rpc_method = 6;
+  // Gateway-configured gateway interceptor service name.
+  string interceptor_name = 1;
+  // Service-declared binding that selected this evaluation.
+  string binding_id = 2;
+  // Gateway operation phase for this evaluation.
+  GatewayInterceptorPhase phase = 3;
+  // Fully qualified public gateway gRPC service name.
+  string rpc_service = 4;
+  // Public gateway RPC method name.
+  string rpc_method = 5;
 
-  string principal = 7;
-  map<string, string> context = 8;
+  // Authenticated gateway principal for the API request.
+  string principal = 6;
+  // Additional gateway-provided request context.
+  map<string, string> context = 7;
 
-  google.protobuf.Struct operation_input = 9;
-  google.protobuf.Struct existing_state = 10;
-  google.protobuf.Struct rpc_request = 11;
+  oneof payload {
+    // Raw public gateway API request. Present for pre_request.
+    google.protobuf.Struct api_request = 8;
+    // Gateway-prepared operation the gateway proposes to execute.
+    google.protobuf.Struct proposed_operation = 9;
+  }
+
+  // Gateway-owned resource state loaded before applying the proposed operation.
+  google.protobuf.Struct current_state = 10;
 }
 ```
 
@@ -189,11 +209,12 @@ qualified RPC selector used by bindings. For example,
 `rpc_service = "openshell.v1.OpenShell"` and
 `rpc_method = "CreateSandbox"`.
 
-The payload fields are phase-scoped. `rpc_request` is the raw gateway RPC
-payload available to `pre_request`. `operation_input` is the gateway-prepared
-input available after state loading and defaulting; it is the main payload for
-`modify_operation`, `validate`, and `post_commit`. `existing_state` is populated
-only when the operation has prior gateway-owned state.
+The gateway sets exactly one payload variant per evaluation. `api_request` is
+the raw public gateway API request available to `pre_request`.
+`proposed_operation` is the gateway-prepared operation after state loading,
+defaulting, and prior patches; it is the main payload for `modify_operation`,
+`validate`, and `post_commit`. `current_state` stays outside the `oneof` because
+it can accompany update-style operations as read-only context.
 
 The gateway interceptor response returns an allow/deny result, optional
 patches, and diagnostic metadata for selected gateway operations.
@@ -209,10 +230,17 @@ message InterceptorResult {
 }
 ```
 
-Only modification phases accept patches. `pre_request` patches apply to
-`rpc_request`; `modify_operation` patches apply to `operation_input`.
-`validate` and `post_commit` gateway interceptors that return patches are
-configuration errors.
+The gateway projects a valid `InterceptorResult` onto the gateway operation.
+`allowed = true` lets the operation continue. `allowed = false` rejects the
+gateway API operation in `pre_request`, `modify_operation`, or `validate`,
+using `status_code` and `reason`. Only modification phases accept patches:
+`pre_request` patches apply to `api_request`, and `modify_operation` patches
+apply to `proposed_operation`. `current_state` is read-only context and is never
+patched. `warnings` and `audit_annotations` are projected into gateway response
+metadata and logs where applicable. `post_commit` runs after the gateway
+operation has committed, so it cannot reject or mutate the operation. A
+`post_commit` result with `allowed = false` or patches is a gateway interceptor
+contract violation.
 
 The `binding_id` is owned by the gateway interceptor service. It identifies the
 service-declared binding that selected the evaluation.
@@ -241,13 +269,12 @@ describes the service's default bindings:
 
 ```proto
 message InterceptorManifest {
-  string api_version = 1;
-  repeated InterceptorBinding bindings = 2;
+  repeated InterceptorBinding bindings = 1;
 }
 
 message InterceptorBinding {
   string id = 1;
-  repeated string phases = 2;
+  repeated GatewayInterceptorPhase phases = 2;
   repeated string rpcs = 3;
   int32 order = 4;
   bool modifies = 5;
@@ -301,15 +328,22 @@ modification order for the same field if that can be detected statically.
 
 ### Failure policy
 
+Failure policy is gateway control-plane behavior for cases where the gateway
+cannot obtain or apply a valid gateway interceptor result. Examples include
+timeout, transport failure, service error, invalid response, response-size
+violation, invalid phase behavior, or patch limit violation. A valid
+`allowed = false` result in `pre_request`, `modify_operation`, or `validate` is
+not an error-policy case; the gateway must project it as an operation rejection.
+
 Each binding has an effective failure policy. The gateway starts with the
 service-declared binding `on_error` value, applies the gateway interceptor
 service-level gateway config, then applies any binding override.
 
 | Failure policy | Behavior |
 |---|---|
-| `fail_closed` | Gateway interceptor timeout or service error rejects the API operation. |
-| `fail_open` | Gateway interceptor timeout or service error permits the operation. The gateway emits warnings and audit logs. |
-| `ignore` | Gateway interceptor errors are logged only. Valid only for `post_commit`. |
+| `fail_closed` | The gateway rejects the API operation before committing side effects. |
+| `fail_open` | The gateway continues without applying the failed gateway interceptor result and emits warning and audit events. |
+| `ignore` | The gateway records the failure without changing operation outcome. Valid only for `post_commit`. |
 
 Defaults:
 
@@ -356,18 +390,17 @@ initial policy and another to guard later policy changes:
 
 ```proto
 InterceptorManifest {
-  api_version: "v1"
   bindings: [
     {
       id: "sandbox-policy-default"
-      phases: ["modify_operation"]
+      phases: [GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION]
       rpcs: ["openshell.v1.OpenShell/CreateSandbox"]
       modifies: true
       on_error: "fail_closed"
     },
     {
       id: "policy-authority"
-      phases: ["validate"]
+      phases: [GATEWAY_INTERCEPTOR_PHASE_VALIDATE]
       rpcs: ["openshell.v1.OpenShell/UpdateConfig"]
       modifies: false
       on_error: "fail_closed"
@@ -382,10 +415,10 @@ binding:
 ```rust
 // Toy implementation of the GatewayInterceptor Evaluate RPC.
 async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorResult {
-    match (req.rpc_method.as_str(), req.phase.as_str()) {
+    match (req.rpc_method.as_str(), req.phase) {
         // CreateSandbox: ask the remote policy provider for the approved
         // initial policy and stamp it into the prepared operation input.
-        ("CreateSandbox", "modify_operation") => {
+        ("CreateSandbox", GatewayInterceptorPhase::ModifyOperation) => {
             let approved_policy = self.policy_provider.initial_policy(&req).await;
 
             InterceptorResult::allow().with_patch(JsonPatch::replace(
@@ -395,7 +428,7 @@ async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorResult {
         }
 
         // UpdateConfig: reject policy writes the remote provider does not approve.
-        ("UpdateConfig", "validate") => {
+        ("UpdateConfig", GatewayInterceptorPhase::Validate) => {
             let validation = self.policy_provider.validate_update(&req).await;
             if !validation.allowed {
                 return InterceptorResult::reject(
