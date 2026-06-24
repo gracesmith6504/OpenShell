@@ -735,6 +735,14 @@
       "created_at": "2026-06-24T16:37:56Z",
       "repoId": 1166129534,
       "pullRequestNo": 1989
+    },
+    {
+      "name": "Gal-Zaidman",
+      "id": 38602062,
+      "comment_id": 4792776900,
+      "created_at": "2026-06-24T19:11:59Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 1992
     }
   ]
 }
