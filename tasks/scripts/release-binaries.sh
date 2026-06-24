@@ -102,6 +102,13 @@ mise x -- cargo build \
     -p openshell-cli \
     --features bundled-z3
 
+mise x -- cargo build \
+    --release \
+    --target "${cli_target}" \
+    -p openshell-sandbox \
+    --bin openshell-sandbox \
+    --features openshell-core/dev-settings
+
 eval "$(
     tasks/scripts/setup-zig-cc-wrapper.sh \
         "${gnu_zig_target}" \
@@ -131,9 +138,11 @@ tasks/scripts/verify-glibc-symbols.sh \
 
 mkdir -p /out/bin
 install -m 0755 "target/${cli_target}/release/openshell" /out/bin/openshell
+install -m 0755 "target/${cli_target}/release/openshell-sandbox" /out/bin/openshell-sandbox
 install -m 0755 "target/${gnu_target}/release/openshell-gateway" /out/bin/openshell-gateway
 install -m 0755 "target/${gnu_target}/release/openshell-driver-vm" /out/bin/openshell-driver-vm
 
 /out/bin/openshell --version
+/out/bin/openshell-sandbox --version
 /out/bin/openshell-gateway --version
 /out/bin/openshell-driver-vm --version

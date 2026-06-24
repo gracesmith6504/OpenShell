@@ -35,6 +35,10 @@ PACKAGE_SOURCE_INCLUDE = [
 ]
 
 GIT_SOURCE_INCLUDE = [".git/"]
+DIND_SOURCE_INCLUDE = ["tasks/scripts/dagger-dind-shell.sh"]
+
+DIND_ENTRYPOINT_PATH = "/usr/local/bin/openshell-dind-shell"
+DIND_SUPERVISOR_PATH = "/usr/local/libexec/openshell/openshell-sandbox"
 
 
 def _platform_for_arch(arch: str) -> dagger.Platform | None:
@@ -78,6 +82,12 @@ class OpenShell:
 
     def _package_source(self, source_path: str) -> dagger.Directory:
         return self._workspace_dir(source_path, PACKAGE_SOURCE_INCLUDE)
+
+    def _dind_script(self, source_path: str) -> dagger.File:
+        return self._workspace_dir(
+            source_path,
+            DIND_SOURCE_INCLUDE,
+        ).file("tasks/scripts/dagger-dind-shell.sh")
 
     def _git_dir(self, source_path: str) -> dagger.Directory:
         return self._workspace_dir(
@@ -132,13 +142,7 @@ class OpenShell:
             .with_exec(["bash", "tasks/scripts/release-binaries.sh"])
         )
 
-    @function
-    def release_binaries(
-        self,
-        arch: str,
-        source_path: str = ".",
-    ) -> dagger.Directory:
-        """Build the binaries consumed by tasks/scripts/package-deb.sh."""
+    def _release_binaries_dir(self, arch: str, source_path: str) -> dagger.Directory:
         build_source = self._build_source(source_path)
         return self._release_build_container(
             arch,
@@ -148,6 +152,15 @@ class OpenShell:
         ).directory("/out/bin")
 
     @function
+    def release_binaries(
+        self,
+        arch: str,
+        source_path: str = ".",
+    ) -> dagger.Directory:
+        """Build release binaries and helper binaries for package smoke tests."""
+        return self._release_binaries_dir(arch, source_path)
+
+    @function
     def deb_package(
         self,
         arch: str,
@@ -155,17 +168,9 @@ class OpenShell:
         version: str | None = None,
     ) -> dagger.Directory:
         """Build an OpenShell Debian package and return the artifact directory."""
-        build_source = self._build_source(source_path)
         package_source = self._package_source(source_path)
         git_dir = self._git_dir(source_path)
-        package_input = self._release_build_container(
-            arch,
-            source_path,
-            build_source,
-            git_dir,
-        ).directory(
-            "/out/bin"
-        )
+        package_input = self._release_binaries_dir(arch, source_path)
         arch_export = f'export OPENSHELL_DEB_ARCH="{arch}"'
         version_export = (
             f'export OPENSHELL_DEB_VERSION="{version}"'
@@ -242,6 +247,58 @@ class OpenShell:
                         ]
                     ),
                 ]
+            )
+        )
+
+    @function
+    def installed_deb_dind_container(
+        self,
+        arch: str,
+        source_path: str = ".",
+        version: str | None = None,
+        base_image: str = "ubuntu:24.04",
+    ) -> dagger.Container:
+        """Install the .deb and prepare an interactive Docker-in-Docker gateway."""
+        supervisor = self._release_binaries_dir(
+            arch,
+            source_path,
+        ).file("openshell-sandbox")
+        return (
+            self.installed_deb_container(
+                arch=arch,
+                source_path=source_path,
+                version=version,
+                base_image=base_image,
+            )
+            .with_file(
+                DIND_SUPERVISOR_PATH,
+                supervisor,
+                permissions=0o755,
+            )
+            .with_env_variable("DEBIAN_FRONTEND", "noninteractive")
+            .with_exec(
+                [
+                    "bash",
+                    "-lc",
+                    "\n".join(
+                        [
+                            "set -euo pipefail",
+                            "apt-get update",
+                            "apt-get install -y --no-install-recommends "
+                            "docker.io iproute2 iptables openssh-client procps",
+                            "rm -rf /var/lib/apt/lists/*",
+                        ]
+                    ),
+                ]
+            )
+            .with_file(
+                DIND_ENTRYPOINT_PATH,
+                self._dind_script(source_path),
+                permissions=0o755,
+            )
+            .with_default_terminal_cmd(
+                [DIND_ENTRYPOINT_PATH],
+                insecure_root_capabilities=True,
             )
         )
 
