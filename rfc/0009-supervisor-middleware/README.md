@@ -151,8 +151,8 @@ Configuration-time:
 
 Request-time:
 
-- `EvaluateHttpRequest` carries the operation phase (`pre_credentials`) plus context: request identity, endpoint and header context, optional originating process data (the binary, pid, and ancestor chain OpenShell resolves when available for network policy and audit), the bounded body, and the middleware's configuration from policy.
-- `HttpRequestResult` is a response OpenShell can apply directly: `allow` or `deny`, optional replacement content and allowed header mutations, findings (labels, counts, confidence, never raw matched values), and namespaced metadata.
+- `EvaluateHttpRequest` carries the selected binding ID and operation phase (`pre_credentials`) plus the request context, middleware configuration from policy, HTTP request target, safe header subset, and bounded body.
+- `HttpRequestResult` is a response OpenShell can apply directly: `allow` or `deny`, a safe reason, optional replacement content, allowed header mutations, findings (labels, counts, confidence, never raw matched values), and namespaced metadata.
 
 A simplified sketch of the gRPC contract:
 
@@ -179,23 +179,35 @@ message MiddlewareBinding {
   string phase = 3;                     // e.g. "pre_credentials"
 }
 
-// Context plus body as two top-level fields, so the body is cleanly separable.
 message HttpRequestEvaluation {
-  Operation operation = 1;
-  RequestContext context = 2;
-  bytes body = 3;                       // bounded
+  string api_version = 1;
+  string binding_id = 2;                // selected manifest binding
+  string phase = 3;                     // e.g. "pre_credentials"
+
+  RequestContext context = 4;
+  google.protobuf.Struct config = 5;    // service-specific, from policy
+
+  HttpRequestTarget target = 6;
+  map<string, string> headers = 7;      // safe subset
+  bytes body = 8;                       // bounded
 }
 
 message RequestContext {
   string request_id = 1;
   string sandbox_id = 2;
-  Endpoint endpoint = 3;                // scheme, host, port, method, path
-  map<string, string> headers = 4;      // safe subset
-  google.protobuf.Struct config = 5;    // service-specific, from policy
-  Process actor = 6;                    // optional originating process (per-connection)
+  Process originating_process = 3;      // optional, per-connection
 }
 
-// Mirrors the actor process OpenShell already resolves for network policy and OCSF audit.
+message HttpRequestTarget {
+  string scheme = 1;
+  string host = 2;
+  uint32 port = 3;
+  string method = 4;
+  string path = 5;
+  string query = 6;                     // raw request query string; never log
+}
+
+// Mirrors the originating process OpenShell already resolves for network policy and OCSF audit.
 message Process {
   string binary = 1;                    // resolved binary path
   uint32 pid = 2;
@@ -210,28 +222,26 @@ message Finding {
   string severity = 5;                   // service-defined severity marker
 }
 
-// Outcome plus optional replacement body.
 message HttpRequestResult {
-  Outcome outcome = 1;
-  bytes body = 2;                       // replacement content when transformed
-}
-
-message Outcome {
   Decision decision = 1;                // ALLOW or DENY
-  string deny_reason = 2;               // safe, machine-readable
-  map<string, string> add_headers = 3;  // append-only, subject to a v1 safe-header allow-list
-  map<string, string> metadata = 4;     // namespaced, no raw values
-  repeated Finding findings = 5;        // labels, counts, confidence
+  string reason = 2;                    // safe, machine-readable
+
+  bytes body = 3;                       // replacement content when transformed
+  bool has_body = 4;                    // distinguishes no replacement from an empty replacement
+
+  map<string, string> add_headers = 5;  // append-only, subject to a v1 safe-header allow-list
+  repeated Finding findings = 6;        // labels, counts, confidence
+  map<string, string> metadata = 7;     // namespaced, no raw values
 }
 ```
 
-The evaluation and result are shaped so middleware composes cleanly in a chain. The transformed content a middleware returns (`HttpRequestResult.body`) is the same request body the next middleware receives as `HttpRequestEvaluation.body`, and the allow/deny decision travels as a separate signal in `Outcome` rather than being mixed into the content. The supervisor feeds one stage's `body` (and allowed header mutations) as the input to the next stage, so a chain is effectively a fold over a single request representation; a `deny` from any stage short-circuits the rest. See [Middleware ordering](#middleware-ordering) for how chains are assembled and ordered.
+The evaluation and result are shaped so middleware composes cleanly in a chain. The allow/deny decision is a first-class result field rather than being mixed into content. If `has_body` is true, the transformed content a middleware returns (`HttpRequestResult.body`) becomes the request body the next middleware receives as `HttpRequestEvaluation.body`; if `has_body` is false, the supervisor keeps the previous body. The supervisor also feeds allowed header mutations into the next stage, so a chain is effectively a fold over a single request representation; a `deny` from any stage short-circuits the rest. See [Middleware ordering](#middleware-ordering) for how chains are assembled and ordered.
 
 Header mutation is deliberately narrow in v1. Middleware may only append safe, non-credential request headers approved by OpenShell. It cannot remove headers, rewrite existing headers, or set credential-bearing and request-routing headers such as `Authorization`, `Cookie`, `Host`, `X-Amz-*`, or OpenShell credential placeholders. This keeps request-body transformation useful while preserving the credential boundary and avoiding a second, middleware-owned routing surface.
 
 The interface is gRPC. The hot-path v1 RPC is unary: the supervisor buffers the bounded body, sends one `HttpRequestEvaluation`, and receives one `HttpRequestResult`. Streaming is deliberately not baked into `EvaluateHttpRequest`; if OpenShell later needs chunked or incremental processing, it should add a separate operation-specific method rather than changing the v1 method cardinality. Possible extensions (streaming operations, additional operation phases, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md). The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The exact field set is settled during implementation; the sketch above is the contract shape this RFC asks reviewers to evaluate.
 
-The `actor` process is the same identity OpenShell already resolves on the egress path - the binary, pid, and ancestor chain it uses for binary-scoped network policy and OCSF audit. It is resolved when the connection is established, so it is per-connection rather than strictly per-request: over a reused or pooled connection it identifies the process that opened the connection, which a middleware should not over-trust for per-request attribution. The field is optional because proxy-only or future shared-supervisor modes may not have reliable actor data; middleware must treat missing actor data as "unavailable" rather than as an authorization failure.
+The `originating_process` is the same identity OpenShell already resolves on the egress path - the binary, pid, and ancestor chain it uses for binary-scoped network policy and OCSF audit. It is resolved when the connection is established, so it is per-connection rather than strictly per-request: over a reused or pooled connection it identifies the process that opened the connection, which a middleware should not over-trust for per-request attribution. The field is optional because proxy-only or future shared-supervisor modes may not have reliable process data; middleware must treat missing process data as "unavailable" rather than as an authorization failure.
 
 ### Relationship to RFC 0010
 
