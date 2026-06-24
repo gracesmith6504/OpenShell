@@ -157,9 +157,12 @@ Each gateway interceptor is a registered service instance that implements the
 
 ```proto
 service GatewayInterceptor {
-  rpc Describe(google.protobuf.Empty) returns (InterceptorManifest);
+  rpc Describe(DescribeRequest) returns (InterceptorManifest);
   rpc Evaluate(InterceptorEvaluation) returns (InterceptorResult);
 }
+
+// Empty today so Describe can grow additively later.
+message DescribeRequest {}
 
 enum GatewayInterceptorPhase {
   GATEWAY_INTERCEPTOR_PHASE_UNSPECIFIED = 0;
