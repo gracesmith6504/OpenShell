@@ -3771,6 +3771,7 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",
@@ -3927,6 +3928,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor-middleware"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "regex",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
@@ -3948,6 +3961,8 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-middleware",
+ "prost-types",
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
