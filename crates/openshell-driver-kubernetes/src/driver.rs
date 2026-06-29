@@ -1414,7 +1414,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             "allowPrivilegeEscalation": false,
             "capabilities": {
                 "drop": ["ALL"],
-                "add": ["NET_ADMIN", "CHOWN", "FOWNER"]
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
             }
         },
         "volumeMounts": [
@@ -3246,7 +3246,7 @@ mod tests {
             network_init["securityContext"]["capabilities"],
             serde_json::json!({
                 "drop": ["ALL"],
-                "add": ["NET_ADMIN", "CHOWN", "FOWNER"]
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
             })
         );
         let network_init_mounts = network_init["volumeMounts"].as_array().unwrap();

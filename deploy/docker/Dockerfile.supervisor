@@ -23,7 +23,7 @@ FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables
+RUN apk add --no-cache nftables iptables iptables-legacy
 
 # --chmod=0555 restores execute bits after the actions/upload-artifact +
 # download-artifact roundtrip strips them. Ownership stays root (0:0) for
