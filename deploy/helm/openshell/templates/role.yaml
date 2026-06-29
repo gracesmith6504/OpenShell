@@ -36,7 +36,7 @@ rules:
   # annotation. patch is intentionally NOT granted — the annotation is set
   # once at pod create and must remain immutable for the lifetime of the
   # sandbox. create/delete/list/watch are intentionally not granted; the Agent
-  # Sandbox controller creates agent pods, and split-pod supervisors are
+  # Sandbox controller creates agent pods, and proxy-pod supervisors are
   # managed through per-sandbox Deployments.
   - apiGroups:
       - ""
@@ -44,7 +44,7 @@ rules:
       - pods
     verbs:
       - get
-  # Split-pod topology creates one supervisor Deployment, one supervisor
+  # Proxy-pod topology creates one supervisor Deployment, one supervisor
   # Service, and one CA Secret per sandbox. All are owner-referenced to the
   # Sandbox CR for garbage collection. The gateway also reads the generated
   # ReplicaSet during K8s ServiceAccount bootstrap to verify the supervisor

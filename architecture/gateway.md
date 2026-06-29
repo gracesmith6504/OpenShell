@@ -67,7 +67,7 @@ with Kubernetes `TokenReview`, requires the configured sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the
 pod's ownership against the live Sandbox CR UID and sandbox-id label before
 minting the gateway JWT. Agent pods must be directly controlled by the
-`Sandbox` CR. Split-pod supervisor pods may be controlled through the Kubernetes
+`Sandbox` CR. Proxy-pod supervisor pods may be controlled through the Kubernetes
 `Pod -> ReplicaSet -> Deployment -> Sandbox` chain. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing

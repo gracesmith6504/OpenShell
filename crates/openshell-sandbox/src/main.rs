@@ -172,15 +172,16 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
 
-    /// UID that the long-running Kubernetes network sidecar will run as.
-    /// `--mode=network-init` installs nftables rules that exempt this UID.
-    #[arg(long, env = "OPENSHELL_SIDECAR_PROXY_UID", default_value_t = 1337)]
-    sidecar_proxy_uid: u32,
+    /// UID that the long-running Kubernetes network proxy will run as.
+    /// In sidecar topology, `--mode=network-init` installs nftables rules
+    /// that exempt this UID.
+    #[arg(long, env = "OPENSHELL_PROXY_UID", default_value_t = 1337)]
+    proxy_uid: u32,
 
     /// GID assigned to shared sidecar state directories. Defaults to
-    /// `--sidecar-proxy-uid` when omitted.
-    #[arg(long, env = "OPENSHELL_SIDECAR_PROXY_GID")]
-    sidecar_proxy_gid: Option<u32>,
+    /// `--proxy-uid` when omitted.
+    #[arg(long, env = "OPENSHELL_PROXY_GID")]
+    proxy_gid: Option<u32>,
 
     /// Shared state directory between the network init container and sidecar.
     #[arg(long, env = "OPENSHELL_SIDECAR_STATE_DIR", default_value = SIDECAR_STATE_DIR)]
@@ -313,46 +314,41 @@ fn copy_sidecar_client_tls_if_present(
 
 #[cfg(target_os = "linux")]
 fn run_network_init(
-    sidecar_proxy_uid: u32,
-    sidecar_proxy_gid: u32,
+    proxy_uid: u32,
+    proxy_gid: u32,
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
 ) -> Result<()> {
-    if sidecar_proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_uid < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
-            "--sidecar-proxy-uid must be at least {}",
+            "--proxy-uid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
         ));
     }
-    if sidecar_proxy_gid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_gid < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
-            "--sidecar-proxy-gid must be at least {}",
+            "--proxy-gid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
         ));
     }
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
-    prepare_sidecar_directory(
-        sidecar_state_dir,
-        sidecar_proxy_uid,
-        sidecar_proxy_gid,
-        0o775,
-    )?;
-    prepare_sidecar_directory(sidecar_tls_dir, sidecar_proxy_uid, sidecar_proxy_gid, 0o755)?;
+    prepare_sidecar_directory(sidecar_state_dir, proxy_uid, proxy_gid, 0o775)?;
+    prepare_sidecar_directory(sidecar_tls_dir, proxy_uid, proxy_gid, 0o755)?;
     copy_sidecar_client_tls_if_present(
         Path::new(CLIENT_TLS_DIR),
         sidecar_tls_dir,
-        sidecar_proxy_uid,
-        sidecar_proxy_gid,
+        proxy_uid,
+        proxy_gid,
     )?;
-    openshell_supervisor_process::netns::install_sidecar_bypass_rules(sidecar_proxy_uid)
+    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_uid)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn run_network_init(
-    _sidecar_proxy_uid: u32,
-    _sidecar_proxy_gid: u32,
+    _proxy_uid: u32,
+    _proxy_gid: u32,
     _sidecar_state_dir: &str,
     _sidecar_tls_dir: &str,
 ) -> Result<()> {
@@ -390,10 +386,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.mode.network_init {
-        let sidecar_proxy_gid = args.sidecar_proxy_gid.unwrap_or(args.sidecar_proxy_uid);
+        let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
         return run_network_init(
-            args.sidecar_proxy_uid,
-            sidecar_proxy_gid,
+            args.proxy_uid,
+            proxy_gid,
             &args.sidecar_state_dir,
             &args.sidecar_tls_dir,
         );

@@ -15,8 +15,8 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default UID for the long-running Kubernetes network supervisor sidecar.
-pub const DEFAULT_SIDECAR_PROXY_UID: u32 = 1337;
+/// Default UID for the long-running Kubernetes network proxy.
+pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -67,7 +67,7 @@ pub enum SupervisorTopology {
     Sidecar,
     /// Run network supervision in a separate supervisor pod and process
     /// supervision as a low-capability wrapper in the agent pod.
-    SplitPod,
+    ProxyPod,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -75,7 +75,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
-            Self::SplitPod => f.write_str("split-pod"),
+            Self::ProxyPod => f.write_str("proxy-pod"),
         }
     }
 }
@@ -87,9 +87,9 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
-            "split-pod" => Ok(Self::SplitPod),
+            "proxy-pod" => Ok(Self::ProxyPod),
             other => Err(format!(
-                "unknown supervisor topology '{other}'; expected 'combined', 'sidecar', or 'split-pod'"
+                "unknown supervisor topology '{other}'; expected 'combined', 'sidecar', or 'proxy-pod'"
             )),
         }
     }
@@ -223,10 +223,11 @@ pub struct KubernetesComputeConfig {
     /// root supervisor container path; `sidecar` moves pod-level network
     /// enforcement into a dedicated sidecar container.
     pub supervisor_topology: SupervisorTopology,
-    /// UID used by the long-running network sidecar in `sidecar` topology.
-    /// The network init container installs nftables rules that exempt this
-    /// UID, so it must not match the sandbox workload UID.
-    pub sidecar_proxy_uid: u32,
+    /// UID used by the long-running network proxy in sidecar and proxy-pod
+    /// topologies. In sidecar topology, the network init container installs
+    /// nftables rules that exempt this UID, so it must not match the sandbox
+    /// workload UID.
+    pub proxy_uid: u32,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -310,7 +311,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
-            sidecar_proxy_uid: DEFAULT_SIDECAR_PROXY_UID,
+            proxy_uid: DEFAULT_PROXY_UID,
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -355,10 +356,10 @@ impl KubernetesComputeConfig {
         )
     }
 
-    pub fn validate_sidecar_proxy_uid(&self) -> Result<(), String> {
-        if self.sidecar_proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+    pub fn validate_proxy_uid(&self) -> Result<(), String> {
+        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
             return Err(format!(
-                "sidecar_proxy_uid must be at least {}",
+                "proxy_uid must be at least {}",
                 openshell_policy::MIN_SANDBOX_UID
             ));
         }
@@ -476,9 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn default_sidecar_proxy_uid_is_dedicated_non_root_uid() {
+    fn default_proxy_uid_is_dedicated_non_root_uid() {
         let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.sidecar_proxy_uid, DEFAULT_SIDECAR_PROXY_UID);
+        assert_eq!(cfg.proxy_uid, DEFAULT_PROXY_UID);
     }
 
     #[test]
@@ -491,33 +492,33 @@ mod tests {
     }
 
     #[test]
-    fn serde_override_supervisor_topology_split_pod() {
+    fn serde_override_supervisor_topology_proxy_pod() {
         let json = serde_json::json!({
-            "supervisor_topology": "split-pod"
+            "supervisor_topology": "proxy-pod"
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.supervisor_topology, SupervisorTopology::SplitPod);
-        assert_eq!(cfg.supervisor_topology.to_string(), "split-pod");
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::ProxyPod);
+        assert_eq!(cfg.supervisor_topology.to_string(), "proxy-pod");
     }
 
     #[test]
-    fn serde_override_sidecar_proxy_uid() {
+    fn serde_override_proxy_uid() {
         let json = serde_json::json!({
-            "sidecar_proxy_uid": 2000
+            "proxy_uid": 2000
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.sidecar_proxy_uid, 2000);
-        cfg.validate_sidecar_proxy_uid().unwrap();
+        assert_eq!(cfg.proxy_uid, 2000);
+        cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]
-    fn validate_sidecar_proxy_uid_rejects_privileged_uid() {
+    fn validate_proxy_uid_rejects_privileged_uid() {
         let cfg = KubernetesComputeConfig {
-            sidecar_proxy_uid: 999,
+            proxy_uid: 999,
             ..KubernetesComputeConfig::default()
         };
-        let err = cfg.validate_sidecar_proxy_uid().unwrap_err();
-        assert!(err.contains("sidecar_proxy_uid"));
+        let err = cfg.validate_proxy_uid().unwrap_err();
+        assert!(err.contains("proxy_uid"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use super::AppArmorProfile;
 use crate::config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_SIDECAR_PROXY_UID,
+    DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
     SupervisorTopology,
 };
@@ -224,7 +224,7 @@ impl KubernetesComputeDriver {
             .validate_provider_spiffe_workload_api_socket_path()
             .map_err(KubernetesDriverError::Precondition)?;
         config
-            .validate_sidecar_proxy_uid()
+            .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -546,7 +546,7 @@ impl KubernetesComputeDriver {
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             supervisor_topology: self.config.supervisor_topology,
-            sidecar_proxy_uid: self.config.sidecar_proxy_uid,
+            proxy_uid: self.config.proxy_uid,
             namespace: &self.config.namespace,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
@@ -567,7 +567,7 @@ impl KubernetesComputeDriver {
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
         };
-        validate_sidecar_proxy_identity(&params)?;
+        validate_proxy_identity(&params)?;
 
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let created = match tokio::time::timeout(
@@ -607,9 +607,9 @@ impl KubernetesComputeDriver {
             }
         };
 
-        if self.config.supervisor_topology == SupervisorTopology::SplitPod
+        if self.config.supervisor_topology == SupervisorTopology::ProxyPod
             && let Err(err) = self
-                .create_split_pod_resources(
+                .create_proxy_pod_resources(
                     sandbox,
                     sandbox.spec.as_ref(),
                     &params,
@@ -622,9 +622,9 @@ impl KubernetesComputeDriver {
                 sandbox_id = %sandbox.id,
                 sandbox_name = %name,
                 error = %err,
-                "Failed to create split-pod resources; deleting Sandbox CR"
+                "Failed to create proxy-pod resources; deleting Sandbox CR"
             );
-            self.cleanup_split_pod_resources(name).await;
+            self.cleanup_proxy_pod_resources(name).await;
             let _ = tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 agent_sandbox_api.api.delete(name, &DeleteParams::default()),
@@ -636,7 +636,7 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    async fn create_split_pod_resources(
+    async fn create_proxy_pod_resources(
         &self,
         sandbox: &Sandbox,
         spec: Option<&SandboxSpec>,
@@ -644,29 +644,31 @@ impl KubernetesComputeDriver {
         sandbox_cr: &DynamicObject,
         sandbox_api_version: &str,
     ) -> Result<(), KubernetesDriverError> {
-        let names = split_pod_resource_names(&sandbox.name);
+        let names = proxy_pod_resource_names(&sandbox.name);
         let template_environment = spec
             .and_then(|spec| spec.template.as_ref())
             .map(|template| template.environment.clone())
             .unwrap_or_default();
         let spec_environment = spec_pod_env(spec);
-        let deployment_owner_ref = split_owner_reference(sandbox_cr, sandbox_api_version, true)?;
-        let dependent_owner_ref = split_owner_reference(sandbox_cr, sandbox_api_version, false)?;
-        let (ca_cert_pem, ca_key_pem) = generate_split_proxy_ca()?;
+        let deployment_owner_ref =
+            proxy_pod_owner_reference(sandbox_cr, sandbox_api_version, true)?;
+        let dependent_owner_ref =
+            proxy_pod_owner_reference(sandbox_cr, sandbox_api_version, false)?;
+        let (ca_cert_pem, ca_key_pem) = generate_proxy_pod_ca()?;
 
-        let secret = split_proxy_ca_secret(
+        let secret = proxy_pod_ca_secret(
             &names,
             params,
             dependent_owner_ref.clone(),
             &ca_cert_pem,
             &ca_key_pem,
         );
-        let service = split_supervisor_service(&names, params, dependent_owner_ref.clone());
+        let service = proxy_pod_supervisor_service(&names, params, dependent_owner_ref.clone());
         let agent_egress =
-            split_agent_egress_network_policy(&names, params, dependent_owner_ref.clone());
+            proxy_pod_agent_egress_network_policy(&names, params, dependent_owner_ref.clone());
         let supervisor_ingress =
-            split_supervisor_ingress_network_policy(&names, params, dependent_owner_ref);
-        let supervisor_deployment = split_supervisor_deployment(
+            proxy_pod_supervisor_ingress_network_policy(&names, params, dependent_owner_ref);
+        let supervisor_deployment = proxy_pod_supervisor_deployment(
             &names,
             &template_environment,
             &spec_environment,
@@ -688,7 +690,7 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod CA secret",
+                "timed out after {}s creating proxy-pod CA secret",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -700,7 +702,7 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod service",
+                "timed out after {}s creating proxy-pod service",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -712,7 +714,7 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod agent egress NetworkPolicy",
+                "timed out after {}s creating proxy-pod agent egress NetworkPolicy",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -724,7 +726,7 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod supervisor ingress NetworkPolicy",
+                "timed out after {}s creating proxy-pod supervisor ingress NetworkPolicy",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -736,7 +738,7 @@ impl KubernetesComputeDriver {
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod supervisor deployment",
+                "timed out after {}s creating proxy-pod supervisor deployment",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -747,13 +749,13 @@ impl KubernetesComputeDriver {
             sandbox_name = %sandbox.name,
             supervisor_deployment = %names.supervisor_deployment,
             service = %names.service,
-            "Created split-pod supervisor resources"
+            "Created proxy-pod supervisor resources"
         );
         Ok(())
     }
 
-    async fn cleanup_split_pod_resources(&self, sandbox_name: &str) {
-        let names = split_pod_resource_names(sandbox_name);
+    async fn cleanup_proxy_pod_resources(&self, sandbox_name: &str) {
+        let names = proxy_pod_resource_names(sandbox_name);
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let policies: Api<NetworkPolicy> =
@@ -801,8 +803,8 @@ impl KubernetesComputeDriver {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        if self.config.supervisor_topology == SupervisorTopology::SplitPod {
-            self.cleanup_split_pod_resources(name).await;
+        if self.config.supervisor_topology == SupervisorTopology::ProxyPod {
+            self.cleanup_proxy_pod_resources(name).await;
         }
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -1213,14 +1215,14 @@ const SIDECAR_GATEWAY_FORWARD_ADDR: &str = "127.0.0.1:18080";
 const LABEL_SANDBOX_ROLE: &str = "openshell.ai/sandbox-role";
 const SANDBOX_ROLE_AGENT: &str = "agent";
 const SANDBOX_ROLE_SUPERVISOR: &str = "supervisor";
-const SPLIT_POD_PROXY_PORT: u16 = 3128;
-const SPLIT_POD_GATEWAY_FORWARD_PORT: u16 = 18080;
-const SPLIT_POD_GATEWAY_FORWARD_ADDR: &str = "0.0.0.0:18080";
-const SPLIT_POD_NETWORK_ENFORCEMENT_MODE: &str = "split-pod-proxy";
-const SPLIT_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
-const SPLIT_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
-const SPLIT_POD_CA_KEY_FILE: &str = "openshell-ca-key.pem";
-const SPLIT_POD_SSH_SOCKET_FILE: &str = "/tmp/openshell/ssh.sock";
+const PROXY_POD_PROXY_PORT: u16 = 3128;
+const PROXY_POD_GATEWAY_FORWARD_PORT: u16 = 18080;
+const PROXY_POD_GATEWAY_FORWARD_ADDR: &str = "0.0.0.0:18080";
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
+const PROXY_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
+const PROXY_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
+const PROXY_POD_CA_KEY_FILE: &str = "openshell-ca-key.pem";
+const PROXY_POD_SSH_SOCKET_FILE: &str = "/tmp/openshell/ssh.sock";
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -1462,7 +1464,7 @@ fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
-struct SplitPodResourceNames {
+struct ProxyPodResourceNames {
     supervisor_deployment: String,
     service: String,
     proxy_ca_secret: String,
@@ -1470,8 +1472,8 @@ struct SplitPodResourceNames {
     supervisor_ingress_network_policy: String,
 }
 
-fn split_pod_resource_names(sandbox_name: &str) -> SplitPodResourceNames {
-    SplitPodResourceNames {
+fn proxy_pod_resource_names(sandbox_name: &str) -> ProxyPodResourceNames {
+    ProxyPodResourceNames {
         supervisor_deployment: dns_label_name("os-sup", sandbox_name),
         service: dns_label_name("os-svc", sandbox_name),
         proxy_ca_secret: dns_label_name("os-ca", sandbox_name),
@@ -1516,22 +1518,22 @@ fn dns_label_name(prefix: &str, name: &str) -> String {
     format!("{prefix}-{sanitized}-{suffix}")
 }
 
-fn split_pod_service_dns(service_name: &str, namespace: &str) -> String {
+fn proxy_pod_service_dns(service_name: &str, namespace: &str) -> String {
     format!("{service_name}.{namespace}.svc.cluster.local")
 }
 
-fn split_pod_process_gateway_endpoint(service_dns: &str, grpc_endpoint: &str) -> String {
+fn proxy_pod_process_gateway_endpoint(service_dns: &str, grpc_endpoint: &str) -> String {
     if grpc_endpoint.is_empty() {
         String::new()
     } else if grpc_endpoint.starts_with("https://") {
-        format!("https://{service_dns}:{SPLIT_POD_GATEWAY_FORWARD_PORT}")
+        format!("https://{service_dns}:{PROXY_POD_GATEWAY_FORWARD_PORT}")
     } else {
-        format!("http://{service_dns}:{SPLIT_POD_GATEWAY_FORWARD_PORT}")
+        format!("http://{service_dns}:{PROXY_POD_GATEWAY_FORWARD_PORT}")
     }
 }
 
-fn split_pod_proxy_url(service_dns: &str) -> String {
-    format!("http://{service_dns}:{SPLIT_POD_PROXY_PORT}")
+fn proxy_pod_proxy_url(service_dns: &str) -> String {
+    format!("http://{service_dns}:{PROXY_POD_PROXY_PORT}")
 }
 
 fn apply_host_gateway_aliases(
@@ -1648,7 +1650,7 @@ fn supervisor_sidecar_container(
         ],
         "env": supervisor_sidecar_env(template_environment, spec_environment, params),
         "securityContext": {
-            "runAsUser": params.sidecar_proxy_uid,
+            "runAsUser": params.proxy_uid,
             "runAsGroup": params.sandbox_gid,
             "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
@@ -1692,9 +1694,9 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
         "command": [
             SUPERVISOR_IMAGE_BINARY_PATH,
             "--mode=network-init",
-            "--sidecar-proxy-uid",
-            params.sidecar_proxy_uid.to_string(),
-            "--sidecar-proxy-gid",
+            "--proxy-uid",
+            params.proxy_uid.to_string(),
+            "--proxy-gid",
             params.sandbox_gid.to_string(),
             "--sidecar-state-dir",
             SIDECAR_STATE_MOUNT_PATH,
@@ -1909,22 +1911,22 @@ fn apply_supervisor_sidecar_topology(
     ));
 }
 
-fn split_pod_ca_source_volume_mount() -> serde_json::Value {
+fn proxy_pod_ca_source_volume_mount() -> serde_json::Value {
     serde_json::json!({
-        "name": "openshell-split-proxy-ca-source",
-        "mountPath": SPLIT_POD_CA_SECRET_MOUNT_PATH,
+        "name": "openshell-proxy-pod-ca-source",
+        "mountPath": PROXY_POD_CA_SECRET_MOUNT_PATH,
         "readOnly": true
     })
 }
 
-fn split_pod_ca_tls_volume_mount() -> serde_json::Value {
+fn proxy_pod_ca_tls_volume_mount() -> serde_json::Value {
     serde_json::json!({
-        "name": "openshell-split-proxy-tls",
+        "name": "openshell-proxy-pod-tls",
         "mountPath": SIDECAR_TLS_MOUNT_PATH,
     })
 }
 
-fn split_pod_ca_init_container(
+fn proxy_pod_ca_init_container(
     image: &str,
     image_pull_policy: &str,
     sandbox_gid: u32,
@@ -1932,7 +1934,7 @@ fn split_pod_ca_init_container(
     let copy_cmd = format!(
         "set -eu; \
          mkdir -p {SIDECAR_TLS_MOUNT_PATH}; \
-         cp {SPLIT_POD_CA_SECRET_MOUNT_PATH}/{SPLIT_POD_CA_CERT_FILE} {SIDECAR_TLS_MOUNT_PATH}/{SPLIT_POD_CA_CERT_FILE}; \
+         cp {PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE} {SIDECAR_TLS_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}; \
          bundle={SIDECAR_TLS_MOUNT_PATH}/ca-bundle.pem; \
          found=0; \
          for path in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do \
@@ -1940,7 +1942,7 @@ fn split_pod_ca_init_container(
          done; \
          if [ \"$found\" = 0 ]; then : > \"$bundle\"; fi; \
          printf '\\n' >> \"$bundle\"; \
-         cat {SPLIT_POD_CA_SECRET_MOUNT_PATH}/{SPLIT_POD_CA_CERT_FILE} >> \"$bundle\""
+         cat {PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE} >> \"$bundle\""
     );
     let mut init_spec = serde_json::json!({
         "name": "openshell-proxy-ca-install",
@@ -1955,8 +1957,8 @@ fn split_pod_ca_init_container(
             }
         },
         "volumeMounts": [
-            split_pod_ca_source_volume_mount(),
-            split_pod_ca_tls_volume_mount(),
+            proxy_pod_ca_source_volume_mount(),
+            proxy_pod_ca_tls_volume_mount(),
         ]
     });
     if !image_pull_policy.is_empty() {
@@ -1965,7 +1967,7 @@ fn split_pod_ca_init_container(
     init_spec
 }
 
-fn apply_split_pod_affinity(
+fn apply_proxy_pod_affinity(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     sandbox_id: &str,
 ) {
@@ -2000,14 +2002,14 @@ fn apply_split_pod_affinity(
     if let Some(required) = required.as_array_mut() {
         required.push(serde_json::json!({
             "labelSelector": {
-                "matchLabels": split_match_labels(sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+                "matchLabels": proxy_pod_match_labels(sandbox_id, SANDBOX_ROLE_SUPERVISOR)
             },
             "topologyKey": "kubernetes.io/hostname"
         }));
     }
 }
 
-fn apply_supervisor_split_pod_topology(
+fn apply_supervisor_proxy_pod_topology(
     pod_template: &mut serde_json::Value,
     params: &SandboxPodParams<'_>,
 ) {
@@ -2029,10 +2031,10 @@ fn apply_supervisor_split_pod_topology(
         params.supervisor_sideload_method,
     );
 
-    apply_split_pod_affinity(spec, params.sandbox_id);
+    apply_proxy_pod_affinity(spec, params.sandbox_id);
 
-    let names = split_pod_resource_names(params.sandbox_name);
-    let service_dns = split_pod_service_dns(&names.service, params.namespace);
+    let names = proxy_pod_resource_names(params.sandbox_name);
+    let service_dns = proxy_pod_service_dns(&names.service, params.namespace);
 
     let volumes = spec
         .entry("volumes")
@@ -2040,18 +2042,18 @@ fn apply_supervisor_split_pod_topology(
         .as_array_mut();
     if let Some(volumes) = volumes {
         volumes.push(serde_json::json!({
-            "name": "openshell-split-proxy-ca-source",
+            "name": "openshell-proxy-pod-ca-source",
             "secret": {
                 "secretName": names.proxy_ca_secret,
                 "defaultMode": 0o444,
                 "items": [{
-                    "key": SPLIT_POD_CA_CERT_FILE,
-                    "path": SPLIT_POD_CA_CERT_FILE,
+                    "key": PROXY_POD_CA_CERT_FILE,
+                    "path": PROXY_POD_CA_CERT_FILE,
                 }]
             }
         }));
         volumes.push(serde_json::json!({
-            "name": "openshell-split-proxy-tls",
+            "name": "openshell-proxy-pod-tls",
             "emptyDir": {}
         }));
     }
@@ -2069,7 +2071,7 @@ fn apply_supervisor_split_pod_topology(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(init_containers) = init_containers {
-        init_containers.push(split_pod_ca_init_container(
+        init_containers.push(proxy_pod_ca_init_container(
             &image,
             params.image_pull_policy,
             params.sandbox_gid,
@@ -2126,7 +2128,7 @@ fn apply_supervisor_split_pod_topology(
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
             volume_mounts.push(supervisor_volume_mount());
-            volume_mounts.push(split_pod_ca_tls_volume_mount());
+            volume_mounts.push(proxy_pod_ca_tls_volume_mount());
         }
 
         let env = container
@@ -2135,7 +2137,7 @@ fn apply_supervisor_split_pod_topology(
             .as_array_mut();
         if let Some(env) = env {
             let process_endpoint =
-                split_pod_process_gateway_endpoint(&service_dns, params.grpc_endpoint);
+                proxy_pod_process_gateway_endpoint(&service_dns, params.grpc_endpoint);
             upsert_env(
                 env,
                 openshell_core::sandbox_env::ENDPOINT,
@@ -2151,12 +2153,12 @@ fn apply_supervisor_split_pod_topology(
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-                "split-pod",
+                "proxy-pod",
             );
             upsert_env(
                 env,
                 openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
-                SPLIT_POD_NETWORK_ENFORCEMENT_MODE,
+                PROXY_POD_NETWORK_ENFORCEMENT_MODE,
             );
             upsert_env(
                 env,
@@ -2166,17 +2168,17 @@ fn apply_supervisor_split_pod_topology(
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                SPLIT_POD_SSH_SOCKET_FILE,
+                PROXY_POD_SSH_SOCKET_FILE,
             );
             upsert_env(
                 env,
                 openshell_core::sandbox_env::PROXY_URL,
-                &split_pod_proxy_url(&service_dns),
+                &proxy_pod_proxy_url(&service_dns),
             );
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SUPERVISOR_READY_ADDR,
-                &format!("{service_dns}:{SPLIT_POD_PROXY_PORT}"),
+                &format!("{service_dns}:{PROXY_POD_PROXY_PORT}"),
             );
             upsert_env(
                 env,
@@ -2341,7 +2343,7 @@ struct SandboxPodParams<'a> {
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
     supervisor_topology: SupervisorTopology,
-    sidecar_proxy_uid: u32,
+    proxy_uid: u32,
     namespace: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
@@ -2375,7 +2377,7 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
-            sidecar_proxy_uid: DEFAULT_SIDECAR_PROXY_UID,
+            proxy_uid: DEFAULT_PROXY_UID,
             namespace: "default",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
@@ -2397,18 +2399,16 @@ impl Default for SandboxPodParams<'_> {
     }
 }
 
-fn validate_sidecar_proxy_identity(
-    params: &SandboxPodParams<'_>,
-) -> Result<(), KubernetesDriverError> {
+fn validate_proxy_identity(params: &SandboxPodParams<'_>) -> Result<(), KubernetesDriverError> {
     if matches!(
         params.supervisor_topology,
-        SupervisorTopology::Sidecar | SupervisorTopology::SplitPod
-    ) && params.sidecar_proxy_uid == params.sandbox_uid
+        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod
+    ) && params.proxy_uid == params.sandbox_uid
     {
         let topology = params.supervisor_topology.to_string();
         return Err(KubernetesDriverError::Precondition(format!(
-            "sidecar_proxy_uid ({}) must not match sandbox_uid ({}) in {topology} topology",
-            params.sidecar_proxy_uid, params.sandbox_uid
+            "proxy_uid ({}) must not match sandbox_uid ({}) in {topology} topology",
+            params.proxy_uid, params.sandbox_uid
         )));
     }
     Ok(())
@@ -2536,8 +2536,8 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
-    let split_pod_topology = params.supervisor_topology == SupervisorTopology::SplitPod;
-    if params.provider_spiffe_enabled || split_pod_topology {
+    let proxy_pod_topology = params.supervisor_topology == SupervisorTopology::ProxyPod;
+    if params.provider_spiffe_enabled || proxy_pod_topology {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
             serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
@@ -2549,7 +2549,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
             );
         }
     }
-    if split_pod_topology {
+    if proxy_pod_topology {
         pod_labels.insert(
             LABEL_SANDBOX_ROLE.to_string(),
             serde_json::Value::String(SANDBOX_ROLE_AGENT.to_string()),
@@ -2739,7 +2739,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     if !params.client_tls_secret_name.is_empty() {
         let client_tls_default_mode = match params.supervisor_topology {
             SupervisorTopology::Combined => 0o400,
-            SupervisorTopology::Sidecar | SupervisorTopology::SplitPod => 0o440,
+            SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
         };
         volumes.push(serde_json::json!({
             "name": "openshell-client-tls",
@@ -2765,7 +2765,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // supervisor containers run with the sandbox GID and need group-read access.
     let sa_token_default_mode = match params.supervisor_topology {
         SupervisorTopology::Combined => 0o400,
-        SupervisorTopology::Sidecar | SupervisorTopology::SplitPod => 0o440,
+        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
     };
     volumes.push(serde_json::json!({
         "name": "openshell-sa-token",
@@ -2812,8 +2812,8 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
                 params,
             );
         }
-        SupervisorTopology::SplitPod => {
-            apply_supervisor_split_pod_topology(&mut result, params);
+        SupervisorTopology::ProxyPod => {
+            apply_supervisor_proxy_pod_topology(&mut result, params);
         }
     }
 
@@ -2926,7 +2926,7 @@ where
     serde_json::from_value(value).expect("driver rendered an invalid Kubernetes object")
 }
 
-fn generate_split_proxy_ca() -> Result<(String, String), KubernetesDriverError> {
+fn generate_proxy_pod_ca() -> Result<(String, String), KubernetesDriverError> {
     let ca_key = KeyPair::generate().map_err(|err| {
         KubernetesDriverError::Message(format!("failed to generate CA key: {err}"))
     })?;
@@ -2935,7 +2935,7 @@ fn generate_split_proxy_ca() -> Result<(String, String), KubernetesDriverError> 
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
         .distinguished_name
-        .push(DnType::CommonName, "OpenShell Split Pod Sandbox CA");
+        .push(DnType::CommonName, "OpenShell Proxy Pod Sandbox CA");
     params
         .distinguished_name
         .push(DnType::OrganizationName, "OpenShell");
@@ -2947,7 +2947,7 @@ fn generate_split_proxy_ca() -> Result<(String, String), KubernetesDriverError> 
     Ok((ca_cert.pem(), ca_key.serialize_pem()))
 }
 
-fn split_owner_reference(
+fn proxy_pod_owner_reference(
     sandbox_cr: &DynamicObject,
     api_version: &str,
     controller: bool,
@@ -2973,7 +2973,7 @@ fn split_owner_reference(
     }))
 }
 
-fn split_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
+fn proxy_pod_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
     let mut labels = serde_json::Map::new();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
@@ -2984,14 +2984,14 @@ fn split_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
     serde_json::Value::Object(labels)
 }
 
-fn split_match_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
+fn proxy_pod_match_labels(sandbox_id: &str, role: &str) -> serde_json::Value {
     let mut labels = serde_json::Map::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), serde_json::json!(sandbox_id));
     labels.insert(LABEL_SANDBOX_ROLE.to_string(), serde_json::json!(role));
     serde_json::Value::Object(labels)
 }
 
-fn split_pod_object_meta(
+fn proxy_pod_object_meta(
     name: &str,
     namespace: &str,
     sandbox_id: &str,
@@ -3001,7 +3001,7 @@ fn split_pod_object_meta(
     serde_json::json!({
         "name": name,
         "namespace": namespace,
-        "labels": split_labels(sandbox_id, role),
+        "labels": proxy_pod_labels(sandbox_id, role),
         "annotations": {
             "openshell.io/sandbox-id": sandbox_id
         },
@@ -3009,7 +3009,7 @@ fn split_pod_object_meta(
     })
 }
 
-fn split_supervisor_env(
+fn proxy_pod_supervisor_env(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
@@ -3045,12 +3045,12 @@ fn split_supervisor_env(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-        "split-pod",
+        "proxy-pod",
     );
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
-        SPLIT_POD_NETWORK_ENFORCEMENT_MODE,
+        PROXY_POD_NETWORK_ENFORCEMENT_MODE,
     );
     upsert_env(
         &mut env,
@@ -3060,12 +3060,12 @@ fn split_supervisor_env(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR,
-        SPLIT_POD_GATEWAY_FORWARD_ADDR,
+        PROXY_POD_GATEWAY_FORWARD_ADDR,
     );
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::PROXY_BIND_ADDR,
-        &format!("0.0.0.0:{SPLIT_POD_PROXY_PORT}"),
+        &format!("0.0.0.0:{PROXY_POD_PROXY_PORT}"),
     );
     upsert_env(
         &mut env,
@@ -3075,12 +3075,12 @@ fn split_supervisor_env(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::PROXY_CA_CERT_PATH,
-        &format!("{SPLIT_POD_CA_SECRET_MOUNT_PATH}/{SPLIT_POD_CA_CERT_FILE}"),
+        &format!("{PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}"),
     );
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::PROXY_CA_KEY_PATH,
-        &format!("{SPLIT_POD_CA_SECRET_MOUNT_PATH}/{SPLIT_POD_CA_KEY_FILE}"),
+        &format!("{PROXY_POD_CA_SECRET_MOUNT_PATH}/{PROXY_POD_CA_KEY_FILE}"),
     );
     upsert_env(
         &mut env,
@@ -3095,8 +3095,8 @@ fn split_supervisor_env(
     env
 }
 
-fn split_proxy_ca_secret(
-    names: &SplitPodResourceNames,
+fn proxy_pod_ca_secret(
+    names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
     cert_pem: &str,
@@ -3104,11 +3104,11 @@ fn split_proxy_ca_secret(
 ) -> Secret {
     let mut string_data = serde_json::Map::new();
     string_data.insert(
-        SPLIT_POD_CA_CERT_FILE.to_string(),
+        PROXY_POD_CA_CERT_FILE.to_string(),
         serde_json::json!(cert_pem),
     );
     string_data.insert(
-        SPLIT_POD_CA_KEY_FILE.to_string(),
+        PROXY_POD_CA_KEY_FILE.to_string(),
         serde_json::json!(key_pem),
     );
     k8s_object(serde_json::json!({
@@ -3117,7 +3117,7 @@ fn split_proxy_ca_secret(
         "metadata": {
             "name": names.proxy_ca_secret,
             "namespace": params.namespace,
-            "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
             "ownerReferences": [owner_ref],
         },
         "type": "Opaque",
@@ -3125,8 +3125,8 @@ fn split_proxy_ca_secret(
     }))
 }
 
-fn split_supervisor_service(
-    names: &SplitPodResourceNames,
+fn proxy_pod_supervisor_service(
+    names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
 ) -> Service {
@@ -3136,24 +3136,24 @@ fn split_supervisor_service(
         "metadata": {
             "name": names.service,
             "namespace": params.namespace,
-            "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
             "ownerReferences": [owner_ref],
         },
         "spec": {
             "clusterIP": "None",
             "publishNotReadyAddresses": true,
-            "selector": split_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "selector": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
             "ports": [
                 {
                     "name": "http-proxy",
-                    "port": SPLIT_POD_PROXY_PORT,
-                    "targetPort": SPLIT_POD_PROXY_PORT,
+                    "port": PROXY_POD_PROXY_PORT,
+                    "targetPort": PROXY_POD_PROXY_PORT,
                     "protocol": "TCP"
                 },
                 {
                     "name": "gateway-forward",
-                    "port": SPLIT_POD_GATEWAY_FORWARD_PORT,
-                    "targetPort": SPLIT_POD_GATEWAY_FORWARD_PORT,
+                    "port": PROXY_POD_GATEWAY_FORWARD_PORT,
+                    "targetPort": PROXY_POD_GATEWAY_FORWARD_PORT,
                     "protocol": "TCP"
                 }
             ]
@@ -3161,8 +3161,8 @@ fn split_supervisor_service(
     }))
 }
 
-fn split_supervisor_deployment(
-    names: &SplitPodResourceNames,
+fn proxy_pod_supervisor_deployment(
+    names: &ProxyPodResourceNames,
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
@@ -3175,18 +3175,18 @@ fn split_supervisor_deployment(
             SUPERVISOR_IMAGE_BINARY_PATH,
             "--mode=network",
         ],
-        "env": split_supervisor_env(template_environment, spec_environment, params),
+        "env": proxy_pod_supervisor_env(template_environment, spec_environment, params),
         "ports": [
-            {"name": "http-proxy", "containerPort": SPLIT_POD_PROXY_PORT, "protocol": "TCP"},
-            {"name": "gateway-fwd", "containerPort": SPLIT_POD_GATEWAY_FORWARD_PORT, "protocol": "TCP"}
+            {"name": "http-proxy", "containerPort": PROXY_POD_PROXY_PORT, "protocol": "TCP"},
+            {"name": "gateway-fwd", "containerPort": PROXY_POD_GATEWAY_FORWARD_PORT, "protocol": "TCP"}
         ],
         "readinessProbe": {
-            "tcpSocket": {"port": SPLIT_POD_PROXY_PORT},
+            "tcpSocket": {"port": PROXY_POD_PROXY_PORT},
             "periodSeconds": 2,
             "failureThreshold": 30
         },
         "securityContext": {
-            "runAsUser": params.sidecar_proxy_uid,
+            "runAsUser": params.proxy_uid,
             "runAsGroup": params.sandbox_gid,
             "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
@@ -3201,11 +3201,11 @@ fn split_supervisor_deployment(
                 "readOnly": true
             },
             {
-                "name": "openshell-split-proxy-ca-source",
-                "mountPath": SPLIT_POD_CA_SECRET_MOUNT_PATH,
+                "name": "openshell-proxy-pod-ca-source",
+                "mountPath": PROXY_POD_CA_SECRET_MOUNT_PATH,
                 "readOnly": true
             },
-            split_pod_ca_tls_volume_mount(),
+            proxy_pod_ca_tls_volume_mount(),
         ]
     });
     if !params.supervisor_image_pull_policy.is_empty() {
@@ -3257,14 +3257,14 @@ fn split_supervisor_deployment(
                 }
             },
             {
-                "name": "openshell-split-proxy-ca-source",
+                "name": "openshell-proxy-pod-ca-source",
                 "secret": {
                     "secretName": names.proxy_ca_secret,
                     "defaultMode": 0o440
                 }
             },
             {
-                "name": "openshell-split-proxy-tls",
+                "name": "openshell-proxy-pod-tls",
                 "emptyDir": {}
             }
         ]
@@ -3307,7 +3307,7 @@ fn split_supervisor_deployment(
     k8s_object(serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": split_pod_object_meta(
+        "metadata": proxy_pod_object_meta(
             &names.supervisor_deployment,
             params.namespace,
             params.sandbox_id,
@@ -3317,11 +3317,11 @@ fn split_supervisor_deployment(
         "spec": {
             "replicas": 1,
             "selector": {
-                "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
             },
             "template": {
                 "metadata": {
-                    "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+                    "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
                     "annotations": {
                         "openshell.io/sandbox-id": params.sandbox_id
                     }
@@ -3332,8 +3332,8 @@ fn split_supervisor_deployment(
     }))
 }
 
-fn split_agent_egress_network_policy(
-    names: &SplitPodResourceNames,
+fn proxy_pod_agent_egress_network_policy(
+    names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
 ) -> NetworkPolicy {
@@ -3343,24 +3343,24 @@ fn split_agent_egress_network_policy(
         "metadata": {
             "name": names.agent_egress_network_policy,
             "namespace": params.namespace,
-            "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_AGENT),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_AGENT),
             "ownerReferences": [owner_ref],
         },
         "spec": {
             "podSelector": {
-                "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
             },
             "policyTypes": ["Egress"],
             "egress": [
                 {
                     "to": [{
                         "podSelector": {
-                            "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+                            "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
                         }
                     }],
                     "ports": [
-                        {"protocol": "TCP", "port": SPLIT_POD_PROXY_PORT},
-                        {"protocol": "TCP", "port": SPLIT_POD_GATEWAY_FORWARD_PORT}
+                        {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT},
+                        {"protocol": "TCP", "port": PROXY_POD_GATEWAY_FORWARD_PORT}
                     ]
                 },
                 {
@@ -3388,8 +3388,8 @@ fn split_agent_egress_network_policy(
     }))
 }
 
-fn split_supervisor_ingress_network_policy(
-    names: &SplitPodResourceNames,
+fn proxy_pod_supervisor_ingress_network_policy(
+    names: &ProxyPodResourceNames,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
 ) -> NetworkPolicy {
@@ -3399,23 +3399,23 @@ fn split_supervisor_ingress_network_policy(
         "metadata": {
             "name": names.supervisor_ingress_network_policy,
             "namespace": params.namespace,
-            "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+            "labels": proxy_pod_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
             "ownerReferences": [owner_ref],
         },
         "spec": {
             "podSelector": {
-                "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+                "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
             },
             "policyTypes": ["Ingress"],
             "ingress": [{
                 "from": [{
                     "podSelector": {
-                        "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
+                        "matchLabels": proxy_pod_match_labels(params.sandbox_id, SANDBOX_ROLE_AGENT)
                     }
                 }],
                 "ports": [
-                    {"protocol": "TCP", "port": SPLIT_POD_PROXY_PORT},
-                    {"protocol": "TCP", "port": SPLIT_POD_GATEWAY_FORWARD_PORT}
+                    {"protocol": "TCP", "port": PROXY_POD_PROXY_PORT},
+                    {"protocol": "TCP", "port": PROXY_POD_GATEWAY_FORWARD_PORT}
                 ]
             }]
         }
@@ -4168,7 +4168,7 @@ mod tests {
             supervisor_image_pull_policy: "IfNotPresent",
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
             client_tls_secret_name: "openshell-client-tls",
-            sidecar_proxy_uid: 2200,
+            proxy_uid: 2200,
             namespace: "default",
             sandbox_uid: 1500,
             sandbox_gid: 1500,
@@ -4323,9 +4323,9 @@ mod tests {
             serde_json::json!([
                 SUPERVISOR_IMAGE_BINARY_PATH,
                 "--mode=network-init",
-                "--sidecar-proxy-uid",
+                "--proxy-uid",
                 "2200",
-                "--sidecar-proxy-gid",
+                "--proxy-gid",
                 "1500",
                 "--sidecar-state-dir",
                 SIDECAR_STATE_MOUNT_PATH,
@@ -4401,28 +4401,28 @@ mod tests {
     fn sidecar_topology_rejects_proxy_uid_matching_sandbox_uid() {
         let params = SandboxPodParams {
             supervisor_topology: SupervisorTopology::Sidecar,
-            sidecar_proxy_uid: 1500,
+            proxy_uid: 1500,
             namespace: "default",
             sandbox_uid: 1500,
             ..SandboxPodParams::default()
         };
 
-        let err = validate_sidecar_proxy_identity(&params).unwrap_err();
+        let err = validate_proxy_identity(&params).unwrap_err();
         assert!(matches!(err, KubernetesDriverError::Precondition(_)));
-        assert!(err.to_string().contains("sidecar_proxy_uid"));
+        assert!(err.to_string().contains("proxy_uid"));
     }
 
     #[test]
-    fn split_pod_topology_renders_process_agent_with_proxy_service() {
+    fn proxy_pod_topology_renders_process_agent_with_proxy_service() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::SplitPod,
+            supervisor_topology: SupervisorTopology::ProxyPod,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             supervisor_image: "supervisor-image:latest",
             namespace: "agents",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
             grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
-            sidecar_proxy_uid: 2200,
+            proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1500,
             host_gateway_ip: "172.17.0.1",
@@ -4439,8 +4439,8 @@ mod tests {
             &params,
         );
 
-        let names = split_pod_resource_names("example-sandbox");
-        let service_dns = split_pod_service_dns(&names.service, "agents");
+        let names = proxy_pod_resource_names("example-sandbox");
+        let service_dns = proxy_pod_service_dns(&names.service, "agents");
         let agent = &pod_template["spec"]["containers"][0];
 
         assert_eq!(
@@ -4472,7 +4472,7 @@ mod tests {
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
-            Some(SPLIT_POD_NETWORK_ENFORCEMENT_MODE)
+            Some(PROXY_POD_NETWORK_ENFORCEMENT_MODE)
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
@@ -4480,18 +4480,18 @@ mod tests {
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
-            Some(SPLIT_POD_SSH_SOCKET_FILE)
+            Some(PROXY_POD_SSH_SOCKET_FILE)
         );
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 1);
         let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
         assert!(volumes.iter().any(|volume| {
-            volume["name"] == "openshell-split-proxy-ca-source"
+            volume["name"] == "openshell-proxy-pod-ca-source"
                 && volume["secret"]["secretName"] == names.proxy_ca_secret
         }));
         assert!(volumes.iter().any(|volume| {
-            volume["name"] == "openshell-split-proxy-tls" && volume["emptyDir"].is_object()
+            volume["name"] == "openshell-proxy-pod-tls" && volume["emptyDir"].is_object()
         }));
 
         let affinity = &pod_template["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
@@ -4504,22 +4504,22 @@ mod tests {
     }
 
     #[test]
-    fn split_pod_companion_resources_bind_one_agent_to_one_supervisor() {
+    fn proxy_pod_companion_resources_bind_one_agent_to_one_supervisor() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::SplitPod,
+            supervisor_topology: SupervisorTopology::ProxyPod,
             supervisor_image: "supervisor-image:latest",
             namespace: "agents",
             service_account_name: "openshell-sandbox",
             sandbox_id: "sandbox-123",
             sandbox_name: "example-sandbox",
             grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
-            sidecar_proxy_uid: 2200,
+            proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1500,
             host_gateway_ip: "172.17.0.1",
             ..SandboxPodParams::default()
         };
-        let names = split_pod_resource_names(params.sandbox_name);
+        let names = proxy_pod_resource_names(params.sandbox_name);
         let owner_ref = serde_json::json!({
             "apiVersion": "agents.x-k8s.io/v1beta1",
             "kind": "Sandbox",
@@ -4529,7 +4529,7 @@ mod tests {
             "blockOwnerDeletion": false
         });
 
-        let supervisor = serde_json::to_value(split_supervisor_deployment(
+        let supervisor = serde_json::to_value(proxy_pod_supervisor_deployment(
             &names,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
@@ -4574,10 +4574,10 @@ mod tests {
         );
         assert_eq!(
             rendered_env(container, openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR),
-            Some(SPLIT_POD_GATEWAY_FORWARD_ADDR)
+            Some(PROXY_POD_GATEWAY_FORWARD_ADDR)
         );
 
-        let agent_egress = serde_json::to_value(split_agent_egress_network_policy(
+        let agent_egress = serde_json::to_value(proxy_pod_agent_egress_network_policy(
             &names,
             &params,
             owner_ref.clone(),
@@ -4597,7 +4597,7 @@ mod tests {
             SANDBOX_ROLE_SUPERVISOR
         );
 
-        let supervisor_ingress = serde_json::to_value(split_supervisor_ingress_network_policy(
+        let supervisor_ingress = serde_json::to_value(proxy_pod_supervisor_ingress_network_policy(
             &names, &params, owner_ref,
         ))
         .unwrap();
@@ -4613,18 +4613,18 @@ mod tests {
     }
 
     #[test]
-    fn split_pod_topology_rejects_proxy_uid_matching_sandbox_uid() {
+    fn proxy_pod_topology_rejects_proxy_uid_matching_sandbox_uid() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::SplitPod,
-            sidecar_proxy_uid: 1500,
+            supervisor_topology: SupervisorTopology::ProxyPod,
+            proxy_uid: 1500,
             namespace: "default",
             sandbox_uid: 1500,
             ..SandboxPodParams::default()
         };
 
-        let err = validate_sidecar_proxy_identity(&params).unwrap_err();
+        let err = validate_proxy_identity(&params).unwrap_err();
         assert!(matches!(err, KubernetesDriverError::Precondition(_)));
-        assert!(err.to_string().contains("split-pod"));
+        assert!(err.to_string().contains("proxy-pod"));
     }
 
     /// Regression test: TLS mount path must match env var paths.

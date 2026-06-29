@@ -72,7 +72,7 @@ pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 
 /// Explicit URL injected into sandbox child processes for proxy-mode egress.
 ///
-/// Kubernetes split-pod topology uses a headless Service DNS name, which
+/// Kubernetes proxy-pod topology uses a headless Service DNS name, which
 /// cannot be represented by the policy's `SocketAddr` proxy field.
 pub const PROXY_URL: &str = "OPENSHELL_PROXY_URL";
 

@@ -74,7 +74,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
-const SPLIT_POD_NETWORK_ENFORCEMENT_MODE: &str = "split-pod-proxy";
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
@@ -600,7 +600,7 @@ fn external_network_enforcement_enabled() -> bool {
     std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE).is_ok_and(|value| {
         matches!(
             value.as_str(),
-            SIDECAR_NETWORK_ENFORCEMENT_MODE | SPLIT_POD_NETWORK_ENFORCEMENT_MODE
+            SIDECAR_NETWORK_ENFORCEMENT_MODE | PROXY_POD_NETWORK_ENFORCEMENT_MODE
         )
     })
 }

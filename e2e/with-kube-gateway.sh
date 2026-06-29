@@ -20,9 +20,9 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
-# Split-pod topology:
-#   Use OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-split-pod.yaml
-#   or `mise run e2e:kubernetes:split-pod`. The target cluster must enforce
+# Proxy-pod topology:
+#   Use OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-proxy-pod.yaml
+#   or `mise run e2e:kubernetes:proxy-pod`. The target cluster must enforce
 #   Kubernetes NetworkPolicies; the ephemeral k3d/k3s path keeps k3s's embedded
 #   network policy controller enabled.
 #
@@ -86,7 +86,7 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
-SPLIT_POD_E2E=0
+PROXY_POD_E2E=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -618,8 +618,8 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
     [ -n "${values_file}" ] || continue
-    if [[ "${values_file}" == *"values-split-pod.yaml" ]]; then
-      SPLIT_POD_E2E=1
+    if [[ "${values_file}" == *"values-proxy-pod.yaml" ]]; then
+      PROXY_POD_E2E=1
     fi
     if [[ "${values_file}" != /* ]]; then
       values_file="${ROOT}/${values_file}"
@@ -628,8 +628,8 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   done
 fi
 
-if [ "${SPLIT_POD_E2E}" = "1" ]; then
-  echo "Split-pod e2e profile enabled; target cluster must enforce Kubernetes NetworkPolicies."
+if [ "${PROXY_POD_E2E}" = "1" ]; then
+  echo "Proxy-pod e2e profile enabled; target cluster must enforce Kubernetes NetworkPolicies."
   echo "Ephemeral k3d/k3s mode uses k3s's embedded NetworkPolicy controller unless the cluster is customized externally."
 fi
 

@@ -70,7 +70,7 @@ tests:
             verbs:
               - get
 
-  - it: grants sandbox RBAC for split-pod supervisor Deployments
+  - it: grants sandbox RBAC for proxy-pod supervisor Deployments
     template: templates/role.yaml
     asserts:
       - contains:
@@ -87,7 +87,7 @@ tests:
               - list
               - watch
 
-  - it: grants ReplicaSet get for split-pod supervisor token bootstrap
+  - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
     template: templates/role.yaml
     asserts:
       - contains:
