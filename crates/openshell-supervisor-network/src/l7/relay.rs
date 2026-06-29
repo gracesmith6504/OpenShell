@@ -454,35 +454,41 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            let req =
-                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
-                    .await?
-                {
-                    MiddlewareApplyResult::Allowed(req) => req,
-                    MiddlewareApplyResult::Denied(reason) => {
-                        crate::l7::rest::RestProvider::default()
-                            .deny_with_redacted_target(
-                                &crate::l7::provider::L7Request {
-                                    action: request_info.action.clone(),
-                                    target: redacted_target.clone(),
-                                    query_params: request_info.query_params.clone(),
-                                    raw_header: Vec::new(),
-                                    body_length: crate::l7::provider::BodyLength::None,
-                                },
-                                &ctx.policy_name,
-                                &reason,
-                                client,
-                                Some(&redacted_target),
-                                Some(crate::l7::rest::DenyResponseContext {
-                                    host: Some(&ctx.host),
-                                    port: Some(ctx.port),
-                                    binary: Some(&ctx.binary_path),
-                                }),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                };
+            let req = match apply_middleware_chain(
+                req,
+                client,
+                ctx,
+                chain,
+                engine.middleware_runner(),
+                engine.generation_guard(),
+            )
+            .await?
+            {
+                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Denied(reason) => {
+                    crate::l7::rest::RestProvider::default()
+                        .deny_with_redacted_target(
+                            &crate::l7::provider::L7Request {
+                                action: request_info.action.clone(),
+                                target: redacted_target.clone(),
+                                query_params: request_info.query_params.clone(),
+                                raw_header: Vec::new(),
+                                body_length: crate::l7::provider::BodyLength::None,
+                            },
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -786,9 +792,11 @@ pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + S
     client: &mut C,
     ctx: &L7EvalContext,
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
 ) -> Result<MiddlewareApplyResult> {
-    apply_middleware_chain_for_scheme(req, client, ctx, "https", chain, generation_guard).await
+    apply_middleware_chain_for_scheme(req, client, ctx, "https", chain, runner, generation_guard)
+        .await
 }
 
 pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -797,12 +805,12 @@ pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite 
     ctx: &L7EvalContext,
     scheme: &str,
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
-    let runner = openshell_supervisor_middleware::ChainRunner::default();
     let chain = runner.describe_chain(&chain).await?;
     let max_body_bytes =
         middleware_chain_body_limit(&chain).expect("non-empty middleware chain has a body limit");
@@ -1221,35 +1229,41 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            let req =
-                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
-                    .await?
-                {
-                    MiddlewareApplyResult::Allowed(req) => req,
-                    MiddlewareApplyResult::Denied(reason) => {
-                        provider
-                            .deny_with_redacted_target(
-                                &crate::l7::provider::L7Request {
-                                    action: request_info.action.clone(),
-                                    target: redacted_target.clone(),
-                                    query_params: request_info.query_params.clone(),
-                                    raw_header: Vec::new(),
-                                    body_length: crate::l7::provider::BodyLength::None,
-                                },
-                                &ctx.policy_name,
-                                &reason,
-                                client,
-                                Some(&redacted_target),
-                                Some(crate::l7::rest::DenyResponseContext {
-                                    host: Some(&ctx.host),
-                                    port: Some(ctx.port),
-                                    binary: Some(&ctx.binary_path),
-                                }),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                };
+            let req = match apply_middleware_chain(
+                req,
+                client,
+                ctx,
+                chain,
+                engine.middleware_runner(),
+                engine.generation_guard(),
+            )
+            .await?
+            {
+                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Denied(reason) => {
+                    provider
+                        .deny_with_redacted_target(
+                            &crate::l7::provider::L7Request {
+                                action: request_info.action.clone(),
+                                target: redacted_target.clone(),
+                                query_params: request_info.query_params.clone(),
+                                raw_header: Vec::new(),
+                                body_length: crate::l7::provider::BodyLength::None,
+                            },
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
             let req_with_auth =
                 match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
                     Ok(req) => req,
@@ -1490,35 +1504,41 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            let req =
-                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
-                    .await?
-                {
-                    MiddlewareApplyResult::Allowed(req) => req,
-                    MiddlewareApplyResult::Denied(reason) => {
-                        crate::l7::rest::RestProvider::default()
-                            .deny_with_redacted_target(
-                                &crate::l7::provider::L7Request {
-                                    action: request_info.action.clone(),
-                                    target: redacted_target.clone(),
-                                    query_params: request_info.query_params.clone(),
-                                    raw_header: Vec::new(),
-                                    body_length: crate::l7::provider::BodyLength::None,
-                                },
-                                &ctx.policy_name,
-                                &reason,
-                                client,
-                                Some(&redacted_target),
-                                Some(crate::l7::rest::DenyResponseContext {
-                                    host: Some(&ctx.host),
-                                    port: Some(ctx.port),
-                                    binary: Some(&ctx.binary_path),
-                                }),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                };
+            let req = match apply_middleware_chain(
+                req,
+                client,
+                ctx,
+                chain,
+                engine.middleware_runner(),
+                engine.generation_guard(),
+            )
+            .await?
+            {
+                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Denied(reason) => {
+                    crate::l7::rest::RestProvider::default()
+                        .deny_with_redacted_target(
+                            &crate::l7::provider::L7Request {
+                                action: request_info.action.clone(),
+                                target: redacted_target.clone(),
+                                query_params: request_info.query_params.clone(),
+                                raw_header: Vec::new(),
+                                body_length: crate::l7::provider::BodyLength::None,
+                            },
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
             // Future MCP response/SSE introspection or rewrite would hook here
             // before returning upstream bytes. The current policy schema has no
             // trusted-annotations or version-profile field, so MCP responses and
@@ -1714,35 +1734,41 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
-            let req =
-                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
-                    .await?
-                {
-                    MiddlewareApplyResult::Allowed(req) => req,
-                    MiddlewareApplyResult::Denied(reason) => {
-                        crate::l7::rest::RestProvider::default()
-                            .deny_with_redacted_target(
-                                &crate::l7::provider::L7Request {
-                                    action: request_info.action.clone(),
-                                    target: redacted_target.clone(),
-                                    query_params: request_info.query_params.clone(),
-                                    raw_header: Vec::new(),
-                                    body_length: crate::l7::provider::BodyLength::None,
-                                },
-                                &ctx.policy_name,
-                                &reason,
-                                client,
-                                Some(&redacted_target),
-                                Some(crate::l7::rest::DenyResponseContext {
-                                    host: Some(&ctx.host),
-                                    port: Some(ctx.port),
-                                    binary: Some(&ctx.binary_path),
-                                }),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                };
+            let req = match apply_middleware_chain(
+                req,
+                client,
+                ctx,
+                chain,
+                engine.middleware_runner(),
+                engine.generation_guard(),
+            )
+            .await?
+            {
+                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Denied(reason) => {
+                    crate::l7::rest::RestProvider::default()
+                        .deny_with_redacted_target(
+                            &crate::l7::provider::L7Request {
+                                action: request_info.action.clone(),
+                                target: redacted_target.clone(),
+                                query_params: request_info.query_params.clone(),
+                                raw_header: Vec::new(),
+                                body_length: crate::l7::provider::BodyLength::None,
+                            },
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
@@ -2170,7 +2196,9 @@ where
             if generation != generation_guard.captured_generation() {
                 return Ok(());
             }
-            match apply_middleware_chain(req, client, ctx, chain, generation_guard).await? {
+            let runner = engine.middleware_runner()?;
+            match apply_middleware_chain(req, client, ctx, chain, &runner, generation_guard).await?
+            {
                 MiddlewareApplyResult::Allowed(req) => req,
                 MiddlewareApplyResult::Denied(reason) => {
                     crate::l7::rest::RestProvider::default()

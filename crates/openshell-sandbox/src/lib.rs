@@ -1409,12 +1409,12 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_retry("Policy fetch", || {
-            openshell_core::grpc_client::fetch_policy(endpoint, id)
+        let mut sandbox_config = grpc_retry("Policy fetch", || {
+            openshell_core::grpc_client::fetch_sandbox_config(endpoint, id)
         })
         .await?;
 
-        let mut proto_policy = if let Some(p) = proto_policy {
+        let mut proto_policy = if let Some(p) = sandbox_config.policy.take() {
             p
         } else {
             // No policy configured on the server. Discover from disk or
@@ -1442,7 +1442,7 @@ async fn load_policy(
 
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
-            grpc_retry("Policy discovery sync", || {
+            let synced = grpc_retry("Policy discovery sync", || {
                 openshell_core::grpc_client::discover_and_sync_policy(
                     endpoint,
                     id,
@@ -1450,7 +1450,12 @@ async fn load_policy(
                     &discovered,
                 )
             })
-            .await?
+            .await?;
+            sandbox_config = grpc_retry("Policy refetch after discovery", || {
+                openshell_core::grpc_client::fetch_sandbox_config(endpoint, id)
+            })
+            .await?;
+            sandbox_config.policy.take().unwrap_or(synced)
         };
 
         // Ensure baseline filesystem paths are present for proxy-mode
@@ -1476,7 +1481,14 @@ async fn load_policy(
         // container hasn't started yet. After the entrypoint spawns, the
         // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
-        let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
+        let engine = OpaEngine::from_proto(&proto_policy)?;
+        let middleware_registry =
+            openshell_supervisor_middleware::MiddlewareRegistry::connect_external(
+                sandbox_config.external_middleware,
+            )
+            .await?;
+        engine.replace_middleware_registry(middleware_registry)?;
+        let opa_engine = Some(Arc::new(engine));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
         return Ok((policy, opa_engine, Some(proto_policy)));
@@ -1626,6 +1638,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
+    let mut current_external_middleware = Vec::new();
     let mut current_settings: std::collections::HashMap<
         String,
         openshell_core::proto::EffectiveSetting,
@@ -1637,6 +1650,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
+            current_external_middleware = result.external_middleware;
             current_settings = result.settings;
             debug!(
                 config_revision = current_config_revision,
@@ -1666,6 +1680,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         let policy_changed = result.policy_hash != current_policy_hash;
+        let middleware_changed = result.external_middleware != current_external_middleware;
 
         // Log which settings changed.
         log_setting_changes(&current_settings, &result.settings);
@@ -1720,6 +1735,47 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         provider_env_revision = result.provider_env_revision,
                         "Settings poll: failed to refresh provider environment"
                     );
+                }
+            }
+        }
+
+        if middleware_changed {
+            match openshell_supervisor_middleware::MiddlewareRegistry::connect_external(
+                result.external_middleware.clone(),
+            )
+            .await
+            .and_then(|registry| ctx.opa_engine.replace_middleware_registry(registry))
+            {
+                Ok(()) => {
+                    current_external_middleware = result.external_middleware.clone();
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "external_middleware_count",
+                                serde_json::json!(current_external_middleware.len())
+                            )
+                            .message(format!(
+                                "External middleware registry reloaded [service_count:{}]",
+                                current_external_middleware.len()
+                            ))
+                            .build()
+                    );
+                }
+                Err(error) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "failed")
+                            .message(format!(
+                                "External middleware registry reload failed, keeping last-known-good registry [error:{error}]"
+                            ))
+                            .build()
+                    );
+                    continue;
                 }
             }
         }

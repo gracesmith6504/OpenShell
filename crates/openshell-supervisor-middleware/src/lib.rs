@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process supervisor middleware chain execution.
+//! Supervisor middleware registration and chain execution.
 
 mod builtins;
+mod remote;
 mod service;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -14,14 +15,17 @@ pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
-    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext,
+    Decision, ExternalMiddlewareService, Finding, HttpRequestEvaluation, HttpRequestTarget,
+    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    ValidateConfigRequest,
 };
 use tokio::sync::OnceCell;
 use tonic::Request;
 
 pub const API_VERSION: &str = "openshell.middleware.v1";
 pub const BUILTIN_SECRETS: &str = builtins::secrets::BINDING_ID;
+const HTTP_REQUEST_OPERATION: &str = "HttpRequest";
+const PRE_CREDENTIALS_PHASE: &str = "pre_credentials";
 
 /// Validate the configuration for an in-process middleware implementation.
 ///
@@ -82,9 +86,10 @@ impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
 /// A policy-selected middleware config joined with metadata reported by its
 /// service's `Describe` call. A missing binding is retained so `on_error` can
 /// decide whether the request fails open or closed.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DescribedChainEntry {
     entry: ChainEntry,
+    service: Option<Arc<MiddlewareServiceState>>,
     binding: Option<MiddlewareBinding>,
     max_body_bytes: usize,
 }
@@ -182,87 +187,423 @@ fn apply_on_error(
 
 #[derive(Clone)]
 pub struct ChainRunner {
-    state: Arc<MiddlewareServiceState>,
+    registry: Arc<MiddlewareRegistry>,
 }
 
 struct MiddlewareServiceState {
     service: Arc<dyn SupervisorMiddleware>,
     manifest: OnceCell<MiddlewareManifest>,
+    operator_max_body_bytes: Option<usize>,
 }
 
 static IN_PROCESS_SERVICE: LazyLock<Arc<MiddlewareServiceState>> = LazyLock::new(|| {
     Arc::new(MiddlewareServiceState {
         service: Arc::new(InProcessMiddlewareService),
         manifest: OnceCell::new(),
+        operator_max_body_bytes: None,
     })
 });
 
-impl Default for ChainRunner {
+/// Validated middleware services available to a gateway or one supervisor.
+///
+/// The registry always contains the in-process built-ins. External services
+/// are connected and described before construction succeeds, so callers never
+/// observe a partially registered service set.
+#[derive(Clone)]
+pub struct MiddlewareRegistry {
+    services: Arc<Vec<Arc<MiddlewareServiceState>>>,
+    external: Arc<Vec<RegisteredExternalService>>,
+}
+
+impl std::fmt::Debug for MiddlewareRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MiddlewareRegistry")
+            .field("service_count", &self.services.len())
+            .field("external_count", &self.external.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredExternalService {
+    registration: ExternalMiddlewareService,
+    binding_ids: Vec<String>,
+}
+
+impl Default for MiddlewareRegistry {
     fn default() -> Self {
         Self {
-            state: Arc::clone(&IN_PROCESS_SERVICE),
+            services: Arc::new(vec![Arc::clone(&IN_PROCESS_SERVICE)]),
+            external: Arc::new(Vec::new()),
         }
+    }
+}
+
+fn validate_registration(registration: &ExternalMiddlewareService) -> Result<()> {
+    if registration.name.trim().is_empty() {
+        return Err(miette!(
+            "external middleware registration name cannot be empty"
+        ));
+    }
+    if !registration.allow_insecure {
+        return Err(miette!(
+            "middleware registration '{}' must set allow_insecure = true; TLS is not supported in V1",
+            registration.name
+        ));
+    }
+    if !registration.endpoint.starts_with("http://") {
+        return Err(miette!(
+            "middleware registration '{}' endpoint must use http:// in the local-development-only V1",
+            registration.name
+        ));
+    }
+    if registration.max_body_bytes == 0 {
+        return Err(miette!(
+            "middleware registration '{}' max_body_bytes must be greater than zero",
+            registration.name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_manifest(
+    registration: &ExternalMiddlewareService,
+    manifest: &MiddlewareManifest,
+    operator_max_body_bytes: usize,
+    known_binding_ids: &mut HashSet<String>,
+) -> Result<Vec<String>> {
+    if manifest.api_version != API_VERSION {
+        return Err(miette!(
+            "middleware registration '{}' reports unsupported API version '{}'",
+            registration.name,
+            manifest.api_version
+        ));
+    }
+    if manifest.bindings.is_empty() {
+        return Err(miette!(
+            "middleware registration '{}' describes no bindings",
+            registration.name
+        ));
+    }
+
+    let mut described_ids = Vec::with_capacity(manifest.bindings.len());
+    for binding in &manifest.bindings {
+        if binding.id.trim().is_empty() {
+            return Err(miette!(
+                "middleware registration '{}' describes an empty binding id",
+                registration.name
+            ));
+        }
+        if binding.id.starts_with("openshell/") {
+            return Err(miette!(
+                "external middleware registration '{}' cannot claim reserved binding '{}'",
+                registration.name,
+                binding.id
+            ));
+        }
+        if binding.operation != HTTP_REQUEST_OPERATION || binding.phase != PRE_CREDENTIALS_PHASE {
+            return Err(miette!(
+                "middleware binding '{}' must support {HTTP_REQUEST_OPERATION}/{PRE_CREDENTIALS_PHASE}",
+                binding.id
+            ));
+        }
+        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
+            miette!(
+                "middleware binding '{}' reports a body limit too large for this platform",
+                binding.id
+            )
+        })?;
+        if advertised == 0 {
+            return Err(miette!(
+                "middleware binding '{}' must advertise a non-zero body limit",
+                binding.id
+            ));
+        }
+        if operator_max_body_bytes > advertised {
+            return Err(miette!(
+                "middleware registration '{}' max_body_bytes ({operator_max_body_bytes}) exceeds binding '{}' capability ({advertised})",
+                registration.name,
+                binding.id
+            ));
+        }
+        if !known_binding_ids.insert(binding.id.clone()) {
+            return Err(miette!(
+                "middleware binding '{}' is described by more than one service",
+                binding.id
+            ));
+        }
+        described_ids.push(binding.id.clone());
+    }
+    Ok(described_ids)
+}
+
+impl MiddlewareRegistry {
+    /// Connect and validate every external service registration.
+    pub async fn connect_external(registrations: Vec<ExternalMiddlewareService>) -> Result<Self> {
+        let mut services = vec![Arc::clone(&IN_PROCESS_SERVICE)];
+        let mut external = Vec::with_capacity(registrations.len());
+        let mut registration_names = HashSet::new();
+        let mut binding_ids = HashSet::from([BUILTIN_SECRETS.to_string()]);
+
+        for registration in registrations {
+            validate_registration(&registration)?;
+            if !registration_names.insert(registration.name.clone()) {
+                return Err(miette!(
+                    "duplicate external middleware registration name '{}'",
+                    registration.name
+                ));
+            }
+
+            let operator_max_body_bytes =
+                usize::try_from(registration.max_body_bytes).map_err(|_| {
+                    miette!(
+                        "middleware registration '{}' body limit is too large for this platform",
+                        registration.name
+                    )
+                })?;
+            let service = Arc::new(
+                remote::RemoteMiddlewareService::connect(
+                    &registration.name,
+                    &registration.endpoint,
+                )
+                .await?,
+            );
+            let manifest = service
+                .describe(Request::new(()))
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|error| {
+                    miette!(
+                        "middleware registration '{}' Describe failed: {}",
+                        registration.name,
+                        safe_reason(&error.to_string())
+                    )
+                })?;
+            let described_ids = validate_external_manifest(
+                &registration,
+                &manifest,
+                operator_max_body_bytes,
+                &mut binding_ids,
+            )?;
+            let manifest_cell = OnceCell::new();
+            manifest_cell
+                .set(manifest)
+                .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
+            services.push(Arc::new(MiddlewareServiceState {
+                service,
+                manifest: manifest_cell,
+                operator_max_body_bytes: Some(operator_max_body_bytes),
+            }));
+            external.push(RegisteredExternalService {
+                registration,
+                binding_ids: described_ids,
+            });
+        }
+
+        Ok(Self {
+            services: Arc::new(services),
+            external: Arc::new(external),
+        })
+    }
+
+    /// Validate implementation-owned configuration for every middleware entry.
+    pub async fn validate_policy_configs(&self, policy: &SandboxPolicy) -> Result<()> {
+        let runner = ChainRunner::from_registry(self.clone());
+        for config in &policy.network_middlewares {
+            runner
+                .validate_config(
+                    &config.middleware,
+                    config.config.clone().unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| {
+                    miette!(
+                        "middleware config '{}' is invalid: {}",
+                        config.name,
+                        safe_reason(&error.to_string())
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Check that every policy binding still belongs to the current static
+    /// registry without making a network call.
+    pub fn ensure_policy_bindings_registered(&self, policy: &SandboxPolicy) -> Result<()> {
+        for config in &policy.network_middlewares {
+            let registered = config.middleware == BUILTIN_SECRETS
+                || self.external.iter().any(|service| {
+                    service
+                        .binding_ids
+                        .iter()
+                        .any(|binding| binding == &config.middleware)
+                });
+            if !registered {
+                return Err(miette!(
+                    "middleware binding '{}' used by config '{}' is not registered",
+                    config.middleware,
+                    config.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return only external services referenced by the effective policy.
+    pub fn required_external_services(
+        &self,
+        policy: Option<&SandboxPolicy>,
+    ) -> Vec<ExternalMiddlewareService> {
+        let Some(policy) = policy else {
+            return Vec::new();
+        };
+        let selected: HashSet<&str> = policy
+            .network_middlewares
+            .iter()
+            .map(|config| config.middleware.as_str())
+            .collect();
+        self.external
+            .iter()
+            .filter(|service| {
+                service
+                    .binding_ids
+                    .iter()
+                    .any(|binding| selected.contains(binding.as_str()))
+            })
+            .map(|service| service.registration.clone())
+            .collect()
+    }
+}
+
+impl Default for ChainRunner {
+    fn default() -> Self {
+        Self::from_registry(MiddlewareRegistry::default())
     }
 }
 
 impl ChainRunner {
     pub fn new(service: Arc<dyn SupervisorMiddleware>) -> Self {
         Self {
-            state: Arc::new(MiddlewareServiceState {
-                service,
-                manifest: OnceCell::new(),
+            registry: Arc::new(MiddlewareRegistry {
+                services: Arc::new(vec![Arc::new(MiddlewareServiceState {
+                    service,
+                    manifest: OnceCell::new(),
+                    operator_max_body_bytes: None,
+                })]),
+                external: Arc::new(Vec::new()),
             }),
         }
     }
 
-    async fn manifest(&self) -> Result<&MiddlewareManifest> {
-        self.state
-            .manifest
-            .get_or_try_init(|| async {
-                self.state
-                    .service
-                    .describe(Request::new(()))
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| {
-                        miette!(
-                            "middleware Describe failed: {}",
-                            safe_reason(&error.to_string())
-                        )
-                    })
-            })
-            .await
+    pub fn from_registry(registry: MiddlewareRegistry) -> Self {
+        Self {
+            registry: Arc::new(registry),
+        }
+    }
+
+    async fn manifests(&self) -> Result<Vec<(Arc<MiddlewareServiceState>, MiddlewareManifest)>> {
+        let mut manifests = Vec::with_capacity(self.registry.services.len());
+        for state in self.registry.services.iter() {
+            let manifest = state
+                .manifest
+                .get_or_try_init(|| async {
+                    state
+                        .service
+                        .describe(Request::new(()))
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(|error| {
+                            miette!(
+                                "middleware Describe failed: {}",
+                                safe_reason(&error.to_string())
+                            )
+                        })
+                })
+                .await?;
+            manifests.push((Arc::clone(state), manifest.clone()));
+        }
+        Ok(manifests)
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
-        let manifest = self.manifest().await?;
+        let manifests = self.manifests().await?;
         entries
             .iter()
             .map(|entry| {
-                let binding = manifest
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.id == entry.implementation)
-                    .cloned();
+                let described = manifests.iter().find_map(|(state, manifest)| {
+                    manifest
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.id == entry.implementation)
+                        .cloned()
+                        .map(|binding| (Arc::clone(state), binding))
+                });
+                let (service, binding) = described.map_or((None, None), |(service, binding)| {
+                    (Some(service), Some(binding))
+                });
                 let max_body_bytes = binding
                     .as_ref()
                     .map(|binding| {
-                        usize::try_from(binding.max_body_bytes).map_err(|_| {
+                        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
                             miette!(
                                 "middleware binding '{}' reports a body limit too large for this platform",
                                 binding.id
                             )
-                        })
+                        })?;
+                        Ok::<_, miette::Report>(service
+                            .as_ref()
+                            .and_then(|state| state.operator_max_body_bytes)
+                            .unwrap_or(advertised))
                     })
                     .transpose()?
                     .unwrap_or(0);
                 Ok(DescribedChainEntry {
                     entry: entry.clone(),
+                    service,
                     binding,
                     max_body_bytes,
                 })
             })
             .collect()
+    }
+
+    pub async fn validate_config(
+        &self,
+        implementation: &str,
+        config: prost_types::Struct,
+    ) -> Result<()> {
+        let manifests = self.manifests().await?;
+        let Some((state, _)) = manifests.iter().find(|(_, manifest)| {
+            manifest
+                .bindings
+                .iter()
+                .any(|binding| binding.id == implementation)
+        }) else {
+            return Err(miette!(
+                "middleware binding '{implementation}' is not registered"
+            ));
+        };
+        let response = state
+            .service
+            .validate_config(Request::new(ValidateConfigRequest {
+                api_version: API_VERSION.into(),
+                binding_id: implementation.into(),
+                config: Some(config),
+            }))
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "middleware ValidateConfig failed: {}",
+                    safe_reason(&error.to_string())
+                )
+            })?;
+        if response.valid {
+            Ok(())
+        } else {
+            Err(miette!("{}", safe_reason(&response.reason)))
+        }
     }
 
     pub async fn evaluate(
@@ -320,8 +661,10 @@ impl ChainRunner {
                 }
             }
             let evaluation = build_evaluation(entry, binding, &input, &headers, &body);
-            let result = match self
-                .state
+            let Some(service) = entry.service.as_ref() else {
+                unreachable!("described binding always has a service")
+            };
+            let result = match service
                 .service
                 .evaluate_http_request(Request::new(evaluation))
                 .await
@@ -545,7 +888,10 @@ pub(crate) fn safe_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
+    use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
+        SupervisorMiddleware, SupervisorMiddlewareServer,
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
 
     fn entry(name: &str, on_error: OnError) -> ChainEntry {
         ChainEntry {
@@ -736,7 +1082,7 @@ mod tests {
 
         async fn validate_config(
             &self,
-            _request: Request<openshell_core::proto::ValidateConfigRequest>,
+            _request: Request<ValidateConfigRequest>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::ValidateConfigResponse>,
             tonic::Status,
@@ -780,6 +1126,51 @@ mod tests {
         }
     }
 
+    fn external_registration(max_body_bytes: u64) -> ExternalMiddlewareService {
+        ExternalMiddlewareService {
+            name: "local-guard-service".into(),
+            endpoint: "http://127.0.0.1:50051".into(),
+            allow_insecure: true,
+            max_body_bytes,
+        }
+    }
+
+    async fn registry_with_external(
+        service: Arc<dyn SupervisorMiddleware>,
+        registration: ExternalMiddlewareService,
+    ) -> MiddlewareRegistry {
+        let manifest = service
+            .describe(Request::new(()))
+            .await
+            .expect("describe test service")
+            .into_inner();
+        let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
+        let mut known = HashSet::from([BUILTIN_SECRETS.to_string()]);
+        let binding_ids = validate_external_manifest(
+            &registration,
+            &manifest,
+            operator_max_body_bytes,
+            &mut known,
+        )
+        .expect("valid external manifest");
+        let manifest_cell = OnceCell::new();
+        manifest_cell.set(manifest).expect("manifest cache");
+        MiddlewareRegistry {
+            services: Arc::new(vec![
+                Arc::clone(&IN_PROCESS_SERVICE),
+                Arc::new(MiddlewareServiceState {
+                    service,
+                    manifest: manifest_cell,
+                    operator_max_body_bytes: Some(operator_max_body_bytes),
+                }),
+            ]),
+            external: Arc::new(vec![RegisteredExternalService {
+                registration,
+                binding_ids,
+            }]),
+        }
+    }
+
     #[tokio::test]
     async fn descriptors_are_resolved_from_any_middleware_service() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
@@ -813,6 +1204,138 @@ mod tests {
             .await
             .expect("evaluate external middleware");
         assert!(outcome.allowed);
+    }
+
+    #[tokio::test]
+    async fn mixed_builtin_and_external_chain_uses_operator_limit() {
+        let external = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: allow_result(),
+        });
+        let registry = registry_with_external(external, external_registration(1024)).await;
+        let runner = ChainRunner::from_registry(registry);
+        let external_entry = ChainEntry {
+            name: "external".into(),
+            implementation: "example/content-guard".into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let entries = [entry("builtin", OnError::FailClosed), external_entry];
+
+        let described = runner
+            .describe_chain(&entries)
+            .await
+            .expect("describe chain");
+        assert_eq!(described[0].max_body_bytes(), 256 * 1024);
+        assert_eq!(described[1].max_body_bytes(), 1024);
+
+        let outcome = runner
+            .evaluate_described(&described, input(r#"password="top-secret""#))
+            .await
+            .expect("evaluate mixed chain");
+        assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), 2);
+        assert_eq!(
+            String::from_utf8(outcome.body).expect("utf8"),
+            r#"password="[REDACTED]""#
+        );
+    }
+
+    #[test]
+    fn external_manifest_rejects_operator_limit_above_capability() {
+        let registration = external_registration(4097);
+        let manifest = MiddlewareManifest {
+            api_version: API_VERSION.into(),
+            name: "example/service".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                id: "example/content-guard".into(),
+                operation: HTTP_REQUEST_OPERATION.into(),
+                phase: PRE_CREDENTIALS_PHASE.into(),
+                max_body_bytes: 4096,
+            }],
+        };
+        let error = validate_external_manifest(
+            &registration,
+            &manifest,
+            4097,
+            &mut HashSet::from([BUILTIN_SECRETS.to_string()]),
+        )
+        .expect_err("operator limit must fit capability");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn external_registration_requires_explicit_insecure_opt_in() {
+        let mut registration = external_registration(4096);
+        registration.allow_insecure = false;
+        let error = validate_registration(&registration).expect_err("opt-in required");
+        assert!(error.to_string().contains("allow_insecure"));
+    }
+
+    #[tokio::test]
+    async fn external_registry_invokes_remote_service_over_grpc() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test middleware");
+        let address = listener.local_addr().expect("test middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(ScriptedService {
+                binding_id: "example/content-guard".into(),
+                max_body_bytes: 4096,
+                result: allow_result(),
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let mut registration = external_registration(1024);
+        registration.endpoint = format!("http://{address}");
+        let registry = MiddlewareRegistry::connect_external(vec![registration.clone()])
+            .await
+            .expect("connect external middleware");
+        let policy = SandboxPolicy {
+            network_middlewares: vec![NetworkMiddlewareConfig {
+                name: "guard".into(),
+                middleware: "example/content-guard".into(),
+                config: Some(prost_types::Struct::default()),
+                on_error: "fail_closed".into(),
+                endpoints: None,
+            }],
+            ..Default::default()
+        };
+
+        registry
+            .validate_policy_configs(&policy)
+            .await
+            .expect("remote config validates");
+        assert_eq!(
+            registry.required_external_services(Some(&policy)),
+            vec![registration]
+        );
+
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("remote evaluation");
+        assert!(outcome.allowed);
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join test middleware")
+            .expect("serve");
     }
 
     #[tokio::test]

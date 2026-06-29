@@ -17,7 +17,10 @@ miette = { workspace = true }
 prost-types = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["channel", "server"] }
+
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

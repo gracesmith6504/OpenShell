@@ -13,11 +13,11 @@ use openshell_core::policy::{
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::L7ConfigStanza;
-use openshell_supervisor_middleware::ChainEntry;
+use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -73,6 +73,7 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
+    middleware_runner: RwLock<ChainRunner>,
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -112,6 +113,7 @@ impl PolicyGenerationGuard {
 pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
+    middleware_runner: ChainRunner,
 }
 
 impl TunnelPolicyEngine {
@@ -133,6 +135,10 @@ impl TunnelPolicyEngine {
 
     pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
         &self.engine
+    }
+
+    pub(crate) fn middleware_runner(&self) -> &ChainRunner {
+        &self.middleware_runner
     }
 
     /// Query the ordered middleware chain for a destination within this tunnel.
@@ -164,6 +170,7 @@ impl OpaEngine {
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            middleware_runner: RwLock::new(ChainRunner::default()),
         })
     }
 
@@ -182,6 +189,7 @@ impl OpaEngine {
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            middleware_runner: RwLock::new(ChainRunner::default()),
         })
     }
 
@@ -254,6 +262,7 @@ impl OpaEngine {
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            middleware_runner: RwLock::new(ChainRunner::default()),
         })
     }
 
@@ -449,6 +458,25 @@ impl OpaEngine {
     /// Current policy generation. Successful reloads increment this value.
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Replace the complete middleware service registry and invalidate
+    /// existing tunnels so subsequent requests use the new service set.
+    pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
+        let mut runner = self
+            .middleware_runner
+            .write()
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        *runner = ChainRunner::from_registry(registry);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub(crate) fn middleware_runner(&self) -> Result<ChainRunner> {
+        self.middleware_runner
+            .read()
+            .map(|runner| runner.clone())
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))
     }
 
     /// Return a guard for a previously captured policy generation.
@@ -662,6 +690,7 @@ impl OpaEngine {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
             },
+            middleware_runner: self.middleware_runner()?,
         })
     }
 }
@@ -2941,6 +2970,7 @@ network_policies:
         let engine = OpaEngine {
             engine: Mutex::new(rego),
             generation: Arc::new(AtomicU64::new(0)),
+            middleware_runner: RwLock::new(ChainRunner::default()),
         };
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",

@@ -4218,6 +4218,7 @@ async fn handle_forward_proxy(
         return Ok(());
     }
     if !chain.is_empty() {
+        let middleware_runner = opa_engine.middleware_runner()?;
         let request = crate::l7::rest::request_from_buffered_http(
             method,
             middleware_path,
@@ -4230,6 +4231,7 @@ async fn handle_forward_proxy(
             &l7_ctx,
             &scheme,
             chain,
+            &middleware_runner,
             &forward_generation_guard,
         )
         .await?
