@@ -99,20 +99,21 @@ dropping, or process/binary identity checks.
 ## Split-Pod Topology
 
 Split-pod topology moves network enforcement and gateway forwarding into a
-separate supervisor pod. The agent pod runs the process supervisor and reaches
-the supervisor through a per-sandbox headless Service.
+separate supervisor Deployment with one pod. The agent pod runs the process
+supervisor and reaches the supervisor through a per-sandbox headless Service.
 
 OpenShell creates these per-sandbox resources:
 
 - Agent pod labeled `openshell.ai/sandbox-role=agent`.
-- Supervisor pod labeled `openshell.ai/sandbox-role=supervisor`.
+- Supervisor Deployment with one pod labeled `openshell.ai/sandbox-role=supervisor`.
 - Headless Service for the supervisor pod.
 - Proxy CA Secret shared through mounts.
 - NetworkPolicy that limits agent egress to the supervisor pod and DNS.
 - NetworkPolicy that accepts supervisor ingress only from the paired agent pod.
 
-The supervisor pod has a controlling `Sandbox` ownerReference so Kubernetes
-garbage collection removes the companion resources when the sandbox is deleted.
+The supervisor Deployment has a controlling `Sandbox` ownerReference so
+Kubernetes garbage collection removes it when the sandbox is deleted. The
+Deployment recreates the supervisor pod if the pod is deleted independently.
 
 <Warning>
 Split-pod topology requires NetworkPolicy enforcement. In local k3s/k3d testing,
@@ -175,7 +176,7 @@ supervisor:
 ```
 
 The same `sidecarProxyUid` value is used as the non-root UID for the split
-supervisor pod and must not match the sandbox UID.
+supervisor pod created by the Deployment and must not match the sandbox UID.
 
 For direct gateway TOML configuration, set the equivalent Kubernetes driver
 fields:

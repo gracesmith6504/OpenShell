@@ -74,10 +74,11 @@ All Skaffold commands build the `gateway` and `supervisor` images and deploy the
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
 proxying. The split-pod profile renders network supervision in a separate
-supervisor pod and relies on Kubernetes NetworkPolicy enforcement so the agent
-pod can reach only its paired supervisor plus DNS. The default local k3s/k3d
-cluster keeps k3s's embedded NetworkPolicy controller enabled; if you replace
-the CNI, install a policy-enforcing CNI before using split-pod. The
+supervisor Deployment with one pod and relies on Kubernetes NetworkPolicy
+enforcement so the agent pod can reach only its paired supervisor plus DNS. The
+default local k3s/k3d cluster keeps k3s's embedded NetworkPolicy controller
+enabled; if you replace the CNI, install a policy-enforcing CNI before using
+split-pod. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway
 generate-certs`) generates mTLS secrets on first install. Envoy Gateway opt-in;
 see the Optional Add-ons section below.

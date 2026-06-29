@@ -181,7 +181,7 @@ supervisor_sideload_method     = "image-volume"
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway forwarding into a network sidecar.
 # "split-pod" moves network enforcement and gateway forwarding into a separate
-# supervisor pod and uses NetworkPolicy to force agent egress through it. In
+# supervisor Deployment and uses NetworkPolicy to force agent egress through it. In
 # sidecar and split-pod modes, the agent container runs non-root with no added
 # Linux capabilities and process/filesystem enforcement is network-only.
 supervisor_topology            = "combined"

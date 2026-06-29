@@ -67,11 +67,12 @@ filesystem policy, process privilege dropping, or process/binary identity
 checks. Network endpoint and L7 policy remain enforced by the network sidecar.
 
 The `split-pod` supervisor topology runs network enforcement and gateway
-forwarding in a separate supervisor pod. The agent pod runs only the
-process-mode supervisor and reaches the supervisor through a per-sandbox
-headless Service. The driver creates owner-referenced supervisor Pod, Service,
-proxy CA Secret, and NetworkPolicy resources so agent egress is limited to its
-paired supervisor pod plus DNS.
+forwarding in a separate supervisor Deployment with one pod. The agent pod runs
+only the process-mode supervisor and reaches the supervisor through a
+per-sandbox headless Service. The driver creates an owner-referenced supervisor
+Deployment with one replica plus Service, proxy CA Secret, and NetworkPolicy
+resources so agent egress is limited to its paired supervisor pod plus DNS. If
+the supervisor pod is deleted, the Deployment recreates it.
 
 Sidecar mode uses the pod `fsGroup` to make the projected service-account token
 and sandbox client TLS secret group-readable so the non-root process supervisor

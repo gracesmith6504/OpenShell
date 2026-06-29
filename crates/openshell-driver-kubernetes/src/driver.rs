@@ -10,7 +10,8 @@ use crate::config::{
     SupervisorTopology,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node, Pod, Secret, Service};
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
@@ -649,7 +650,7 @@ impl KubernetesComputeDriver {
             .map(|template| template.environment.clone())
             .unwrap_or_default();
         let spec_environment = spec_pod_env(spec);
-        let pod_owner_ref = split_owner_reference(sandbox_cr, sandbox_api_version, true)?;
+        let deployment_owner_ref = split_owner_reference(sandbox_cr, sandbox_api_version, true)?;
         let dependent_owner_ref = split_owner_reference(sandbox_cr, sandbox_api_version, false)?;
         let (ca_cert_pem, ca_key_pem) = generate_split_proxy_ca()?;
 
@@ -665,19 +666,20 @@ impl KubernetesComputeDriver {
             split_agent_egress_network_policy(&names, params, dependent_owner_ref.clone());
         let supervisor_ingress =
             split_supervisor_ingress_network_policy(&names, params, dependent_owner_ref);
-        let supervisor_pod = split_supervisor_pod(
+        let supervisor_deployment = split_supervisor_deployment(
             &names,
             &template_environment,
             &spec_environment,
             params,
-            pod_owner_ref,
+            deployment_owner_ref,
         );
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let policies: Api<NetworkPolicy> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
+        let deployments: Api<Deployment> =
+            Api::namespaced(self.client.clone(), &self.config.namespace);
 
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -729,12 +731,12 @@ impl KubernetesComputeDriver {
         .map_err(KubernetesDriverError::from_kube)?;
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            pods.create(&PostParams::default(), &supervisor_pod),
+            deployments.create(&PostParams::default(), &supervisor_deployment),
         )
         .await
         .map_err(|_| {
             KubernetesDriverError::Message(format!(
-                "timed out after {}s creating split-pod supervisor pod",
+                "timed out after {}s creating split-pod supervisor deployment",
                 KUBE_API_TIMEOUT.as_secs()
             ))
         })?
@@ -743,7 +745,7 @@ impl KubernetesComputeDriver {
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
-            supervisor_pod = %names.supervisor_pod,
+            supervisor_deployment = %names.supervisor_deployment,
             service = %names.service,
             "Created split-pod supervisor resources"
         );
@@ -756,11 +758,12 @@ impl KubernetesComputeDriver {
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let policies: Api<NetworkPolicy> =
             Api::namespaced(self.client.clone(), &self.config.namespace);
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
+        let deployments: Api<Deployment> =
+            Api::namespaced(self.client.clone(), &self.config.namespace);
 
         let _ = tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            pods.delete(&names.supervisor_pod, &DeleteParams::default()),
+            deployments.delete(&names.supervisor_deployment, &DeleteParams::default()),
         )
         .await;
         let _ = tokio::time::timeout(
@@ -1460,7 +1463,7 @@ fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 struct SplitPodResourceNames {
-    supervisor_pod: String,
+    supervisor_deployment: String,
     service: String,
     proxy_ca_secret: String,
     agent_egress_network_policy: String,
@@ -1469,7 +1472,7 @@ struct SplitPodResourceNames {
 
 fn split_pod_resource_names(sandbox_name: &str) -> SplitPodResourceNames {
     SplitPodResourceNames {
-        supervisor_pod: dns_label_name("os-sup", sandbox_name),
+        supervisor_deployment: dns_label_name("os-sup", sandbox_name),
         service: dns_label_name("os-svc", sandbox_name),
         proxy_ca_secret: dns_label_name("os-ca", sandbox_name),
         agent_egress_network_policy: dns_label_name("os-eg", sandbox_name),
@@ -3158,13 +3161,13 @@ fn split_supervisor_service(
     }))
 }
 
-fn split_supervisor_pod(
+fn split_supervisor_deployment(
     names: &SplitPodResourceNames,
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
     owner_ref: serde_json::Value,
-) -> Pod {
+) -> Deployment {
     let mut container = serde_json::json!({
         "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
         "image": params.supervisor_image,
@@ -3302,16 +3305,30 @@ fn split_supervisor_pod(
     }
 
     k8s_object(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
         "metadata": split_pod_object_meta(
-            &names.supervisor_pod,
+            &names.supervisor_deployment,
             params.namespace,
             params.sandbox_id,
             SANDBOX_ROLE_SUPERVISOR,
             owner_ref
         ),
-        "spec": spec
+        "spec": {
+            "replicas": 1,
+            "selector": {
+                "matchLabels": split_match_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+            },
+            "template": {
+                "metadata": {
+                    "labels": split_labels(params.sandbox_id, SANDBOX_ROLE_SUPERVISOR),
+                    "annotations": {
+                        "openshell.io/sandbox-id": params.sandbox_id
+                    }
+                },
+                "spec": spec
+            }
+        }
     }))
 }
 
@@ -4512,7 +4529,7 @@ mod tests {
             "blockOwnerDeletion": false
         });
 
-        let supervisor = serde_json::to_value(split_supervisor_pod(
+        let supervisor = serde_json::to_value(split_supervisor_deployment(
             &names,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
@@ -4532,15 +4549,25 @@ mod tests {
             supervisor["metadata"]["labels"][LABEL_SANDBOX_ROLE],
             SANDBOX_ROLE_SUPERVISOR
         );
+        assert_eq!(supervisor["kind"], "Deployment");
+        assert_eq!(supervisor["spec"]["replicas"], 1);
         assert_eq!(
-            supervisor["spec"]["hostAliases"][0]["ip"],
+            supervisor["spec"]["selector"]["matchLabels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(
+            supervisor["spec"]["template"]["metadata"]["labels"][LABEL_SANDBOX_ROLE],
+            SANDBOX_ROLE_SUPERVISOR
+        );
+        assert_eq!(
+            supervisor["spec"]["template"]["spec"]["hostAliases"][0]["ip"],
             params.host_gateway_ip
         );
-        let hostnames = supervisor["spec"]["hostAliases"][0]["hostnames"]
+        let hostnames = supervisor["spec"]["template"]["spec"]["hostAliases"][0]["hostnames"]
             .as_array()
             .unwrap();
         assert!(hostnames.contains(&serde_json::json!("host.openshell.internal")));
-        let container = &supervisor["spec"]["containers"][0];
+        let container = &supervisor["spec"]["template"]["spec"]["containers"][0];
         assert_eq!(
             rendered_env(container, openshell_core::sandbox_env::PROXY_BIND_ADDR),
             Some("0.0.0.0:3128")

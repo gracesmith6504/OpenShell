@@ -215,6 +215,10 @@ The namespaced Role covers sandbox lifecycle and identity:
 | `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
 | `""` | `events` | get, list, watch |
 | `""` | `pods` | get |
+| `apps` | `deployments` | create, delete, get, list, watch |
+| `apps` | `replicasets` | get |
+| `""` | `services`, `secrets` | create, delete, get, list, watch |
+| `networking.k8s.io` | `networkpolicies` | create, delete, get, list, watch |
 
 The ClusterRole grants node inspection and token validation:
 
