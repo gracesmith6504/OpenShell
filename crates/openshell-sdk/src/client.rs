@@ -310,7 +310,7 @@ impl OpenShellClient {
     async fn ensure_fresh(&self) -> Result<()> {
         if let (Some(source), Some(slot)) = (&self.token_source, &self.bearer_slot) {
             let token = source.current().await?;
-            store_bearer(slot, &token);
+            store_bearer(slot, &token)?;
         }
         Ok(())
     }
@@ -321,7 +321,7 @@ impl OpenShellClient {
     async fn refresh_on_unauthorized(&self) -> Result<bool> {
         if let (Some(source), Some(slot)) = (&self.token_source, &self.bearer_slot) {
             let token = source.refresh_now().await?;
-            store_bearer(slot, &token);
+            store_bearer(slot, &token)?;
             Ok(true)
         } else {
             Ok(false)
@@ -383,15 +383,20 @@ fn token_source_from_config(config: &ClientConfig) -> Option<TokenSource> {
     Some(TokenSource::new(initial, Arc::clone(refresher)))
 }
 
-/// Overwrite the live bearer slot with a freshly minted token. A malformed
-/// token value is dropped (the slot keeps its previous value); the next
-/// request then fails auth and surfaces a clear error.
-fn store_bearer(slot: &BearerSlot, token: &str) {
-    if let Ok(value) = bearer_metadata(token)
-        && let Ok(mut guard) = slot.write()
-    {
-        *guard = Some(value);
-    }
+/// Overwrite the live bearer slot with a freshly minted token.
+///
+/// Returns an error if the refreshed token can't be encoded as gRPC metadata
+/// instead of silently keeping the previous value. The [`TokenSource`] has
+/// already committed the new token to its state by this point, so a silent
+/// drop would leave the interceptor sending the old token with no path back
+/// to a refresh; surfacing the error fails the call loudly instead.
+fn store_bearer(slot: &BearerSlot, token: &str) -> Result<()> {
+    let value = bearer_metadata(token)?;
+    let mut guard = slot
+        .write()
+        .map_err(|_| SdkError::auth("bearer slot lock poisoned"))?;
+    *guard = Some(value);
+    Ok(())
 }
 
 fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
@@ -440,5 +445,23 @@ fn map_status(status: tonic::Status) -> SdkError {
             code: status.code() as i32,
             message,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn store_bearer_rejects_malformed_token_and_keeps_previous() {
+        let slot: BearerSlot = Arc::new(RwLock::new(None));
+        store_bearer(&slot, "good-token").expect("a valid token should store");
+
+        // A token with a control character can't be gRPC metadata; the slot
+        // must keep its previous value and the error must surface.
+        assert!(store_bearer(&slot, "bad\nvalue").is_err());
+        let current = slot.read().unwrap().clone().unwrap();
+        assert_eq!(current.to_str().unwrap(), "Bearer good-token");
     }
 }
