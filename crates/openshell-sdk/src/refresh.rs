@@ -69,11 +69,21 @@ impl From<RefreshError> for SdkError {
 /// `expires_at` is seconds since the Unix epoch. `None` means the token's
 /// expiry was not advertised — the SDK will not refresh it proactively but
 /// may refresh on demand if [`Refresh::refresh`] is called.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct RefreshedToken {
     pub access_token: String,
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for RefreshedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `access_token` is a bearer secret; omit it so a stray `{:?}` or a
+        // containing struct's derived `Debug` cannot write it to logs.
+        f.debug_struct("RefreshedToken")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RefreshedToken {
@@ -208,8 +218,12 @@ impl TokenSource {
     /// caller observed before queueing; if the current generation already
     /// moved past it, another caller refreshed and we return that token
     /// without invoking [`Refresh::refresh`] again.
+    // `map_or_else` (what `clippy::option_if_let_else` suggests) can't take
+    // `&mut flight` in the None arm to publish the new attempt, so keep the
+    // explicit `if let`/`else`.
+    #[allow(clippy::option_if_let_else)]
     async fn coalesced_refresh(&self, expected_generation: u64) -> Result<String> {
-        let (shared, is_leader, epoch) = {
+        let shared = {
             let mut flight = self.flight.lock().await;
             // Re-check under the flight lock: a refresh may have completed
             // between our generation read and acquiring this lock.
@@ -221,13 +235,19 @@ impl TokenSource {
             }
             if let Some(existing) = flight.future.as_ref() {
                 // Join the attempt already in flight.
-                (existing.clone(), false, flight.epoch)
+                existing.clone()
             } else {
-                // Become the leader for a fresh attempt.
+                // Become the leader for a fresh attempt. The attempt clears its
+                // own slot on completion (below) rather than relying on the
+                // leader's post-await code, so cleanup is cancellation-safe: a
+                // dropped leader can't strand a completed future in the slot and
+                // pin later callers to a stale token.
                 let refresher = Arc::clone(&self.refresher);
                 let state = Arc::clone(&self.state);
+                let flight_slot = Arc::clone(&self.flight);
+                let epoch = flight.epoch.wrapping_add(1);
                 let future: RefreshFuture = async move {
-                    match refresher.refresh().await {
+                    let outcome = match refresher.refresh().await {
                         Ok(token) => {
                             let mut state = state.write().await;
                             state.token.clone_from(&token.access_token);
@@ -236,28 +256,29 @@ impl TokenSource {
                             Ok(token.access_token)
                         }
                         Err(err) => Err(SdkError::from(err).to_string()),
+                    };
+                    // Clear this attempt's slot so the next caller starts a
+                    // fresh refresh. Epoch-guarded so a newer attempt is never
+                    // clobbered. Runs inside the single shared computation, so
+                    // it fires exactly once regardless of which waiter drives it
+                    // to completion or whether the leader was dropped.
+                    {
+                        let mut flight = flight_slot.lock().await;
+                        if flight.epoch == epoch {
+                            flight.future = None;
+                        }
                     }
+                    outcome
                 }
                 .boxed()
                 .shared();
-                flight.epoch = flight.epoch.wrapping_add(1);
+                flight.epoch = epoch;
                 flight.future = Some(future.clone());
-                (future, true, flight.epoch)
+                future
             }
         };
 
-        let outcome = shared.await;
-
-        // Only the leader clears the slot, and only if no newer attempt has
-        // replaced it, so a fresh attempt can start once this one resolves.
-        if is_leader {
-            let mut flight = self.flight.lock().await;
-            if flight.epoch == epoch {
-                flight.future = None;
-            }
-        }
-
-        outcome.map_err(SdkError::auth)
+        shared.await.map_err(SdkError::auth)
     }
 
     /// Replace the current token without invoking the refresher.
@@ -388,6 +409,67 @@ mod tests {
             outcomes.push(f.await.unwrap());
         }
         (calls.load(Ordering::SeqCst), outcomes)
+    }
+
+    #[tokio::test]
+    async fn refresh_clears_slot_when_leader_is_cancelled() {
+        // Regression: the in-flight slot must be cleared by the shared refresh
+        // computation, not by the leader's post-await code. If only the leader
+        // cleared it, cancelling the leader would strand a completed future in
+        // the slot and pin every later `refresh_now()` to that stale token.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let refresher = Arc::new(GatedRefresher {
+            calls: Arc::clone(&calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            fail: false,
+        });
+        let source = TokenSource::new(RefreshedToken::new("initial").with_expires_at(0), refresher);
+
+        // Leader enters the refresher, then is cancelled before it completes.
+        let leader = {
+            let src = source.clone();
+            tokio::spawn(async move { src.refresh_now().await })
+        };
+        entered.notified().await;
+        leader.abort();
+        let _ = leader.await;
+
+        // A follower joins and drives the in-flight attempt to completion.
+        let follower = {
+            let src = source.clone();
+            tokio::spawn(async move { src.refresh_now().await })
+        };
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_waiters();
+        assert_eq!(follower.await.unwrap().unwrap(), "token-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The completed attempt must have cleared the slot, so the next refresh
+        // starts a new attempt instead of re-joining the stale completed one.
+        let next = {
+            let src = source.clone();
+            tokio::spawn(async move { src.refresh_now().await })
+        };
+        entered.notified().await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_waiters();
+        assert_eq!(next.await.unwrap().unwrap(), "token-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn debug_omits_access_token() {
+        let token = RefreshedToken::new("super-secret-value").with_expires_at(123);
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("super-secret-value"));
+        assert!(rendered.contains("expires_at"));
     }
 
     #[tokio::test]

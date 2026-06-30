@@ -33,6 +33,17 @@ pub struct RefreshTokenInput {
     pub insecure: bool,
 }
 
+impl std::fmt::Debug for RefreshTokenInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Omit `refresh_token` (a long-lived secret).
+        f.debug_struct("RefreshTokenInput")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("insecure", &self.insecure)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RefreshTokenInput {
     pub fn new(
         refresh_token: impl Into<String>,
@@ -60,12 +71,22 @@ impl RefreshTokenInput {
 /// refresh token; per OAuth 2.0, callers should preserve the previous
 /// refresh token in that case. `expires_at` is a Unix timestamp (seconds
 /// since epoch); `None` when the server omits `expires_in`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct RefreshTokenOutput {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
+}
+
+impl std::fmt::Debug for RefreshTokenOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Omit `access_token`; never print the refresh-token value.
+        f.debug_struct("RefreshTokenOutput")
+            .field("has_refresh_token", &self.refresh_token.is_some())
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Discover OIDC endpoints from the issuer's well-known configuration.
@@ -142,5 +163,28 @@ fn output_from_oauth2_response(resp: &oauth2::basic::BasicTokenResponse) -> Refr
         access_token: resp.access_token().secret().clone(),
         refresh_token: resp.refresh_token().map(|rt| rt.secret().clone()),
         expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_tokens() {
+        let input = RefreshTokenInput::new("refresh-secret", "https://idp", "cli");
+        let rendered = format!("{input:?}");
+        assert!(!rendered.contains("refresh-secret"));
+        assert!(rendered.contains("cli"));
+
+        let output = RefreshTokenOutput {
+            access_token: "access-secret".to_string(),
+            refresh_token: Some("refresh-secret".to_string()),
+            expires_at: Some(123),
+        };
+        let rendered = format!("{output:?}");
+        assert!(!rendered.contains("access-secret"));
+        assert!(!rendered.contains("refresh-secret"));
+        assert!(rendered.contains("has_refresh_token"));
     }
 }
