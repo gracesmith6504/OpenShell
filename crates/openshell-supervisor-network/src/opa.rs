@@ -6698,7 +6698,6 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6777,7 +6776,6 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
