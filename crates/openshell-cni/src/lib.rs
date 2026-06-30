@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
-const SUPPORTED_CNI_VERSION: &str = "1.0.0";
+const DEFAULT_CNI_VERSION: &str = "1.0.0";
+const SUPPORTED_CNI_VERSIONS: &[&str] = &["0.3.0", "0.3.1", "0.4.0", "1.0.0"];
 const DEFAULT_KUBECONFIG_PATH: &str = "/etc/cni/net.d/openshell-cni-kubeconfig";
 const OPENSHELL_CNI_ENABLED_ANNOTATION: &str = "openshell.ai/cni";
 const OPENSHELL_CNI_PROXY_UID_ANNOTATION: &str = "openshell.ai/proxy-uid";
@@ -148,8 +149,13 @@ trait PodReader {
 }
 
 trait RuleInstaller {
-    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<()>;
+    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport>;
     fn cleanup(&self, netns: &Path) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallReport {
+    backend: &'static str,
 }
 
 pub fn run() -> Result<()> {
@@ -176,6 +182,10 @@ fn log_cni_error(input: &str, env: &CniEnv, error: &miette::Report) {
     let Ok(config) = serde_json::from_str::<CniConfig>(input) else {
         return;
     };
+    log_cni_info(&config, env, &format!("error={}", one_line_error(error)));
+}
+
+fn log_cni_info(config: &CniConfig, env: &CniEnv, message: &str) {
     let Some(log_file) = config.openshell.log_file.as_deref() else {
         return;
     };
@@ -187,7 +197,6 @@ fn log_cni_error(input: &str, env: &CniEnv, error: &miette::Report) {
         || "-".to_string(),
         |pod| format!("{}/{}", pod.namespace, pod.name),
     );
-    let message = one_line_error(error);
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -195,11 +204,7 @@ fn log_cni_error(input: &str, env: &CniEnv, error: &miette::Report) {
     else {
         return;
     };
-    let _ = writeln!(
-        file,
-        "command={} pod={} error={}",
-        env.command, pod, message
-    );
+    let _ = writeln!(file, "command={} pod={} {}", env.command, pod, message);
 }
 
 fn one_line_error(error: &miette::Report) -> String {
@@ -231,7 +236,15 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI ADD")
                 })?;
-                installer.install(netns, workload.proxy_uid)?;
+                let report = installer.install(netns, workload.proxy_uid)?;
+                log_cni_info(
+                    &config,
+                    env,
+                    &format!(
+                        "status=installed backend={} proxy_uid={}",
+                        report.backend, workload.proxy_uid
+                    ),
+                );
             }
             Ok(Some(pass_through_result(&config)))
         }
@@ -241,7 +254,15 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI CHECK")
                 })?;
-                installer.install(netns, workload.proxy_uid)?;
+                let report = installer.install(netns, workload.proxy_uid)?;
+                log_cni_info(
+                    &config,
+                    env,
+                    &format!(
+                        "status=installed backend={} proxy_uid={}",
+                        report.backend, workload.proxy_uid
+                    ),
+                );
             }
             Ok(None)
         }
@@ -303,15 +324,15 @@ fn workload_from_config(
 fn pass_through_result(config: &CniConfig) -> Value {
     config.prev_result.clone().unwrap_or_else(|| {
         serde_json::json!({
-            "cniVersion": config.cni_version.as_deref().unwrap_or(SUPPORTED_CNI_VERSION)
+            "cniVersion": config.cni_version.as_deref().unwrap_or(DEFAULT_CNI_VERSION)
         })
     })
 }
 
 fn version_response() -> Value {
     serde_json::json!({
-        "cniVersion": SUPPORTED_CNI_VERSION,
-        "supportedVersions": [SUPPORTED_CNI_VERSION]
+        "cniVersion": DEFAULT_CNI_VERSION,
+        "supportedVersions": SUPPORTED_CNI_VERSIONS
     })
 }
 
@@ -456,7 +477,7 @@ fn cluster_certificate_authority(
 }
 
 impl RuleInstaller for Runtime {
-    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<()> {
+    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
         install_rules(netns, proxy_uid)
     }
 
@@ -501,10 +522,12 @@ fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn install_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
+fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
     let nft_error = if let Some(nft) = find_nft() {
         match install_nft_rules(netns, proxy_uid, &nft) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return Ok(InstallReport { backend: "nft" });
+            }
             Err(error) => Some(one_line_error(&error)),
         }
     } else {
@@ -512,8 +535,10 @@ fn install_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
     };
 
     if let Some(iptables) = find_iptables() {
-        return install_iptables_rules(netns, proxy_uid, &iptables)
-            .wrap_err("iptables fallback failed");
+        install_iptables_rules(netns, proxy_uid, &iptables).wrap_err("iptables fallback failed")?;
+        return Ok(InstallReport {
+            backend: "iptables",
+        });
     }
 
     if let Some(nft_error) = nft_error {
@@ -535,7 +560,7 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
+fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
     let _ = (netns, proxy_uid);
     Err(miette::miette!(
         "OpenShell CNI rule installation is supported only on Linux nodes"
@@ -822,9 +847,9 @@ mod tests {
     }
 
     impl RuleInstaller for TestInstaller {
-        fn install(&self, _netns: &Path, proxy_uid: u32) -> Result<()> {
+        fn install(&self, _netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
             self.installed.lock().unwrap().push(proxy_uid);
-            Ok(())
+            Ok(InstallReport { backend: "test" })
         }
 
         fn cleanup(&self, _netns: &Path) -> Result<()> {
@@ -905,7 +930,19 @@ mod tests {
         let output = handle_command("", &env("VERSION"), &pods, &installer)
             .unwrap()
             .unwrap();
-        assert_eq!(output["supportedVersions"][0], SUPPORTED_CNI_VERSION);
+        assert_eq!(output["cniVersion"], DEFAULT_CNI_VERSION);
+        assert!(
+            output["supportedVersions"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("0.3.1"))
+        );
+        assert!(
+            output["supportedVersions"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("1.0.0"))
+        );
     }
 
     #[test]
@@ -1016,6 +1053,31 @@ mod tests {
         assert!(log.contains("command=ADD"));
         assert!(log.contains("pod=openshell/sandbox-1"));
         assert!(log.contains("neither nft nor iptables was found"));
+    }
+
+    #[test]
+    fn add_success_appends_to_configured_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("openshell-cni.log");
+        let pods = TestPods {
+            annotations: openshell_annotations(),
+        };
+        let installer = TestInstaller::default();
+
+        handle_command(
+            &cni_input_with_log_file(&log_file),
+            &env("ADD"),
+            &pods,
+            &installer,
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(log_file).unwrap();
+        assert!(log.contains("command=ADD"));
+        assert!(log.contains("pod=openshell/sandbox-1"));
+        assert!(log.contains("status=installed"));
+        assert!(log.contains("backend=test"));
+        assert!(log.contains("proxy_uid=1337"));
     }
 
     #[cfg(target_os = "linux")]
