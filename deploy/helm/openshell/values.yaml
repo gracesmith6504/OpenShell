@@ -53,7 +53,8 @@ supervisor:
   topology: "combined"
   # -- UID for the long-running network sidecar or proxy supervisor pod. In sidecar
   # topology, the network init container installs nftables rules that exempt
-  # this UID.
+  # this UID. In cni-sidecar topology, the CNI plugin installs equivalent
+  # nftables or iptables rules.
   proxyUid: 1337
 
 cni:

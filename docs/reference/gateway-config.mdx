@@ -191,7 +191,7 @@ supervisor_topology            = "combined"
 # UID used by the long-running network sidecar or proxy supervisor pod. In
 # sidecar topology, the network init container installs nftables rules that
 # exempt this UID. In cni-sidecar topology, the OpenShell CNI plugin installs
-# equivalent rules.
+# equivalent nftables or iptables rules.
 proxy_uid              = 1337
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"

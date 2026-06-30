@@ -20,6 +20,8 @@ const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
 const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
+#[allow(dead_code)]
+const OPENSHELL_IPTABLES_CHAIN: &str = "OPENSHELL_OUTPUT";
 #[cfg(target_os = "linux")]
 const NFT_SEARCH_PATHS: &[&str] = &[
     "/usr/sbin/nft",
@@ -28,6 +30,24 @@ const NFT_SEARCH_PATHS: &[&str] = &[
     "/bin/nft",
     "/opt/cni/bin/nft",
     "/bin/aux/nft",
+];
+#[cfg(target_os = "linux")]
+const IPTABLES_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/iptables",
+    "/sbin/iptables",
+    "/usr/bin/iptables",
+    "/bin/iptables",
+    "/opt/cni/bin/iptables",
+    "/bin/aux/iptables",
+];
+#[cfg(target_os = "linux")]
+const IP6TABLES_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/ip6tables",
+    "/sbin/ip6tables",
+    "/usr/bin/ip6tables",
+    "/bin/ip6tables",
+    "/opt/cni/bin/ip6tables",
+    "/bin/aux/ip6tables",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -482,8 +502,33 @@ fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> 
 
 #[cfg(target_os = "linux")]
 fn install_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
-    let nft = find_nft()
-        .ok_or_else(|| miette::miette!("nft not found on node; OpenShell CNI requires nftables"))?;
+    let nft_error = if let Some(nft) = find_nft() {
+        match install_nft_rules(netns, proxy_uid, &nft) {
+            Ok(()) => return Ok(()),
+            Err(error) => Some(one_line_error(&error)),
+        }
+    } else {
+        None
+    };
+
+    if let Some(iptables) = find_iptables() {
+        return install_iptables_rules(netns, proxy_uid, &iptables)
+            .wrap_err("iptables fallback failed");
+    }
+
+    if let Some(nft_error) = nft_error {
+        return Err(miette::miette!(
+            "nft rule installation failed and iptables was not found on node: {nft_error}"
+        ));
+    }
+
+    Err(miette::miette!(
+        "neither nft nor iptables was found on node; OpenShell CNI requires a pod-network firewall backend"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
     let _ = run_nft_args_in_netns(netns, &nft, &["delete", "table", "inet", OPENSHELL_TABLE]);
     let ruleset = generate_sidecar_bypass_ruleset(proxy_uid, Some("openshell:cni-sidecar:"));
     run_nft_ruleset_in_netns(netns, &nft, &ruleset)
@@ -499,9 +544,18 @@ fn install_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn cleanup_rules(netns: &Path) -> Result<()> {
-    let nft = find_nft()
-        .ok_or_else(|| miette::miette!("nft not found on node; OpenShell CNI requires nftables"))?;
-    run_nft_args_in_netns(netns, &nft, &["delete", "table", "inet", OPENSHELL_TABLE])
+    if let Some(nft) = find_nft() {
+        let _ = cleanup_nft_rules(netns, &nft);
+    }
+    if let Some(iptables) = find_iptables() {
+        cleanup_iptables_rules(netns, &iptables);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_nft_rules(netns: &Path, nft: &str) -> Result<()> {
+    run_nft_args_in_netns(netns, nft, &["delete", "table", "inet", OPENSHELL_TABLE])
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -527,16 +581,21 @@ fn run_nft_ruleset_in_netns(netns: &Path, nft: &str, ruleset: &str) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn run_nft_args_in_netns(netns: &Path, nft: &str, args: &[&str]) -> Result<()> {
+    run_command_in_netns(netns, nft, args)
+}
+
+#[cfg(target_os = "linux")]
+fn run_command_in_netns(netns: &Path, program: &str, args: &[&str]) -> Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
     let netns = std::fs::File::open(netns).into_diagnostic()?;
     let fd = netns.as_raw_fd();
     let output = {
-        let mut command = Command::new(nft);
+        let mut command = Command::new(program);
         command.args(args);
         // SAFETY: pre_exec runs in the child after fork and before exec. setns
-        // only affects that child process before it executes nft.
+        // only affects that child process before it executes the firewall tool.
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(move || {
@@ -553,17 +612,189 @@ fn run_nft_args_in_netns(netns: &Path, nft: &str, args: &[&str]) -> Result<()> {
         return Ok(());
     }
     Err(miette::miette!(
-        "nft failed in CNI network namespace: {}",
+        "{} failed in CNI network namespace: {}",
+        program,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
 }
 
 #[cfg(target_os = "linux")]
 fn find_nft() -> Option<String> {
-    NFT_SEARCH_PATHS
+    find_existing_binary(NFT_SEARCH_PATHS)
+}
+
+#[cfg(target_os = "linux")]
+fn find_iptables() -> Option<IptablesBackend> {
+    find_existing_binary(IPTABLES_SEARCH_PATHS).map(|ipv4| IptablesBackend {
+        ipv4,
+        ipv6: find_existing_binary(IP6TABLES_SEARCH_PATHS),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn find_existing_binary(paths: &[&str]) -> Option<String> {
+    paths
         .iter()
         .find(|path| Path::new(path).is_file())
         .map(|path| (*path).to_string())
+}
+
+#[cfg(target_os = "linux")]
+struct IptablesBackend {
+    ipv4: String,
+    ipv6: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn install_iptables_rules(netns: &Path, proxy_uid: u32, backend: &IptablesBackend) -> Result<()> {
+    cleanup_iptables_family(netns, &backend.ipv4);
+    install_iptables_family(netns, &backend.ipv4, proxy_uid, "icmp-port-unreachable")?;
+
+    if let Some(ipv6) = backend.ipv6.as_deref() {
+        cleanup_iptables_family(netns, ipv6);
+        install_iptables_family(netns, ipv6, proxy_uid, "icmp6-port-unreachable")?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_iptables_rules(netns: &Path, backend: &IptablesBackend) {
+    cleanup_iptables_family(netns, &backend.ipv4);
+    if let Some(ipv6) = backend.ipv6.as_deref() {
+        cleanup_iptables_family(netns, ipv6);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_iptables_family(netns: &Path, iptables: &str) {
+    for _ in 0..16 {
+        if run_command_in_netns(
+            netns,
+            iptables,
+            &[
+                "-w",
+                "-t",
+                "filter",
+                "-D",
+                "OUTPUT",
+                "-j",
+                OPENSHELL_IPTABLES_CHAIN,
+            ],
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+    let _ = run_command_in_netns(
+        netns,
+        iptables,
+        &["-w", "-t", "filter", "-F", OPENSHELL_IPTABLES_CHAIN],
+    );
+    let _ = run_command_in_netns(
+        netns,
+        iptables,
+        &["-w", "-t", "filter", "-X", OPENSHELL_IPTABLES_CHAIN],
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn install_iptables_family(
+    netns: &Path,
+    iptables: &str,
+    proxy_uid: u32,
+    reject_with: &str,
+) -> Result<()> {
+    for args in generate_iptables_install_commands(proxy_uid, reject_with) {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_command_in_netns(netns, iptables, &args)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn generate_iptables_install_commands(proxy_uid: u32, reject_with: &str) -> Vec<Vec<String>> {
+    let uid = proxy_uid.to_string();
+    [
+        vec!["-w", "-t", "filter", "-N", OPENSHELL_IPTABLES_CHAIN],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-A",
+            OPENSHELL_IPTABLES_CHAIN,
+            "-o",
+            "lo",
+            "-j",
+            "RETURN",
+        ],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-A",
+            OPENSHELL_IPTABLES_CHAIN,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "RETURN",
+        ],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-A",
+            OPENSHELL_IPTABLES_CHAIN,
+            "-m",
+            "owner",
+            "--uid-owner",
+            &uid,
+            "-j",
+            "RETURN",
+        ],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-A",
+            OPENSHELL_IPTABLES_CHAIN,
+            "-p",
+            "tcp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            reject_with,
+        ],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-A",
+            OPENSHELL_IPTABLES_CHAIN,
+            "-p",
+            "udp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            reject_with,
+        ],
+        vec![
+            "-w",
+            "-t",
+            "filter",
+            "-I",
+            "OUTPUT",
+            "1",
+            "-j",
+            OPENSHELL_IPTABLES_CHAIN,
+        ],
+    ]
+    .into_iter()
+    .map(|args| args.into_iter().map(str::to_string).collect())
+    .collect()
 }
 
 #[cfg(test)]
@@ -754,18 +985,37 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn iptables_fallback_commands_allow_proxy_uid_before_rejects() {
+        let commands = generate_iptables_install_commands(1337, "icmp-port-unreachable");
+        let rendered = commands
+            .iter()
+            .map(|command| command.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let uid_pos = rendered.find("--uid-owner 1337 -j RETURN").unwrap();
+        let reject_pos = rendered.find("-p tcp -j REJECT").unwrap();
+        assert!(uid_pos < reject_pos);
+        assert!(rendered.contains("-A OPENSHELL_OUTPUT -o lo -j RETURN"));
+        assert!(rendered.contains("-I OUTPUT 1 -j OPENSHELL_OUTPUT"));
+        assert!(rendered.contains("--reject-with icmp-port-unreachable"));
+    }
+
     #[test]
     fn cni_errors_append_to_configured_log_file() {
         let dir = tempfile::tempdir().unwrap();
         let log_file = dir.path().join("openshell-cni.log");
-        let error = miette::miette!("nft not found on node; OpenShell CNI requires nftables");
+        let error = miette::miette!(
+            "neither nft nor iptables was found on node; OpenShell CNI requires a pod-network firewall backend"
+        );
 
         log_cni_error(&cni_input_with_log_file(&log_file), &env("ADD"), &error);
 
         let log = std::fs::read_to_string(log_file).unwrap();
         assert!(log.contains("command=ADD"));
         assert!(log.contains("pod=openshell/sandbox-1"));
-        assert!(log.contains("nft not found on node"));
+        assert!(log.contains("neither nft nor iptables was found"));
     }
 
     #[cfg(target_os = "linux")]

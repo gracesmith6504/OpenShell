@@ -99,10 +99,11 @@ pod-network nftables setup with `NET_ADMIN` and hands shared state ownership to
 the configured proxy UID; the long-running network sidecar runs as that UID and
 does not keep `NET_ADMIN`. CNI-sidecar mode keeps the sidecar runtime model but
 requires the privileged OpenShell CNI DaemonSet to install the pod-network rules
-during CNI `ADD`. Proxy-pod mode moves network enforcement into a paired
-supervisor Deployment and requires NetworkPolicy enforcement. The agent
-container runs as the resolved sandbox UID/GID with no added Linux capabilities
-in the alternate topologies. They preserve gateway session and SSH behavior, but
+during CNI `ADD` using nftables or iptables. Proxy-pod mode moves network
+enforcement into a paired supervisor Deployment and requires NetworkPolicy
+enforcement. The agent container runs as the resolved sandbox UID/GID with no
+added Linux capabilities in the alternate topologies. They preserve gateway
+session and SSH behavior, but
 treat the process leaf as network-only: Landlock filesystem policy, process
 privilege dropping, and process/binary identity checks are not applied there.
 

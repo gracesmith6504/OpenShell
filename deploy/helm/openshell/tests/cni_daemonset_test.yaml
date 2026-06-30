@@ -47,7 +47,7 @@ tests:
           pattern: '"logFile": "\$\{log_file\}"'
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: "/bin/aux/nft"
+          pattern: "firewall backend selected during CNI ADD"
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
           pattern: 'select\(\.type != "openshell-cni"\)'

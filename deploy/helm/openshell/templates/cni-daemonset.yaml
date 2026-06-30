@@ -104,18 +104,7 @@ spec:
                 .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
               ' "${target}" > "${tmp}"
               mv "${tmp}" "${target}"
-              nft_path=""
-              for path in /usr/sbin/nft /sbin/nft /usr/bin/nft /bin/nft /opt/cni/bin/nft /bin/aux/nft; do
-                if [ -f "/host${path}" ]; then
-                  nft_path="${path}"
-                  break
-                fi
-              done
-              if [ -n "${nft_path}" ]; then
-                echo "OpenShell CNI installed; nft found at ${nft_path}; plugin log ${log_file}"
-              else
-                echo "WARNING: OpenShell CNI installed but nft was not found on this node; sandbox CNI ADD will fail until nftables is available" >&2
-              fi
+              echo "OpenShell CNI installed; plugin log ${log_file}; firewall backend selected during CNI ADD"
               tail -n 0 -F "${host_log_file}" &
               tail_pid="$!"
               trap 'kill "${tail_pid}" 2>/dev/null || true; exit 0' INT TERM

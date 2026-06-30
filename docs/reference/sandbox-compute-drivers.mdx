@@ -305,7 +305,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `supervisor_topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, `sidecar` to move pod-level network enforcement and gateway forwarding into a dedicated sidecar, `cni-sidecar` to use that sidecar runtime model with CNI-installed pod-network rules, or `proxy-pod` to run network enforcement in a separate supervisor Deployment with NetworkPolicy isolation. |
-| `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar or proxy supervisor pod. In `sidecar` topology, the network init container exempts this UID from proxy redirection. In `cni-sidecar` topology, the OpenShell CNI plugin installs equivalent exemptions. |
+| `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar or proxy supervisor pod. In `sidecar` topology, the network init container exempts this UID from proxy redirection. In `cni-sidecar` topology, the OpenShell CNI plugin installs equivalent nftables or iptables exemptions. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
@@ -317,7 +317,8 @@ policy, process privilege changes, and network policy enforcement. In
 the resolved sandbox UID/GID with no added Linux capabilities. Sidecar mode uses
 a root init container for nftables setup and a long-running non-root sidecar.
 CNI-sidecar mode keeps that sidecar runtime model but requires the privileged
-OpenShell CNI DaemonSet to install pod-network rules before the workload starts.
+OpenShell CNI DaemonSet to install nftables or iptables pod-network rules before
+the workload starts.
 Proxy-pod mode creates a separate non-root supervisor Deployment with one pod, a
 headless Service, a proxy CA Secret, and per-sandbox NetworkPolicies. The
 Deployment recreates the supervisor pod if it is deleted. All three alternate

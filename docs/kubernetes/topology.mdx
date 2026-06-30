@@ -113,10 +113,12 @@ Use this topology when a cluster admin can install node-level CNI components and
 you want sandbox pods to avoid the sidecar topology's privileged network init
 container.
 
-Each node must provide `nft` for the host-executed plugin. The installer
-DaemonSet writes plugin failures to `cni.logFile` and tails that file, so
-`kubectl logs daemonset/openshell-cni -c install-cni` includes CNI `ADD` and
-`CHECK` errors that would otherwise only appear in pod events or node logs.
+Each node must provide a firewall backend usable from the host-executed plugin.
+The plugin prefers `nft` and falls back to `iptables` when `nft` is unavailable.
+The installer DaemonSet writes plugin failures to `cni.logFile` and tails that
+file, so `kubectl logs daemonset/openshell-cni -c install-cni` includes CNI
+`ADD` and `CHECK` errors that would otherwise only appear in pod events or node
+logs.
 
 <Warning>
 `cni-sidecar` is experimental. It currently targets normal Kubernetes runtimes
