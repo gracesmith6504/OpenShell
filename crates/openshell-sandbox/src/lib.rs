@@ -730,7 +730,7 @@ fn process_enforcement_mode() -> ProcessEnforcementMode {
         .ok()
         .as_deref()
     {
-        Some("sidecar" | "proxy-pod") => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar" | "cni-sidecar" | "proxy-pod") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }

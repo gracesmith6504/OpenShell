@@ -306,8 +306,8 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
-| `supervisor_topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, `sidecar` to move pod-level network enforcement and gateway session handling into a dedicated sidecar, or `proxy-pod` to run network enforcement and gateway forwarding in a separate supervisor Deployment with NetworkPolicy isolation. |
-| `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar or proxy supervisor pod. In `sidecar` topology, the network init container exempts this UID from proxy redirection. |
+| `supervisor_topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, `sidecar` to move pod-level network enforcement and gateway session handling into a dedicated sidecar, `cni-sidecar` to use that sidecar runtime model with CNI-installed pod-network rules, or `proxy-pod` to run network enforcement and gateway forwarding in a separate supervisor Deployment with NetworkPolicy isolation. |
+| `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar or proxy supervisor pod. In `sidecar` topology, the network init container exempts this UID from proxy redirection. In `cni-sidecar` topology, the OpenShell CNI plugin installs equivalent nftables or iptables exemptions. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
@@ -327,7 +327,12 @@ gateway access in the agent container.
 Sidecar mode keeps gateway session and SSH behavior, but the process supervisor
 runs in `network-only` mode: filesystem policy, process privilege dropping, and
 process/binary identity checks are not applied by the process container. Network
-policy still runs in the sidecar and remains endpoint/L7 scoped.
+policy still runs in the sidecar and remains endpoint/L7 scoped in sidecar and
+cni-sidecar topologies.
+
+CNI-sidecar mode keeps the sidecar runtime model and local snapshot boundary,
+but requires the privileged OpenShell CNI DaemonSet to install nftables or
+iptables pod-network rules before the workload starts.
 
 In `proxy-pod` topology, network enforcement runs in a separate non-root
 supervisor Deployment with one pod, a headless Service, a proxy CA Secret, and
