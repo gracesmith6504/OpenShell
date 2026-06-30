@@ -128,6 +128,31 @@ spec:
           securityContext:
             privileged: true
             allowPrivilegeEscalation: true
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -ec
+                  - |
+                    conf_dir="/host{{ .Values.cni.confDir }}"
+                    for target in "${conf_dir}"/*.conflist; do
+                      [ -f "${target}" ] || continue
+                      tmp="$(mktemp "${conf_dir}/openshell-cni-cleanup.XXXXXX")"
+                      jq '
+                        if .plugins then
+                          .plugins = (.plugins | map(select(.type != "openshell-cni")))
+                        else
+                          .
+                        end
+                      ' "${target}" > "${tmp}"
+                      mv "${tmp}" "${target}"
+                    done
+                    rm -f \
+                      "${conf_dir}/openshell-cni-ca.crt" \
+                      "${conf_dir}/openshell-cni-kubeconfig" \
+                      "${conf_dir}/openshell-cni-plugin.json" \
+                      "${conf_dir}/openshell-cni-token"
           volumeMounts:
             - name: cni-bin
               mountPath: /host{{ .Values.cni.binDir }}
