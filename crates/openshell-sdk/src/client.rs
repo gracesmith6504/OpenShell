@@ -371,8 +371,14 @@ fn token_source_from_config(config: &ClientConfig) -> Option<TokenSource> {
         return None;
     };
     let mut initial = RefreshedToken::new(token.clone());
-    if let Some(exp) = expires_at {
-        initial = initial.with_expires_at(*exp);
+    // Prefer the caller-advertised expiry; otherwise derive a deadline from
+    // the token's JWT `exp` claim (reusing openshell-core's decoder) so the
+    // proactive refresh path has an expiry to schedule against. Non-JWT
+    // bearers fall back to reactive-only refresh.
+    let deadline = expires_at
+        .or_else(|| openshell_core::jwt::parse_exp_secs(token).and_then(|s| u64::try_from(s).ok()));
+    if let Some(exp) = deadline {
+        initial = initial.with_expires_at(exp);
     }
     Some(TokenSource::new(initial, Arc::clone(refresher)))
 }
