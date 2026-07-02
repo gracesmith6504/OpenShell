@@ -1848,12 +1848,14 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
+    if let Some(baseline_policy) = spec.policy.as_ref() {
+        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+    }
+
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
 
-    if let Some(baseline_policy) = spec.policy.as_ref() {
-        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-    } else {
+    if spec.policy.is_none() {
         // Backfill spec.policy using CAS (first-time policy discovery)
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         let sandbox_id = sandbox.object_id().to_string();
