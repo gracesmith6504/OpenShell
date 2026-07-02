@@ -2678,6 +2678,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2693,6 +2694,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2771,6 +2773,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
