@@ -46,9 +46,16 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// File written by the network supervisor when sidecar networking is ready.
 pub const SUPERVISOR_READY_FILE: &str = "OPENSHELL_SUPERVISOR_READY_FILE";
 
+/// TCP address the process supervisor waits for before starting when the
+/// network supervisor runs outside the agent process.
+pub const SUPERVISOR_READY_ADDR: &str = "OPENSHELL_SUPERVISOR_READY_ADDR";
+
 /// File written by the process supervisor with the workload entrypoint PID and
 /// read by the network sidecar for process/binary-bound network policy checks.
 pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
+
+/// Address where an external network supervisor forwards gateway gRPC traffic.
+pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
 
 /// Local protobuf policy snapshot written by the network sidecar and read by
 /// the process-only supervisor in Kubernetes sidecar topology.
@@ -61,9 +68,25 @@ pub const SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE: &str = "OPENSHELL_SIDECAR_PROVIDER
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 
+/// Explicit URL injected into sandbox child processes for proxy-mode egress.
+///
+/// Kubernetes proxy-pod topology uses a headless Service DNS name, which
+/// cannot be represented by the policy's `SocketAddr` proxy field.
+pub const PROXY_URL: &str = "OPENSHELL_PROXY_URL";
+
+/// Explicit listener address for the network supervisor's HTTP CONNECT proxy.
+pub const PROXY_BIND_ADDR: &str = "OPENSHELL_PROXY_BIND_ADDR";
+
 /// Directory where the network supervisor writes the proxy CA files consumed
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
+/// Optional CA certificate PEM path used by the network supervisor instead of
+/// generating an ephemeral CA.
+pub const PROXY_CA_CERT_PATH: &str = "OPENSHELL_PROXY_CA_CERT_PATH";
+
+/// Optional CA private key PEM path paired with [`PROXY_CA_CERT_PATH`].
+pub const PROXY_CA_KEY_PATH: &str = "OPENSHELL_PROXY_CA_KEY_PATH";
 
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
