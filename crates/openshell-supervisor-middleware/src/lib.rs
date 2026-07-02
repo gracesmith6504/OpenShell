@@ -712,6 +712,37 @@ impl ChainRunner {
                 }
             };
 
+            if decision == Decision::Deny {
+                for finding in result.findings {
+                    findings.push(NamespacedFinding {
+                        middleware: entry.entry.name.clone(),
+                        finding,
+                    });
+                }
+                if !result.metadata.is_empty() {
+                    metadata.insert(
+                        entry.entry.name.clone(),
+                        result.metadata.into_iter().collect(),
+                    );
+                }
+                applied.push(MiddlewareInvocation {
+                    name: entry.entry.name.clone(),
+                    implementation: entry.entry.implementation.clone(),
+                    decision,
+                    transformed: false,
+                    failed: false,
+                });
+                return Ok(ChainOutcome {
+                    allowed: false,
+                    reason: safe_reason(&result.reason),
+                    body,
+                    added_headers,
+                    findings,
+                    metadata,
+                    applied,
+                });
+            }
+
             if result.has_body && result.body.len() > entry.max_body_bytes {
                 match apply_on_error(entry, "response_body_over_capacity", &mut applied) {
                     OnErrorAction::FailOpen => continue,
@@ -774,17 +805,6 @@ impl ChainRunner {
                 transformed,
                 failed: false,
             });
-            if decision == Decision::Deny {
-                return Ok(ChainOutcome {
-                    allowed: false,
-                    reason: safe_reason(&result.reason),
-                    body,
-                    added_headers,
-                    findings,
-                    metadata,
-                    applied,
-                });
-            }
         }
 
         Ok(ChainOutcome {
@@ -1396,6 +1416,62 @@ mod tests {
         // The deny short-circuits the chain: the second middleware never runs.
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);
+        assert!(!outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn deny_decision_ignores_unsafe_mutations_under_fail_open() {
+        let runner = ChainRunner::new(Arc::new(scripted_service(
+            openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason: "blocked_by_policy".into(),
+                add_headers: std::iter::once((
+                    "x-openshell-middleware-inject".to_string(),
+                    "ok\r\nHost: evil".to_string(),
+                ))
+                .collect(),
+                ..allow_result()
+            },
+        )));
+
+        let outcome = runner
+            .evaluate(&[entry("guard", OnError::FailOpen)], input("hello"))
+            .await
+            .expect("evaluate");
+
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "blocked_by_policy");
+        assert!(outcome.added_headers.is_empty());
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].decision, Decision::Deny);
+        assert!(!outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn deny_decision_ignores_oversized_replacement_under_fail_open() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            binding_id: BUILTIN_SECRETS.into(),
+            max_body_bytes: 4,
+            result: openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason: "blocked_by_policy".into(),
+                body: b"too large".to_vec(),
+                has_body: true,
+                ..allow_result()
+            },
+        }));
+
+        let outcome = runner
+            .evaluate(&[entry("guard", OnError::FailOpen)], input("safe"))
+            .await
+            .expect("evaluate");
+
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "blocked_by_policy");
+        assert_eq!(outcome.body, b"safe");
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].decision, Decision::Deny);
+        assert!(!outcome.applied[0].transformed);
         assert!(!outcome.applied[0].failed);
     }
 

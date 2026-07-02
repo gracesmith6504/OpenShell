@@ -1527,7 +1527,12 @@ async fn load_policy(
         let opa_engine = Some(Arc::new(engine));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy), middleware_install_pending));
+        return Ok((
+            policy,
+            opa_engine,
+            Some(proto_policy),
+            middleware_install_pending,
+        ));
     }
 
     // No policy source available

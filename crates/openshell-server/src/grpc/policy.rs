@@ -3135,6 +3135,18 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
         hasher.update(key.as_bytes());
         hasher.update(value.encode_to_vec());
     }
+    if !policy.network_middlewares.is_empty() {
+        hasher.update(b"network_middlewares");
+        for middleware in &policy.network_middlewares {
+            let encoded = middleware.encode_to_vec();
+            hasher.update(
+                u64::try_from(encoded.len())
+                    .expect("protobuf payload length fits in u64")
+                    .to_le_bytes(),
+            );
+            hasher.update(encoded);
+        }
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -9313,6 +9325,26 @@ mod tests {
         let rev_a = compute_config_revision(Some(&policy_a), &settings, PolicySource::Sandbox, &[]);
         let rev_b = compute_config_revision(Some(&policy_b), &settings, PolicySource::Sandbox, &[]);
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn policy_hash_changes_when_network_middlewares_change() {
+        let policy_a = ProtoSandboxPolicy::default();
+        let policy_b = ProtoSandboxPolicy {
+            network_middlewares: vec![openshell_core::proto::NetworkMiddlewareConfig {
+                name: "redact-secrets".into(),
+                middleware: "openshell/secrets".into(),
+                on_error: "fail_closed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_ne!(
+            deterministic_policy_hash(&policy_a),
+            deterministic_policy_hash(&policy_b),
+            "middleware-only policy changes must produce a new policy hash"
+        );
     }
 
     #[test]

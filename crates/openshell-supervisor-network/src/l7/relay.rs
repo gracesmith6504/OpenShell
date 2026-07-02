@@ -824,7 +824,14 @@ pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite 
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input = middleware_request_input(scheme, &req, ctx, BTreeMap::new(), String::new(), Vec::new());
+        let input = middleware_request_input(
+            scheme,
+            &req,
+            ctx,
+            BTreeMap::new(),
+            String::new(),
+            Vec::new(),
+        );
         let outcome = runner.evaluate_described(&chain, input).await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
@@ -2824,6 +2831,72 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn l7_rest_middleware_acknowledges_expect_continue_before_reading_body() {
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context("openshell/secrets", "fail_closed");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"api_key":"sk-1234567890abcdef"}"#;
+        let headers = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(headers.as_bytes()).await.unwrap();
+
+        let mut interim = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut interim))
+            .await
+            .expect("middleware buffering should acknowledge Expect before reading the body")
+            .unwrap();
+        assert_eq!(&interim[..n], b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream after the body is released")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+        assert!(upstream_request.contains(r#""api_key":"[REDACTED]""#));
+        assert!(!upstream_request.contains("Expect: 100-continue"));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn l7_rest_middleware_fail_closed_does_not_reach_upstream() {
         let (config, tunnel_engine, ctx) =
             middleware_relay_context("example/unavailable", "fail_closed");
@@ -3484,7 +3557,8 @@ network_policies:
         let mut response = Vec::new();
         let mut buf = [0u8; 512];
         while !String::from_utf8_lossy(&response).contains("middleware_failed") {
-            match tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut buf)).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut buf)).await
+            {
                 Ok(Ok(0)) | Err(_) => break, // clean EOF, or no more data before the deadline
                 Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
                 Ok(Err(e)) => panic!("read from relay failed: {e}"),

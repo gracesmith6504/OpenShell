@@ -828,7 +828,7 @@ pub(crate) enum BufferResult {
     OverCapacity { recoverable: bool },
 }
 
-pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
+pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite + Unpin>(
     req: &L7Request,
     client: &mut C,
     generation_guard: Option<&PolicyGenerationGuard>,
@@ -839,7 +839,7 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
-    let headers = req.raw_header[..header_end].to_vec();
+    let mut headers = req.raw_header[..header_end].to_vec();
     let already_read = &req.raw_header[header_end..];
     match req.body_length {
         BodyLength::None => Ok(BufferResult::Buffered(BufferedRequestBody {
@@ -860,6 +860,9 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
             let mut body = Vec::with_capacity(len);
             body.extend_from_slice(&already_read[..initial_len]);
             let mut remaining = len.saturating_sub(initial_len);
+            if remaining > 0 && already_read.is_empty() {
+                acknowledge_expect_continue(client, &mut headers).await?;
+            }
             let mut buf = [0u8; RELAY_BUF_SIZE];
             while remaining > 0 {
                 let to_read = remaining.min(buf.len());
@@ -887,6 +890,9 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
             // we have already consumed wire bytes from the client stream and
             // cannot re-enter the normal raw relay path without a separate
             // splice-through buffer.
+            if already_read.is_empty() {
+                acknowledge_expect_continue(client, &mut headers).await?;
+            }
             Ok(
                 collect_chunked_body(client, already_read, generation_guard, Some(max_body_bytes))
                     .await
@@ -896,6 +902,25 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
             )
         }
     }
+}
+
+async fn acknowledge_expect_continue<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    headers: &mut Vec<u8>,
+) -> Result<()> {
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    if !has_expect_continue(header_str) {
+        return Ok(());
+    }
+
+    client
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+    *headers = strip_header(headers, "expect")?;
+    Ok(())
 }
 
 pub(crate) fn rebuild_request_with_buffered_body(
