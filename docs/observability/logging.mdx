@@ -94,7 +94,7 @@ CLASS:ACTIVITY [SEVERITY] ACTION DETAILS [CONTEXT]
 - SSH: peer address and authentication type
 - Process: `name(pid)` with exit code or command line
 - Config: description of what changed
-- Finding: quoted title with confidence level
+- Finding: quoted title with the stable finding type, optional confidence, and allowlisted evidence fields when available
 
 **Context** in brackets at the end provides the policy rule and enforcement engine that produced the decision.
 
@@ -128,6 +128,13 @@ An HTTP request to a non-default port. HTTP log URLs include the port whenever i
 
 ```text
 OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy:internal_api engine:opa]
+```
+
+A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
+
+```text
+OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware transformed:true failed:false]
+OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match middleware:prototype-content-guard count:1]
 ```
 
 Proxy and SSH servers ready:

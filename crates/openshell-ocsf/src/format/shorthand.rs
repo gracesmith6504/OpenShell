@@ -7,7 +7,22 @@
 
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
-use crate::objects::Url;
+use crate::objects::{Evidence, Url};
+
+fn finding_evidence_value<'a>(evidences: Option<&'a [Evidence]>, key: &str) -> Option<&'a str> {
+    evidences?
+        .iter()
+        .filter_map(|evidence| evidence.data.as_ref()?.as_object())
+        .find_map(|data| data.get(key)?.as_str())
+}
+
+fn message_bool_value<'a>(message: Option<&'a str>, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    message?
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix))
+        .filter(|value| matches!(*value, "true" | "false"))
+}
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
 ///
@@ -195,10 +210,32 @@ impl OcsfEvent {
                     .and_then(|r| r.url.as_ref())
                     .map(Url::to_display_string)
                     .unwrap_or_default();
+                let transformed = e
+                    .firewall_rule
+                    .as_ref()
+                    .filter(|rule| rule.rule_type == "middleware")
+                    .and_then(|_| message_bool_value(e.base.message.as_deref(), "transformed"));
+                let failed = e
+                    .firewall_rule
+                    .as_ref()
+                    .filter(|rule| rule.rule_type == "middleware")
+                    .and_then(|_| message_bool_value(e.base.message.as_deref(), "failed"));
                 let rule_ctx = e
                     .firewall_rule
                     .as_ref()
-                    .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
+                    .map(|r| {
+                        let mut context = vec![
+                            format!("policy:{}", r.name),
+                            format!("engine:{}", r.rule_type),
+                        ];
+                        if let Some(value) = transformed {
+                            context.push(format!("transformed:{value}"));
+                        }
+                        if let Some(value) = failed {
+                            context.push(format!("failed:{value}"));
+                        }
+                        format!(" [{}]", context.join(" "))
+                    })
                     .unwrap_or_default();
                 // For denied events, surface the reason from status_detail
                 let reason_ctx = if action == "DENIED" {
@@ -280,16 +317,26 @@ impl OcsfEvent {
             }
 
             Self::DetectionFinding(e) => {
-                let disposition = e
-                    .disposition
-                    .map_or_else(|| "UNKNOWN".to_string(), |d| d.label().to_uppercase());
+                let disposition = e.disposition.map_or_else(
+                    || e.base.activity_name.to_uppercase(),
+                    |d| d.label().to_uppercase(),
+                );
                 let title = &e.finding_info.title;
-                let confidence_ctx = e
-                    .confidence
-                    .map(|c| format!(" [confidence:{}]", c.label().to_lowercase()))
-                    .unwrap_or_default();
+                let mut context = vec![format!("type:{}", e.finding_info.uid)];
+                if let Some(middleware) =
+                    finding_evidence_value(e.evidences.as_deref(), "middleware")
+                {
+                    context.push(format!("middleware:{middleware}"));
+                }
+                if let Some(count) = finding_evidence_value(e.evidences.as_deref(), "count") {
+                    context.push(format!("count:{count}"));
+                }
+                if let Some(confidence) = e.confidence {
+                    context.push(format!("confidence:{}", confidence.label().to_lowercase()));
+                }
+                let context = format!(" [{}]", context.join(" "));
 
-                format!("FINDING:{disposition} {sev} \"{title}\"{confidence_ctx}")
+                format!("FINDING:{disposition} {sev} \"{title}\"{context}")
             }
 
             Self::ApplicationLifecycle(e) => {
@@ -531,6 +578,37 @@ mod tests {
         assert_eq!(
             shorthand,
             "HTTP:GET [INFO] ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress engine:mechanistic]"
+        );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_includes_middleware_outcome() {
+        let mut base = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
+        base.set_message(
+            "MIDDLEWARE prototype-content-guard example/content-guard decision=Allow transformed=false failed=true",
+        );
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "httpbin.org", "/anything", 443),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("httpbin", "middleware")),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware transformed:false failed:true]"
         );
     }
 
@@ -863,8 +941,35 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "FINDING:BLOCKED [HIGH] \"NSSH1 Nonce Replay Attack\" [confidence:high]"
+            "FINDING:BLOCKED [HIGH] \"NSSH1 Nonce Replay Attack\" [type:nssh1-replay-abc confidence:high]"
         );
+    }
+
+    #[test]
+    fn test_detection_finding_shorthand_uses_activity_and_safe_evidence() {
+        let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
+            base: base(2004, "Detection Finding", 2, "Findings", 1, "Create"),
+            finding_info: FindingInfo::new("content_guard.match", "configured content matched"),
+            evidences: Some(vec![Evidence::from_pairs(&[
+                ("middleware", "prototype-content-guard"),
+                ("count", "1"),
+                ("matched_content", "must-not-appear"),
+            ])]),
+            attacks: None,
+            remediation: None,
+            is_alert: None,
+            confidence: None,
+            risk_level: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "FINDING:CREATE [INFO] \"configured content matched\" [type:content_guard.match middleware:prototype-content-guard count:1]"
+        );
+        assert!(!shorthand.contains("must-not-appear"));
     }
 
     #[test]
