@@ -1539,6 +1539,99 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     );
 }
 
+fn managed_container_summary(
+    container_id: &str,
+    state: ContainerSummaryStateEnum,
+    created: i64,
+) -> ContainerSummary {
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    ContainerSummary {
+        id: Some(container_id.to_string()),
+        names: Some(vec![format!("/{}", container_name_for_sandbox(&sandbox))]),
+        labels: Some(HashMap::from([
+            (LABEL_SANDBOX_ID.to_string(), sandbox.id),
+            (LABEL_SANDBOX_NAME.to_string(), sandbox.name),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
+        ])),
+        state: Some(state),
+        created: Some(created),
+        ..Default::default()
+    }
+}
+
+fn selected_container_id(summaries: &[ContainerSummary]) -> &str {
+    preferred_container_summaries_by_sandbox_id(summaries)
+        .get("sbx-1")
+        .and_then(|summary| summary.id.as_deref())
+        .expect("sandbox has a preferred container")
+}
+
+#[test]
+fn preferred_container_summary_selects_running_in_both_list_orders() {
+    let running = managed_container_summary("running", ContainerSummaryStateEnum::RUNNING, 10);
+    let newer_exited =
+        managed_container_summary("newer-exited", ContainerSummaryStateEnum::EXITED, 20);
+
+    assert_eq!(
+        selected_container_id(&[running.clone(), newer_exited.clone()]),
+        "running"
+    );
+    assert_eq!(selected_container_id(&[newer_exited, running]), "running");
+}
+
+#[test]
+fn preferred_container_summary_selects_newer_same_state_in_both_list_orders() {
+    let older = managed_container_summary("older", ContainerSummaryStateEnum::EXITED, 10);
+    let newer = managed_container_summary("newer", ContainerSummaryStateEnum::EXITED, 20);
+
+    assert_eq!(
+        selected_container_id(&[older.clone(), newer.clone()]),
+        "newer"
+    );
+    assert_eq!(selected_container_id(&[newer, older]), "newer");
+}
+
+#[test]
+fn preferred_container_summary_selects_canonical_name_for_equal_time_clones() {
+    let canonical = managed_container_summary("aaa", ContainerSummaryStateEnum::EXITED, 10);
+    let mut backup = managed_container_summary("zzz", ContainerSummaryStateEnum::EXITED, 10);
+    backup.names = Some(vec!["/openshell-demo-nemoclaw-gpu-backup-1234".to_string()]);
+
+    assert_eq!(
+        selected_container_id(&[canonical.clone(), backup.clone()]),
+        "aaa"
+    );
+    assert_eq!(selected_container_id(&[backup, canonical]), "aaa");
+}
+
+#[test]
+fn matching_managed_container_targets_include_all_duplicate_containers() {
+    let first = managed_container_summary("first", ContainerSummaryStateEnum::RUNNING, 10);
+    let second = managed_container_summary("second", ContainerSummaryStateEnum::EXITED, 10);
+    let mut other_namespace =
+        managed_container_summary("other", ContainerSummaryStateEnum::RUNNING, 10);
+    other_namespace
+        .labels
+        .as_mut()
+        .expect("labels")
+        .insert(LABEL_SANDBOX_NAMESPACE.to_string(), "other".to_string());
+
+    let matches = matching_managed_container_summaries(
+        vec![first, second, other_namespace],
+        "default",
+        "sbx-1",
+        "demo",
+    );
+    let mut targets = managed_container_targets(&matches);
+    targets.sort();
+
+    assert_eq!(targets, vec!["first", "second"]);
+}
+
 #[test]
 fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
     let running = ContainerSummary {

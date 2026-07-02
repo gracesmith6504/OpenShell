@@ -49,6 +49,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
@@ -641,8 +642,8 @@ impl DockerComputeDriver {
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
-        let container_sandboxes = containers
-            .iter()
+        let container_sandboxes = preferred_container_summaries_by_sandbox_id(&containers)
+            .into_values()
             .filter_map(|summary| {
                 sandbox_from_container_summary(summary, self.supervisor_readiness.as_ref())
             })
@@ -853,10 +854,10 @@ impl DockerComputeDriver {
             task.abort();
         }
 
-        let Some(container) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
+        let containers = self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?;
+        if containers.is_empty() {
             if let Some(record) = pending {
                 let container_name = container_name_for_sandbox(&record.sandbox);
                 match self
@@ -881,36 +882,48 @@ impl DockerComputeDriver {
                 }
             }
             return Ok(false);
-        };
-        let Some(target) = summary_container_target(&container) else {
-            return Ok(pending.is_some());
-        };
-
-        match self
-            .docker
-            .remove_container(
-                &target,
-                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-            )
-            .await
-        {
-            Ok(()) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
-                Ok(true)
-            }
-            Err(err) if is_not_found_error(&err) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
-                Ok(pending.is_some())
-            }
-            Err(err) => Err(internal_status("delete docker sandbox container", err)),
         }
+        let targets = managed_container_targets(&containers);
+        if targets.is_empty() {
+            if pending.is_some() {
+                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+            }
+            return Ok(pending.is_some());
+        }
+
+        let mut deleted = false;
+        let mut failures = Vec::new();
+        for target in targets {
+            match self
+                .docker
+                .remove_container(
+                    &target,
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                )
+                .await
+            {
+                Ok(()) => deleted = true,
+                Err(err) if is_not_found_error(&err) => {}
+                Err(err) => failures.push(format!("{target}: {err}")),
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(Status::internal(format!(
+                "delete Docker sandbox containers: {}",
+                failures.join("; ")
+            )));
+        }
+
+        cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+        Ok(deleted || pending.is_some())
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
-        let Some(container) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
+        let containers = self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?;
+        if containers.is_empty() {
             if let Some(record) = self.remove_pending_sandbox(sandbox_id, sandbox_name).await {
                 if let Some(task) = record.task {
                     task.abort();
@@ -920,27 +933,44 @@ impl DockerComputeDriver {
                 return Ok(());
             }
             return Err(Status::not_found("sandbox not found"));
-        };
-        let Some(target) = summary_container_target(&container) else {
+        }
+        let targets = managed_container_targets(&containers);
+        if targets.is_empty() {
             return Err(Status::not_found("sandbox container has no id or name"));
-        };
+        }
 
-        match self
-            .docker
-            .stop_container(
-                &target,
-                Some(
-                    StopContainerOptionsBuilder::default()
-                        .t(docker_stop_timeout_secs(self.config.stop_timeout_secs))
-                        .build(),
-                ),
-            )
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) if is_not_modified_error(&err) => Ok(()),
-            Err(err) if is_not_found_error(&err) => Err(Status::not_found("sandbox not found")),
-            Err(err) => Err(internal_status("stop docker sandbox container", err)),
+        let mut stopped = false;
+        let mut failures = Vec::new();
+        for target in targets {
+            match self
+                .docker
+                .stop_container(
+                    &target,
+                    Some(
+                        StopContainerOptionsBuilder::default()
+                            .t(docker_stop_timeout_secs(self.config.stop_timeout_secs))
+                            .build(),
+                    ),
+                )
+                .await
+            {
+                Ok(()) => stopped = true,
+                Err(err) if is_not_modified_error(&err) => stopped = true,
+                Err(err) if is_not_found_error(&err) => {}
+                Err(err) => failures.push(format!("{target}: {err}")),
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(Status::internal(format!(
+                "stop Docker sandbox containers: {}",
+                failures.join("; ")
+            )));
+        }
+        if stopped {
+            Ok(())
+        } else {
+            Err(Status::not_found("sandbox not found"))
         }
     }
 
@@ -1260,11 +1290,11 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("list Docker sandbox containers", err))
     }
 
-    async fn find_managed_container_summary(
+    async fn find_managed_container_summaries(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Result<Option<ContainerSummary>, Status> {
+    ) -> Result<Vec<ContainerSummary>, Status> {
         let mut label_filter_values = Vec::new();
         if !sandbox_id.is_empty() {
             label_filter_values.push(format!("{LABEL_SANDBOX_ID}={sandbox_id}"));
@@ -1285,23 +1315,24 @@ impl DockerComputeDriver {
             .await
             .map_err(|err| internal_status("find Docker sandbox container", err))?;
 
-        Ok(containers.into_iter().find(|summary| {
-            let Some(labels) = summary.labels.as_ref() else {
-                return false;
-            };
-            let namespace_matches = labels
-                .get(LABEL_SANDBOX_NAMESPACE)
-                .is_some_and(|value| value == &self.config.sandbox_namespace);
-            let id_matches = sandbox_id.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_ID)
-                    .is_some_and(|value| value == sandbox_id);
-            let name_matches = sandbox_name.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_NAME)
-                    .is_some_and(|value| value == sandbox_name);
-            namespace_matches && id_matches && name_matches
-        }))
+        Ok(matching_managed_container_summaries(
+            containers,
+            &self.config.sandbox_namespace,
+            sandbox_id,
+            sandbox_name,
+        ))
+    }
+
+    async fn find_managed_container_summary(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<Option<ContainerSummary>, Status> {
+        Ok(self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?
+            .into_iter()
+            .max_by(compare_container_summary_preference))
     }
 
     async fn ensure_image_available(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -2691,6 +2722,101 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some((amount * multiplier).round() as i64))
 }
 
+fn compare_container_summary_preference(
+    left: &ContainerSummary,
+    right: &ContainerSummary,
+) -> Ordering {
+    let left_running = matches!(left.state, Some(ContainerSummaryStateEnum::RUNNING));
+    let right_running = matches!(right.state, Some(ContainerSummaryStateEnum::RUNNING));
+
+    left_running
+        .cmp(&right_running)
+        .then_with(|| {
+            is_canonical_container_summary(left).cmp(&is_canonical_container_summary(right))
+        })
+        .then_with(|| left.created.cmp(&right.created))
+        // Docker container IDs are unique and make equal-state, equal-time
+        // selection deterministic regardless of daemon response order.
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn is_canonical_container_summary(summary: &ContainerSummary) -> bool {
+    let Some(labels) = summary.labels.as_ref() else {
+        return false;
+    };
+    let Some(sandbox_id) = labels.get(LABEL_SANDBOX_ID) else {
+        return false;
+    };
+    let Some(sandbox_name) = labels.get(LABEL_SANDBOX_NAME) else {
+        return false;
+    };
+    let expected = container_name_for_sandbox(&DriverSandbox {
+        id: sandbox_id.clone(),
+        name: sandbox_name.clone(),
+        ..Default::default()
+    });
+    summary.names.as_ref().is_some_and(|names| {
+        names
+            .iter()
+            .any(|name| name.trim_start_matches('/') == expected)
+    })
+}
+
+fn matching_managed_container_summaries(
+    containers: Vec<ContainerSummary>,
+    sandbox_namespace: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Vec<ContainerSummary> {
+    containers
+        .into_iter()
+        .filter(|summary| {
+            let Some(labels) = summary.labels.as_ref() else {
+                return false;
+            };
+            let namespace_matches = labels
+                .get(LABEL_SANDBOX_NAMESPACE)
+                .is_some_and(|value| value == sandbox_namespace);
+            let id_matches = sandbox_id.is_empty()
+                || labels
+                    .get(LABEL_SANDBOX_ID)
+                    .is_some_and(|value| value == sandbox_id);
+            let name_matches = sandbox_name.is_empty()
+                || labels
+                    .get(LABEL_SANDBOX_NAME)
+                    .is_some_and(|value| value == sandbox_name);
+            namespace_matches && id_matches && name_matches
+        })
+        .collect()
+}
+
+fn preferred_container_summaries_by_sandbox_id(
+    summaries: &[ContainerSummary],
+) -> HashMap<&str, &ContainerSummary> {
+    let mut preferred = HashMap::new();
+    for summary in summaries {
+        let Some(sandbox_id) = summary
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+        else {
+            continue;
+        };
+
+        match preferred.entry(sandbox_id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(summary);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if compare_container_summary_preference(summary, entry.get()).is_gt() {
+                    entry.insert(summary);
+                }
+            }
+        }
+    }
+    preferred
+}
+
 fn sandbox_from_container_summary(
     summary: &ContainerSummary,
     readiness: &dyn SupervisorReadiness,
@@ -2805,6 +2931,13 @@ fn summary_container_target(summary: &ContainerSummary) -> Option<String> {
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .or_else(|| summary_container_name(summary))
+}
+
+fn managed_container_targets(summaries: &[ContainerSummary]) -> Vec<String> {
+    summaries
+        .iter()
+        .filter_map(summary_container_target)
+        .collect()
 }
 
 fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool {
