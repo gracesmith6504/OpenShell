@@ -1023,13 +1023,11 @@ fn middleware_events(
             ))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
+            .unmapped("transformed", invocation.transformed)
+            .unmapped("failed", invocation.failed)
             .message(format!(
-                "MIDDLEWARE {} {} decision={:?} transformed={} failed={}",
-                invocation.name,
-                invocation.implementation,
-                invocation.decision,
-                invocation.transformed,
-                invocation.failed
+                "MIDDLEWARE {} {} decision={:?}",
+                invocation.name, invocation.implementation, invocation.decision
             ));
         if !allowed && !outcome.reason.is_empty() {
             event = event
@@ -1053,6 +1051,8 @@ fn middleware_events(
                     ("middleware", invocation.name.as_str()),
                     ("implementation", invocation.implementation.as_str()),
                 ])
+                .unmapped("middleware", invocation.name.as_str())
+                .unmapped("implementation", invocation.implementation.as_str())
                 .message(format!(
                     "Middleware {} failed and was bypassed (fail_open)",
                     invocation.name
@@ -1087,6 +1087,8 @@ fn middleware_events(
                 ("middleware", &finding.middleware),
                 ("count", &finding.finding.count.to_string()),
             ])
+            .unmapped("middleware", finding.middleware.as_str())
+            .unmapped("count", finding.finding.count)
             .message(format!(
                 "Middleware finding {} count={}",
                 finding.finding.r#type, finding.finding.count
@@ -3411,11 +3413,14 @@ network_policies:
             denied_http.base().status_detail.as_deref(),
             Some("request matched configured policy")
         );
+        let denied_json = denied_http.to_json().expect("serialize denied event");
+        assert_eq!(denied_json["unmapped"]["transformed"], false);
+        assert_eq!(denied_json["unmapped"]["failed"], false);
         assert_eq!(
             denied_http.format_shorthand(),
             "HTTP:POST [MED] DENIED POST http://api.example.test:443/v1/messages \
              [policy:rest_api engine:middleware] \
-             [transformed:false failed:false reason:request matched configured policy]"
+             [failed:false transformed:false reason:request matched configured policy]"
         );
     }
 
