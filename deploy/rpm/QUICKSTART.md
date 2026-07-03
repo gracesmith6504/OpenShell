@@ -56,17 +56,23 @@ socket activation:
 systemctl --user enable --now podman.socket
 ```
 
-When using `install.sh`, you can select Podman explicitly after completing
-these prerequisites:
+When using `install.sh`, select Podman explicitly after completing these
+prerequisites:
 
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
 ```
 
-The option updates the gateway configuration; it does not install or start
-Podman. The option is not required on RPM installations: without it, the
-gateway keeps automatic driver selection and the RPM's bridge-reachable bind
-address still supports Podman callbacks.
+The option updates the gateway configuration with the Podman driver and its
+required bridge-reachable bind address; it does not install or start Podman.
+For a direct RPM transaction, configure the same settings before starting the
+service:
+
+```shell
+openshell-gateway config set \
+  --compute-driver podman \
+  --bind-address 0.0.0.0:17670
+```
 
 ### Network access
 
@@ -88,11 +94,11 @@ On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 
-> **Note:** The RPM default configuration binds to `0.0.0.0:17670` so
-> Podman sandbox containers can reach the gateway over the host network
-> bridge. Mutual TLS (mTLS) is enabled automatically on first start,
-> requiring a valid client certificate for every connection. See
-> CONFIGURATION.md for details.
+> **Note:** The RPM default configuration binds to `127.0.0.1:17670` to avoid
+> exposing the gateway on host network interfaces. Driver auto-detection does
+> not widen the listener. Configure Podman as shown above before creating
+> Podman-backed sandboxes. Mutual TLS (mTLS) is enabled automatically on first
+> start. See CONFIGURATION.md for details.
 
 Verify the service is running:
 

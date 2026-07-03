@@ -13,21 +13,22 @@ The RPM ships a default TOML configuration template at
 `openshell-gateway.service`, the systemd unit copies this template to
 `~/.config/openshell/gateway.toml` if no config file exists there yet.
 
-The default keeps the bind address required by rootless Podman while leaving
-compute driver selection automatic:
+The default keeps the listener on loopback while leaving compute driver
+selection automatic:
 
 ```toml
 [openshell]
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
+bind_address = "127.0.0.1:17670"
 ```
 
-`bind_address = "0.0.0.0:17670"` is required because Podman sandbox
-containers reach the gateway over the host network bridge and cannot
-connect to `127.0.0.1` inside the gateway's network namespace. mTLS is
-enabled by default and protects all connections.
+The loopback default avoids exposing the gateway on host network interfaces.
+Rootless Podman sandbox containers cannot reach host loopback from their
+network namespace. Select Podman through `install.sh --compute-driver podman`
+or configure both `compute_drivers = ["podman"]` and
+`bind_address = "0.0.0.0:17670"` before creating Podman-backed sandboxes.
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then a
 reachable Podman socket, then Docker. Set `compute_drivers = ["docker"]` or
@@ -89,7 +90,7 @@ systemctl --user edit openshell-gateway
 
 The RPM enables mutual TLS by default. The gateway requires a valid
 client certificate for all API connections and listens on
-`0.0.0.0:17670` by default (see "Default configuration" above).
+`127.0.0.1:17670` by default (see "Default configuration" above).
 
 ### Auto-generated certificates
 
@@ -239,7 +240,7 @@ overrides that persist across package upgrades.
 
 | TOML option | Default | Description |
 |-------------|---------|-------------|
-| `bind_address` | `0.0.0.0:17670` (RPM default) | Address for the gRPC/HTTP API. |
+| `bind_address` | `127.0.0.1:17670` | Address for the gRPC/HTTP API. Rootless Podman requires `0.0.0.0:17670`. |
 | `compute_drivers` | unset | The gateway auto-detects Kubernetes, then a reachable Podman socket, then Docker. VM requires explicit selection. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |

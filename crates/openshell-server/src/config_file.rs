@@ -622,7 +622,7 @@ version = 2
     }
 
     /// Contract test: the RPM default config template must parse against the
-    /// current schema and must retain the settings that Podman deployments require.
+    /// current schema and must retain the safe package defaults.
     ///
     /// This test loads `deploy/rpm/gateway.toml.default` through the same
     /// `load()` path that the gateway uses at runtime, catching:
@@ -641,9 +641,8 @@ version = 2
             .bind_address
             .expect("bind_address must be explicitly set in the RPM default config");
         assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
+            addr.ip().is_loopback(),
+            "RPM default bind_address must remain loopback-only, got {addr}"
         );
         assert_eq!(
             addr.port(),

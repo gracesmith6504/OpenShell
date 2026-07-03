@@ -97,10 +97,9 @@ TLS.
 
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
-    address is **0.0.0.0** (the RPM default), disabling TLS exposes the
-    API to the entire network without authentication. Only use when the
-    gateway sits behind a TLS-terminating reverse proxy, or restrict
-    **--bind-address** to **127.0.0.1**.
+    address is **0.0.0.0**, disabling TLS exposes the API to the entire
+    network without authentication. Only use when the gateway sits behind a
+    TLS-terminating reverse proxy. The RPM default is **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
 
 **--server-san** *SAN*

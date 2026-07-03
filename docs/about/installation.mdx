@@ -32,7 +32,8 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 Supported values are `docker`, `podman`, and `vm`. Podman selection also makes
 the gateway listener reachable from rootless containers. Docker and VM
 selection keep the listener on loopback. Omit the option to retain automatic
-driver selection. Set
+driver selection and the package's loopback listener; on RPM installations,
+select Podman explicitly so sandbox callbacks can reach the gateway. Set
 `OPENSHELL_INSTALL_COMPUTE_DRIVER` instead when an environment variable is more
 convenient; the command-line option takes precedence.
 
