@@ -35,7 +35,7 @@ assert_glibc_preflight_fails() {
     exit 1
   fi
 
-  if ! grep -Fq "$expected" "$err"; then
+  if ! grep -Fq -- "$expected" "$err"; then
     echo "FAIL: ${name}: missing expected message" >&2
     echo "Expected: ${expected}" >&2
     echo "Actual:" >&2
@@ -81,7 +81,89 @@ assert_gateway_failure() {
     "OpenShell remains installed" \
     "install and start Docker or Podman" \
     "install openshell-driver-vm and explicitly configure compute_drivers = [\"vm\"]"; do
-    if ! grep -Fq "$expected" "$err"; then
+    if ! grep -Fq -- "$expected" "$err"; then
+      echo "FAIL: ${name}: missing expected message: ${expected}" >&2
+      cat "$err" >&2 || true
+      exit 1
+    fi
+  done
+}
+
+assert_driver_parse() {
+  local name=$1
+  local env_driver=$2
+  local expected=$3
+  shift 3
+
+  if ! (
+    INSTALL_COMPUTE_DRIVER="$env_driver"
+    parse_install_args "$@"
+    [ "$INSTALL_COMPUTE_DRIVER" = "$expected" ]
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${name}" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+}
+
+assert_driver_parse_fails() {
+  local name=$1
+  local expected=$2
+  shift 2
+
+  if (INSTALL_COMPUTE_DRIVER=""; parse_install_args "$@") >"$out" 2>"$err"; then
+    echo "FAIL: ${name}: expected failure" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$expected" "$err"; then
+    echo "FAIL: ${name}: missing expected message: ${expected}" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+}
+
+assert_driver_configuration() {
+  local name=$1
+  local driver=$2
+  local expected=$3
+
+  if ! (
+    INSTALL_COMPUTE_DRIVER="$driver"
+    OPENSHELL_GATEWAY_BIN="/test/bin/openshell-gateway"
+    as_target_user() {
+      printf '%s\n' "$*" >"$out"
+    }
+    configure_gateway_compute_driver
+  ) 2>"$err"; then
+    echo "FAIL: ${name}" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+  if ! grep -Fxq "$expected" "$out"; then
+    echo "FAIL: ${name}: unexpected config command" >&2
+    echo "Expected: ${expected}" >&2
+    echo "Actual:" >&2
+    cat "$out" >&2 || true
+    exit 1
+  fi
+}
+
+assert_driver_prerequisite_notice() {
+  local name=$1
+  local driver=$2
+  local expected_warning=$3
+  local expected_url=$4
+
+  if ! (
+    INSTALL_COMPUTE_DRIVER="$driver"
+    print_compute_driver_prerequisite_notice
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${name}" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+  for expected in "$expected_warning" "$expected_url"; do
+    if ! grep -Fq -- "$expected" "$err"; then
       echo "FAIL: ${name}: missing expected message: ${expected}" >&2
       cat "$err" >&2 || true
       exit 1
@@ -144,6 +226,80 @@ assert_glibc_preflight_fails \
   "ldd musl fallback fails" \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
+
+assert_driver_parse \
+  "compute-driver flag selects podman" \
+  "" \
+  podman \
+  --compute-driver podman
+
+assert_driver_parse \
+  "compute-driver flag overrides environment" \
+  podman \
+  docker \
+  --compute-driver=docker
+
+assert_driver_parse \
+  "compute-driver environment is preserved without flag" \
+  vm \
+  vm
+
+assert_driver_parse_fails \
+  "compute-driver rejects unsupported values" \
+  "unsupported compute driver 'containerd'" \
+  --compute-driver containerd
+
+if (INSTALL_COMPUTE_DRIVER="containerd"; parse_install_args) >"$out" 2>"$err"; then
+  echo "FAIL: compute-driver rejects unsupported environment value: expected failure" >&2
+  exit 1
+fi
+if ! grep -Fq -- "unsupported compute driver 'containerd'" "$err"; then
+  echo "FAIL: compute-driver rejects unsupported environment value: missing expected message" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
+assert_driver_parse_fails \
+  "compute-driver rejects kubernetes for local installs" \
+  "use the OpenShell Helm chart" \
+  --compute-driver kubernetes
+
+assert_driver_parse_fails \
+  "compute-driver requires a value" \
+  "--compute-driver requires a value" \
+  --compute-driver
+
+assert_driver_configuration \
+  "podman selection configures bridge-reachable binding" \
+  podman \
+  "/test/bin/openshell-gateway config set --compute-driver podman --bind-address 0.0.0.0:17670"
+
+assert_driver_configuration \
+  "docker selection configures loopback binding" \
+  docker \
+  "/test/bin/openshell-gateway config set --compute-driver docker --bind-address 127.0.0.1:17670"
+
+assert_driver_configuration \
+  "vm selection configures loopback binding" \
+  vm \
+  "/test/bin/openshell-gateway config set --compute-driver vm --bind-address 127.0.0.1:17670"
+
+assert_driver_configuration \
+  "auto selection removes only the driver pin" \
+  auto \
+  "/test/bin/openshell-gateway config set --compute-driver auto"
+
+assert_driver_prerequisite_notice \
+  "docker selection prints prerequisite guidance" \
+  docker \
+  "Docker is not installed or managed by the OpenShell installer" \
+  "https://docs.docker.com/engine/install/"
+
+assert_driver_prerequisite_notice \
+  "podman selection prints prerequisite guidance" \
+  podman \
+  "Podman is not installed or managed by the OpenShell installer" \
+  "https://podman.io/docs/installation"
 
 assert_gateway_failure \
   "systemd enable failure is actionable" \

@@ -51,7 +51,16 @@ The gateway never auto-detects VM support.
 
 ### Customizing the configuration
 
-Edit `~/.config/openshell/gateway.toml` directly. The template at
+Use the gateway config command to select a driver or update the listener:
+
+```shell
+openshell-gateway config set --compute-driver docker --bind-address 127.0.0.1:17670
+systemctl --user restart openshell-gateway
+```
+
+Use `--compute-driver auto` to remove an existing driver pin. The command
+preserves comments and unrelated settings. You can also edit
+`~/.config/openshell/gateway.toml` directly. The template at
 `/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
 and is not overwritten by RPM upgrades.
 

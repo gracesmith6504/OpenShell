@@ -56,6 +56,18 @@ socket activation:
 systemctl --user enable --now podman.socket
 ```
 
+When using `install.sh`, you can select Podman explicitly after completing
+these prerequisites:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
+```
+
+The option updates the gateway configuration; it does not install or start
+Podman. The option is not required on RPM installations: without it, the
+gateway keeps automatic driver selection and the RPM's bridge-reachable bind
+address still supports Podman callbacks.
+
 ### Network access
 
 The gateway pulls container images from ghcr.io on first sandbox

@@ -448,6 +448,13 @@ Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
 
+`openshell-gateway config set` provides typed, comment-preserving updates for
+installer- and operator-managed settings. It resolves the same explicit or XDG
+config path as gateway startup, validates the complete document, and replaces
+it atomically. Installers persist driver choices through this interface instead
+of adding service environment overrides, which would take precedence over
+later TOML edits.
+
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 

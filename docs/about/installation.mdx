@@ -20,6 +20,22 @@ The script detects your operating system and installs the OpenShell CLI and gate
 
 OpenShell packages do not have a hard dependency on Docker or Podman. A direct package-manager installation can therefore finish without a usable compute runtime. When `install.sh` cannot start the gateway, it prints service diagnostics and runtime recovery steps, exits nonzero, and leaves OpenShell installed.
 
+To select a driver during a Debian, RPM, or Homebrew installation, pass
+`--compute-driver`. Install and start the selected runtime before running the
+installer; this option configures OpenShell but does not install or manage the
+runtime.
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
+```
+
+Supported values are `docker`, `podman`, `vm`, and `auto`. Podman selection
+also makes the gateway listener reachable from rootless containers. Docker and
+VM selection keep the listener on loopback. `auto` removes an existing driver
+pin so the gateway can detect a runtime. Set
+`OPENSHELL_INSTALL_COMPUTE_DRIVER` instead when an environment variable is more
+convenient; the command-line option takes precedence.
+
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
 Use `openshell status` to confirm the CLI can reach the gateway.

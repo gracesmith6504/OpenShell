@@ -27,6 +27,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_edit;
 pub mod config_file;
 mod defaults;
 mod grpc;

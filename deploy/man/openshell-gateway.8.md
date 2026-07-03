@@ -14,6 +14,9 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway config set** \[*--config PATH*\]
+\[*--compute-driver DRIVER*\] \[*--bind-address IP:PORT*\]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -110,6 +113,23 @@ TLS.
 Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
+
+# CONFIG SUBCOMMAND
+
+**openshell-gateway config set** updates the gateway TOML file without
+discarding comments or unrelated settings. It creates the default XDG config
+file when needed, validates the complete result, and replaces the file
+atomically.
+
+**--compute-driver** *DRIVER*
+:   Persist one compute driver. Use **auto** to remove the existing driver pin.
+
+**--bind-address** *IP:PORT*
+:   Persist the gateway listener socket address.
+
+**--config** *PATH*
+:   Update a specific gateway TOML file instead of the default XDG location.
+    Environment: **OPENSHELL_GATEWAY_CONFIG**.
 
 # SYSTEMD INTEGRATION
 
