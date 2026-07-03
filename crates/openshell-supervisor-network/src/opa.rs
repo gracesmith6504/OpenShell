@@ -227,6 +227,7 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
 
+        // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {
             openshell_ocsf::ocsf_emit!(
@@ -272,27 +273,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -342,27 +323,7 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -552,27 +513,7 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -630,27 +571,7 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -1711,7 +1632,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 "middleware": mw.middleware,
             });
             if let Some(config) = &mw.config {
-                value["config"] = prost_struct_to_json(config);
+                value["config"] = openshell_core::proto_struct::struct_to_json_value(config);
             }
             if !mw.on_error.is_empty() {
                 value["on_error"] = mw.on_error.clone().into();
@@ -1738,32 +1659,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         "network_middlewares": network_middlewares,
     })
     .to_string()
-}
-
-fn prost_struct_to_json(config: &prost_types::Struct) -> serde_json::Value {
-    serde_json::Value::Object(
-        config
-            .fields
-            .iter()
-            .map(|(key, value)| (key.clone(), prost_value_to_json(value)))
-            .collect(),
-    )
-}
-
-fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
-        Some(prost_types::value::Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
-        Some(prost_types::value::Kind::NumberValue(value)) => serde_json::Number::from_f64(*value)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(prost_types::value::Kind::StringValue(value)) => {
-            serde_json::Value::String(value.clone())
-        }
-        Some(prost_types::value::Kind::ListValue(value)) => {
-            serde_json::Value::Array(value.values.iter().map(prost_value_to_json).collect())
-        }
-        Some(prost_types::value::Kind::StructValue(value)) => prost_struct_to_json(value),
-    }
 }
 
 #[cfg(test)]

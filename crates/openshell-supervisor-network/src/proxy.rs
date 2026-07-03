@@ -4225,7 +4225,7 @@ async fn handle_forward_proxy(
             &upstream_target,
             forward_request_bytes,
         )?;
-        forward_request_bytes = match crate::l7::relay::apply_middleware_chain_for_scheme(
+        forward_request_bytes = match crate::l7::middleware::apply_middleware_chain_for_scheme(
             request,
             client,
             &l7_ctx,
@@ -4236,8 +4236,8 @@ async fn handle_forward_proxy(
         )
         .await?
         {
-            crate::l7::relay::MiddlewareApplyResult::Allowed(request) => request.raw_header,
-            crate::l7::relay::MiddlewareApplyResult::Denied(reason) => {
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::middleware::MiddlewareApplyResult::Denied(reason) => {
                 emit_activity_simple(activity_tx, true, "middleware");
                 respond(
                     client,
