@@ -31,8 +31,8 @@ Package availability differs by installation method:
 
 | Installation | `openshell-driver-vm` availability |
 |---|---|
-| Debian/Ubuntu package | Included under `/usr/libexec/openshell`. |
-| Homebrew | Included under the formula's libexec directory. |
+| Debian/Ubuntu package | Included under `/usr/libexec/openshell`; the gateway searches this location automatically after you select VM. |
+| Homebrew | Included under the formula's libexec directory; the gateway searches the formula prefix automatically after you select VM. |
 | Fedora/RHEL RPM | Not included. Install the matching standalone release artifact in a conventional libexec directory or configure `driver_dir`. |
 | Snap | Not included. |
 
@@ -266,9 +266,8 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 ### Enable the VM Driver
 
-The VM driver is opt-in. Debian packages and Homebrew include
-`openshell-driver-vm`; RPM and Snap packages do not. The gateway does not select
-VM unless you configure the driver explicitly.
+The VM driver is opt-in. The gateway does not select VM unless you configure
+the driver explicitly, even when `openshell-driver-vm` is installed.
 
 Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
 
