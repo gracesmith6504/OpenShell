@@ -1648,39 +1648,9 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
         ));
     };
 
-    Ok(prost_types::Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-            .collect::<Result<_>>()?,
-    })
-}
-
-fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
-    use prost_types::{ListValue, Struct, Value, value::Kind};
-
-    let kind = match value {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
-            miette!("--driver-config-json contains a number that cannot be represented")
-        })?),
-        serde_json::Value::String(value) => Kind::StringValue(value),
-        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
-            values: values
-                .into_iter()
-                .map(json_to_protobuf_value)
-                .collect::<Result<_>>()?,
-        }),
-        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
-            fields: fields
-                .into_iter()
-                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-                .collect::<Result<_>>()?,
-        }),
-    };
-
-    Ok(Value { kind: Some(kind) })
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json contains a value that cannot be represented")
 }
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {

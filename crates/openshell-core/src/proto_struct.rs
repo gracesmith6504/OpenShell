@@ -1,9 +1,56 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Helpers for decoding `google.protobuf.Struct` values.
+//! Helpers for converting `google.protobuf.Struct` values to and from JSON.
 
 use serde::{Deserialize, Deserializer, de::Error as _};
+
+/// Errors converting JSON values into protobuf well-known types.
+#[derive(Debug, thiserror::Error)]
+pub enum ProtoStructError {
+    /// A JSON number cannot be represented by protobuf's double value.
+    #[error("JSON number {0} cannot be represented as a protobuf double")]
+    UnrepresentableNumber(serde_json::Number),
+}
+
+/// Convert a JSON object into a protobuf Struct.
+pub fn json_object_to_struct(
+    object: serde_json::Map<String, serde_json::Value>,
+) -> Result<prost_types::Struct, ProtoStructError> {
+    Ok(prost_types::Struct {
+        fields: object
+            .into_iter()
+            .map(|(key, value)| json_value_to_proto(value).map(|value| (key, value)))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Convert a JSON value into a protobuf Value.
+pub fn json_value_to_proto(
+    value: serde_json::Value,
+) -> Result<prost_types::Value, ProtoStructError> {
+    use prost_types::{ListValue, Value, value::Kind};
+
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(value) => Kind::BoolValue(value),
+        serde_json::Value::Number(value) => Kind::NumberValue(
+            value
+                .as_f64()
+                .ok_or_else(|| ProtoStructError::UnrepresentableNumber(value.clone()))?,
+        ),
+        serde_json::Value::String(value) => Kind::StringValue(value),
+        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
+            values: values
+                .into_iter()
+                .map(json_value_to_proto)
+                .collect::<Result<_, _>>()?,
+        }),
+        serde_json::Value::Object(object) => Kind::StructValue(json_object_to_struct(object)?),
+    };
+
+    Ok(Value { kind: Some(kind) })
+}
 
 /// Convert a protobuf Struct into a JSON object for typed serde decoding.
 #[must_use]
@@ -71,6 +118,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_and_proto_values_round_trip() {
+        let json = serde_json::json!({
+            "null": null,
+            "bool": true,
+            "number": 42.5,
+            "string": "value",
+            "list": [1.0, {"nested": "value"}],
+        });
+        let serde_json::Value::Object(object) = json.clone() else {
+            unreachable!();
+        };
+
+        let proto = json_object_to_struct(object).unwrap();
+
+        assert_eq!(struct_to_json_value(&proto), json);
+    }
 
     #[derive(Debug, Default, Deserialize)]
     #[serde(default)]
