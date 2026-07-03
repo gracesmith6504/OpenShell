@@ -1130,6 +1130,14 @@ mod tests {
     }
 
     #[test]
+    fn config_detect_driver_parses_without_runtime_arguments() {
+        let cli = Cli::try_parse_from(["openshell-gateway", "config", "detect-driver"])
+            .expect("config detect-driver should parse");
+
+        assert!(matches!(cli.command, Some(super::Commands::Config(_))));
+    }
+
+    #[test]
     fn bare_invocation_with_no_db_url_parses_for_runtime_defaults() {
         // db_url is Option<String> at the clap level so subcommand parsing
         // does not require it. The Run path fills a default URL from XDG

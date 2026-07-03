@@ -20,22 +20,19 @@ The script detects your operating system and installs the OpenShell CLI and gate
 
 OpenShell packages do not have a hard dependency on Docker or Podman. A direct package-manager installation can therefore finish without a usable compute runtime. When `install.sh` cannot start the gateway, it prints service diagnostics and runtime recovery steps, exits nonzero, and leaves OpenShell installed.
 
-To select a driver during a Debian, RPM, or Homebrew installation, pass
-`--compute-driver`. Install and start the selected runtime before running the
-installer; this option configures OpenShell but does not install or manage the
-runtime.
+After installing the package, `install.sh` asks the gateway binary to detect the
+available compute driver. Detection does not change the gateway configuration
+or listener address. If the gateway detects Podman, the installer prints the
+following command for rootless Podman users:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
+openshell-gateway config set --bind-address 0.0.0.0:17670
 ```
 
-Supported values are `docker`, `podman`, and `vm`. Podman selection also makes
-the gateway listener reachable from rootless containers. Docker and VM
-selection keep the listener on loopback. Omit the option to retain automatic
-driver selection and the package's loopback listener; on RPM installations,
-select Podman explicitly so sandbox callbacks can reach the gateway. Set
-`OPENSHELL_INSTALL_COMPUTE_DRIVER` instead when an environment variable is more
-convenient; the command-line option takes precedence.
+Rootless Podman containers cannot reach a gateway bound to host loopback. Run
+the command only when you use rootless Podman, then restart the gateway
+service. Docker and installations with no detected runtime retain the package's
+loopback listener. The command leaves driver selection automatic.
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 

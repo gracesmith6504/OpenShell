@@ -35,9 +35,18 @@ openshell-gateway config set --compute-driver docker
 systemctl --user restart openshell-gateway
 ```
 
-The Debian, RPM, and Homebrew installer also accepts `--compute-driver`. The
-installer configures the selected driver and its listener address, but it does
-not install or manage Docker, Podman, or the VM driver.
+The Debian, RPM, and Homebrew installer runs
+`openshell-gateway config detect-driver` after package installation. Detection
+does not change the gateway configuration. When Podman is detected, the
+installer tells rootless Podman users to select Podman and make the listener
+reachable through the host bridge:
+
+```shell
+openshell-gateway config set --bind-address 0.0.0.0:17670
+```
+
+Restart the gateway service after running the command. The installer does not
+pin the detected driver or install and manage Docker, Podman, or the VM driver.
 
 Package availability differs by installation method:
 

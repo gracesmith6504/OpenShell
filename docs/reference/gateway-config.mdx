@@ -31,6 +31,18 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 ## Update Configuration from the CLI
 
+Use `detect-driver` to run the same automatic driver detection as gateway
+startup:
+
+```shell
+openshell-gateway config detect-driver
+```
+
+The command prints one machine-readable value: `kubernetes`, `podman`,
+`docker`, or `none`. It checks drivers in that order and does not detect the
+opt-in VM driver. The command only inspects the current environment; it does
+not read or update the gateway configuration.
+
 Use `openshell-gateway config set` for typed updates to driver selection and
 the listener address:
 

@@ -14,6 +14,8 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway config detect-driver**
+
 **openshell-gateway config set** \[*--config PATH*\]
 \[*--compute-driver DRIVER*\] \[*--bind-address IP:PORT*\]
 
@@ -114,6 +116,11 @@ pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
 # CONFIG SUBCOMMAND
+
+**openshell-gateway config detect-driver** runs the same automatic driver
+detection as gateway startup and prints one value: **kubernetes**, **podman**,
+**docker**, or **none**. It does not detect the opt-in VM driver, read the
+gateway configuration, or change system state.
 
 **openshell-gateway config set** updates the gateway TOML file without
 discarding comments or unrelated settings. It creates the default XDG config

@@ -56,23 +56,17 @@ socket activation:
 systemctl --user enable --now podman.socket
 ```
 
-When using `install.sh`, select Podman explicitly after completing these
-prerequisites:
+The install script uses the gateway's automatic detection after installing the
+package. When it detects Podman, it prints the following command for rootless
+Podman users:
 
 ```shell
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
+openshell-gateway config set --bind-address 0.0.0.0:17670
 ```
 
-The option updates the gateway configuration with the Podman driver and its
-required bridge-reachable bind address; it does not install or start Podman.
-For a direct RPM transaction, configure the same settings before starting the
-service:
-
-```shell
-openshell-gateway config set \
-  --compute-driver podman \
-  --bind-address 0.0.0.0:17670
-```
+The installer does not apply the command, pin the auto-detected driver, or
+install and start Podman. For a direct RPM transaction, run it before starting
+Podman-backed sandboxes.
 
 ### Network access
 

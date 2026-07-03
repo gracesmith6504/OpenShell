@@ -20,8 +20,8 @@ version = 1
 [openshell.gateway]
 # Listen on loopback by default. Rootless Podman requires an explicit
 # 0.0.0.0:17670 bind so sandbox containers can reach the gateway through the
-# host bridge. Use install.sh --compute-driver podman or update this setting
-# with openshell-gateway config set before starting Podman-backed sandboxes.
+# host bridge. Update this setting with openshell-gateway config set before
+# starting Podman-backed sandboxes.
 bind_address = "127.0.0.1:17670"
 
 # The gateway auto-detects Kubernetes, then a reachable Podman socket, then

@@ -23,6 +23,8 @@ pub struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Detect the compute driver available in the current environment.
+    DetectDriver,
     /// Update selected fields in the gateway TOML configuration.
     Set(SetArgs),
 }
@@ -45,13 +47,25 @@ struct SetArgs {
 }
 
 pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
-    let path = explicit_path.map_or_else(defaults::default_gateway_config_path, Ok)?;
     match args.command {
-        ConfigCommand::Set(settings) => set(&path, &settings)?,
+        ConfigCommand::DetectDriver => {
+            println!(
+                "{}",
+                detected_driver_name(openshell_core::config::detect_driver())
+            );
+        }
+        ConfigCommand::Set(settings) => {
+            let path = explicit_path.map_or_else(defaults::default_gateway_config_path, Ok)?;
+            set(&path, &settings)?;
+            println!("updated gateway configuration: {}", path.display());
+            println!("Restart the gateway service for changes to take effect.");
+        }
     }
-    println!("updated gateway configuration: {}", path.display());
-    println!("Restart the gateway service for changes to take effect.");
     Ok(())
+}
+
+fn detected_driver_name(driver: Option<openshell_core::ComputeDriverKind>) -> &'static str {
+    driver.map_or("none", openshell_core::ComputeDriverKind::as_str)
 }
 
 fn set(path: &Path, settings: &SetArgs) -> Result<()> {
@@ -161,6 +175,19 @@ mod tests {
             compute_driver: driver.map(str::to_string),
             gateway_bind_address: bind_address.map(|value| value.parse().unwrap()),
         }
+    }
+
+    #[test]
+    fn detect_driver_output_is_machine_readable() {
+        assert_eq!(
+            detected_driver_name(Some(openshell_core::ComputeDriverKind::Podman)),
+            "podman"
+        );
+        assert_eq!(
+            detected_driver_name(Some(openshell_core::ComputeDriverKind::Docker)),
+            "docker"
+        );
+        assert_eq!(detected_driver_name(None), "none");
     }
 
     #[test]

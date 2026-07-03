@@ -21,7 +21,6 @@ HOMEBREW_FORMULA_NAME="openshell"
 BREAKING_RELEASE_VERSION="0.0.37"
 LINUX_PACKAGE_GLIBC_MIN_VERSION="2.28"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
-INSTALL_COMPUTE_DRIVER="${OPENSHELL_INSTALL_COMPUTE_DRIVER:-}"
 
 info() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -47,9 +46,6 @@ USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
 OPTIONS:
-    --compute-driver DRIVER
-                 Persist the gateway compute driver: docker, podman, or vm.
-                 Install the required runtime or driver separately.
     --help       Print this help message.
 
 ENVIRONMENT VARIABLES:
@@ -58,10 +54,6 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 installation.
-    OPENSHELL_INSTALL_COMPUTE_DRIVER
-                        Same as --compute-driver. The command-line option
-                        takes precedence when both are set.
-
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
@@ -71,54 +63,6 @@ NOTES:
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
-}
-
-parse_install_args() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --compute-driver)
-        [ "$#" -ge 2 ] || error "--compute-driver requires a value"
-        INSTALL_COMPUTE_DRIVER="$2"
-        shift 2
-        ;;
-      --compute-driver=*)
-        INSTALL_COMPUTE_DRIVER="${1#*=}"
-        [ -n "$INSTALL_COMPUTE_DRIVER" ] || error "--compute-driver requires a value"
-        shift
-        ;;
-      --help)
-        usage
-        exit 0
-        ;;
-      *)
-        error "unknown option: $1"
-        ;;
-    esac
-  done
-
-  case "$INSTALL_COMPUTE_DRIVER" in
-    "" | docker | podman | vm)
-      ;;
-    kubernetes)
-      error "--compute-driver kubernetes is not supported by the local installer; use the OpenShell Helm chart"
-      ;;
-    *)
-      error "unsupported compute driver '${INSTALL_COMPUTE_DRIVER}'; expected docker, podman, or vm"
-      ;;
-  esac
-}
-
-print_compute_driver_prerequisite_notice() {
-  case "$INSTALL_COMPUTE_DRIVER" in
-    docker)
-      warn "Docker is not installed or managed by the OpenShell installer. Install and start Docker before the gateway starts."
-      info "Docker installation instructions: https://docs.docker.com/engine/install/"
-      ;;
-    podman)
-      warn "Podman is not installed or managed by the OpenShell installer. Install Podman and start its API socket before the gateway starts."
-      info "Podman installation instructions: https://podman.io/docs/installation"
-      ;;
-  esac
 }
 
 has_cmd() {
@@ -737,22 +681,25 @@ patch_homebrew_formula() {
 
 }
 
-configure_gateway_compute_driver() {
-  [ -n "$INSTALL_COMPUTE_DRIVER" ] || return 0
-
+report_detected_compute_driver() {
   _gateway_bin="${OPENSHELL_GATEWAY_BIN:-openshell-gateway}"
-  set -- "$_gateway_bin" config set --compute-driver "$INSTALL_COMPUTE_DRIVER"
-  case "$INSTALL_COMPUTE_DRIVER" in
+  if ! _detected_driver="$(as_target_user "$_gateway_bin" config detect-driver)"; then
+    warn "could not detect an available compute driver; the gateway will report runtime errors when it starts"
+    return 0
+  fi
+
+  case "$_detected_driver" in
     podman)
-      set -- "$@" --bind-address "0.0.0.0:${LOCAL_GATEWAY_PORT}"
+      warn "Podman was auto-detected. If you use rootless Podman, configure the gateway to listen on the host bridge:"
+      info "openshell-gateway config set --bind-address 0.0.0.0:${LOCAL_GATEWAY_PORT}"
+      info "Restart the gateway service for changes to take effect."
       ;;
-    docker | vm)
-      set -- "$@" --bind-address "127.0.0.1:${LOCAL_GATEWAY_PORT}"
+    kubernetes | docker | none)
+      ;;
+    *)
+      warn "gateway returned an unexpected detected compute driver: ${_detected_driver}"
       ;;
   esac
-
-  info "configuring gateway compute driver: ${INSTALL_COMPUTE_DRIVER}"
-  as_target_user "$@"
 }
 
 start_user_gateway() {
@@ -988,7 +935,7 @@ install_linux_deb() {
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
   info "installed ${APP_NAME} package from ${RELEASE_TAG}"
-  configure_gateway_compute_driver
+  report_detected_compute_driver
   start_user_gateway
 }
 
@@ -1036,7 +983,7 @@ install_linux_rpm() {
   info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
   install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
   info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
-  configure_gateway_compute_driver
+  report_detected_compute_driver
   start_user_gateway
 }
 
@@ -1079,7 +1026,7 @@ install_macos_homebrew() {
   if [ -n "$_brew_prefix" ]; then
     OPENSHELL_GATEWAY_BIN="${_brew_prefix}/bin/openshell-gateway"
   fi
-  configure_gateway_compute_driver
+  report_detected_compute_driver
   restart_homebrew_gateway "$_formula_ref"
 
   if [ -n "$_brew_prefix" ] && [ -x "${_brew_prefix}/bin/openshell" ]; then
@@ -1102,8 +1049,17 @@ restart_homebrew_gateway() {
 }
 
 main() {
-  parse_install_args "$@"
-  print_compute_driver_prerequisite_notice
+  if [ "$#" -gt 0 ]; then
+    case "$1" in
+      --help)
+        usage
+        exit 0
+        ;;
+      *)
+        error "unknown option: $1"
+        ;;
+    esac
+  fi
 
   require_cmd curl
   RELEASE_TAG="$(resolve_release_tag)"
