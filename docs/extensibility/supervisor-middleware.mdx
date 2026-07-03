@@ -120,6 +120,7 @@ When the effective sandbox configuration changes, a running supervisor validates
 Middleware activity is emitted through OpenShell's OCSF logging:
 
 - Each invocation records its policy-local middleware name, binding, decision, transformation state, and failure state.
+- A denied invocation records the service-provided audit-safe reason without request content, configured terms, credentials, or other secrets.
 - A bypass under `fail_open` emits a detection finding.
 - A required stage that fails closed emits a high-severity detection finding.
 - Findings include the service-provided type and label plus aggregate counts. Middleware services should keep those fields audit-safe and omit request content or matched values.

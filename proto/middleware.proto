@@ -148,7 +148,9 @@ message Finding {
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Human-readable reason used for diagnostics and denied responses.
+  // Audit-safe human-readable reason used for diagnostics, denied responses,
+  // and security logs. Must not contain request content, configured terms,
+  // credentials, or other secrets.
   string reason = 2;
   // Replacement request body when has_body is true.
   bytes body = 3;

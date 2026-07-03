@@ -1000,7 +1000,7 @@ fn middleware_events(
     let mut events = Vec::new();
     for invocation in &outcome.applied {
         let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        let mut event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .action(if allowed {
                 ActionId::Allowed
@@ -1030,8 +1030,13 @@ fn middleware_events(
                 invocation.decision,
                 invocation.transformed,
                 invocation.failed
-            ))
-            .build();
+            ));
+        if !allowed && !outcome.reason.is_empty() {
+            event = event
+                .status(StatusId::Failure)
+                .status_detail(&outcome.reason);
+        }
+        let event = event.build();
         events.push(event);
 
         // A middleware that failed but was bypassed under `fail_open` is an
@@ -3381,6 +3386,37 @@ network_policies:
         );
         // Safe finding metadata is still present.
         assert!(serialized.contains("secret.common"));
+
+        let denied_outcome = ChainOutcome {
+            allowed: false,
+            reason: "request matched configured policy".into(),
+            body: Vec::new(),
+            added_headers: BTreeMap::new(),
+            findings: Vec::new(),
+            metadata: BTreeMap::new(),
+            applied: vec![MiddlewareInvocation {
+                name: "content-guard".into(),
+                implementation: "example/content-guard".into(),
+                decision: openshell_core::proto::Decision::Deny,
+                transformed: false,
+                failed: false,
+            }],
+        };
+        let denied_events = middleware_events(&ctx, &req, &denied_outcome);
+        let denied_http = denied_events
+            .iter()
+            .find(|event| event.class_uid() == 4002)
+            .expect("expected denied HTTP Activity event");
+        assert_eq!(
+            denied_http.base().status_detail.as_deref(),
+            Some("request matched configured policy")
+        );
+        assert_eq!(
+            denied_http.format_shorthand(),
+            "HTTP:POST [MED] DENIED POST http://api.example.test:443/v1/messages \
+             [policy:rest_api engine:middleware] \
+             [transformed:false failed:false reason:request matched configured policy]"
+        );
     }
 
     #[tokio::test]

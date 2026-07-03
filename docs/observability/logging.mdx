@@ -133,7 +133,7 @@ OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy
 A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
 
 ```text
-OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware transformed:true failed:false]
+OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [transformed:true failed:false]
 OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match middleware:prototype-content-guard count:1]
 ```
 
@@ -166,6 +166,8 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 ## Denial Reasons
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
+
+For supervisor middleware denials, `status_detail` contains the service-provided audit-safe reason from the gRPC response.
 
 Common reason phrases emitted by the sandbox include:
 

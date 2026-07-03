@@ -97,22 +97,20 @@ fn truncate_with_ellipsis(text: &str, max: usize) -> String {
     format!("{}...", &text[..end])
 }
 
-/// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
-/// for denied events.  Returns an empty string if neither field is set.
-fn reason_tag(base: &BaseEventData) -> String {
-    let text = base
-        .status_detail
-        .as_deref()
-        .or(base.message.as_deref())
-        .unwrap_or("");
+fn reason_text(text: Option<&str>) -> Option<String> {
+    let text = text?;
     if text.is_empty() {
-        return String::new();
+        return None;
     }
     let text = text.replace(['\n', '\r'], " ");
-    format!(
-        " [reason:{}]",
-        truncate_with_ellipsis(&text, MAX_REASON_LEN)
-    )
+    Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
+}
+
+/// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
+/// for denied events. Returns an empty string if neither field is set.
+fn reason_tag(base: &BaseEventData) -> String {
+    reason_text(base.status_detail.as_deref().or(base.message.as_deref()))
+        .map_or_else(String::new, |text| format!(" [reason:{text}]"))
 }
 
 fn message_tag(base: &BaseEventData) -> String {
@@ -210,35 +208,37 @@ impl OcsfEvent {
                     .and_then(|r| r.url.as_ref())
                     .map(Url::to_display_string)
                     .unwrap_or_default();
-                let transformed = e
+                let is_middleware = e
                     .firewall_rule
                     .as_ref()
-                    .filter(|rule| rule.rule_type == "middleware")
-                    .and_then(|_| message_bool_value(e.base.message.as_deref(), "transformed"));
-                let failed = e
-                    .firewall_rule
-                    .as_ref()
-                    .filter(|rule| rule.rule_type == "middleware")
-                    .and_then(|_| message_bool_value(e.base.message.as_deref(), "failed"));
+                    .is_some_and(|rule| rule.rule_type == "middleware");
                 let rule_ctx = e
                     .firewall_rule
                     .as_ref()
-                    .map(|r| {
-                        let mut context = vec![
-                            format!("policy:{}", r.name),
-                            format!("engine:{}", r.rule_type),
-                        ];
-                        if let Some(value) = transformed {
-                            context.push(format!("transformed:{value}"));
-                        }
-                        if let Some(value) = failed {
-                            context.push(format!("failed:{value}"));
-                        }
-                        format!(" [{}]", context.join(" "))
-                    })
+                    .map(|r| format!(" [policy:{} engine:{}]", r.name, r.rule_type))
                     .unwrap_or_default();
-                // For denied events, surface the reason from status_detail
-                let reason_ctx = if action == "DENIED" {
+                let outcome_ctx = if is_middleware {
+                    let mut context = Vec::new();
+                    if let Some(value) =
+                        message_bool_value(e.base.message.as_deref(), "transformed")
+                    {
+                        context.push(format!("transformed:{value}"));
+                    }
+                    if let Some(value) = message_bool_value(e.base.message.as_deref(), "failed") {
+                        context.push(format!("failed:{value}"));
+                    }
+                    if action == "DENIED"
+                        && let Some(reason) = reason_text(e.base.status_detail.as_deref())
+                    {
+                        // Keep the free-form reason last so the preceding fields remain easy to parse.
+                        context.push(format!("reason:{reason}"));
+                    }
+                    if context.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", context.join(" "))
+                    }
+                } else if action == "DENIED" {
                     reason_tag(&e.base)
                 } else {
                     String::new()
@@ -255,7 +255,7 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                format!("HTTP:{method} {sev}{detail}{rule_ctx}{reason_ctx}")
+                format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}")
             }
 
             Self::SshActivity(e) => {
@@ -608,7 +608,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware transformed:false failed:true]"
+            "HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [transformed:false failed:true]"
         );
     }
 
