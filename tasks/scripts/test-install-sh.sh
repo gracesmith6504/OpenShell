@@ -44,6 +44,51 @@ assert_glibc_preflight_fails() {
   fi
 }
 
+assert_gateway_failure() {
+  local name=$1
+  local platform=$2
+  local action=$3
+
+  if (
+    export PLATFORM="$platform"
+    TARGET_USER="test-user"
+    TARGET_HOME="${tmpdir}/home"
+
+    as_target_user() {
+      if [ "$*" = "$action" ]; then
+        return 1
+      fi
+      return 0
+    }
+    dump_local_gateway_diagnostics() {
+      echo "TEST gateway diagnostics" >&2
+    }
+    register_local_gateway() { return 0; }
+    wait_for_local_gateway_listener() { return 0; }
+    wait_for_local_gateway_status() { return 0; }
+
+    case "$platform" in
+      linux) start_user_gateway ;;
+      darwin) restart_homebrew_gateway "${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}" ;;
+    esac
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: ${name}: expected failure" >&2
+    exit 1
+  fi
+
+  for expected in \
+    "TEST gateway diagnostics" \
+    "OpenShell remains installed" \
+    "install and start Docker or Podman" \
+    "install openshell-driver-vm and explicitly configure compute_drivers = [\"vm\"]"; do
+    if ! grep -Fq "$expected" "$err"; then
+      echo "FAIL: ${name}: missing expected message: ${expected}" >&2
+      cat "$err" >&2 || true
+      exit 1
+    fi
+  done
+}
+
 setup_glibc_227() {
   export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
   export OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.27"
@@ -100,4 +145,24 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
-echo "install.sh libc preflight tests passed"
+assert_gateway_failure \
+  "systemd enable failure is actionable" \
+  linux \
+  "systemctl --user enable openshell-gateway"
+
+assert_gateway_failure \
+  "systemd restart failure is actionable" \
+  linux \
+  "systemctl --user restart openshell-gateway"
+
+assert_gateway_failure \
+  "inactive systemd service is actionable" \
+  linux \
+  "systemctl --user is-active --quiet openshell-gateway"
+
+assert_gateway_failure \
+  "Homebrew restart failure is actionable" \
+  darwin \
+  "brew services restart ${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}"
+
+echo "install.sh tests passed"

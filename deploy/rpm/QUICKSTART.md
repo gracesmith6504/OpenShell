@@ -4,10 +4,19 @@ Get from `dnf install` to a running sandbox in five minutes.
 
 ## Prerequisites
 
-### Podman (rootless)
+### Container runtime
 
-The gateway uses rootless Podman for sandbox containers. Verify
-Podman is installed and the cgroup version is v2:
+Install and start either Docker or Podman before starting the gateway. The RPM
+does not install a container runtime. When `compute_drivers` is unset, the
+gateway selects a reachable Podman socket first, then Docker.
+
+For Docker, verify that the daemon is running:
+
+```shell
+docker info
+```
+
+For rootless Podman, verify Podman is installed and the cgroup version is v2:
 
 ```shell
 podman --version
@@ -22,7 +31,9 @@ sudo grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=1"
 sudo reboot
 ```
 
-### Subordinate UID/GID ranges
+The following subordinate ID and socket steps apply only to rootless Podman.
+
+### Subordinate UID/GID ranges (Podman)
 
 Rootless containers require subordinate UID/GID mappings:
 
@@ -50,8 +61,8 @@ systemctl --user enable --now podman.socket
 The gateway pulls container images from ghcr.io on first sandbox
 creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
 
-For air-gapped environments, pre-load images with `podman pull` and
-set `image_pull_policy = "never"` in
+For air-gapped environments, pre-load images with `docker pull` or
+`podman pull` and set the selected driver's `image_pull_policy = "never"` in
 `~/.config/openshell/gateway.toml`. See CONFIGURATION.md for
 details.
 
@@ -76,6 +87,12 @@ Verify the service is running:
 ```shell
 systemctl --user status openshell-gateway
 ```
+
+If neither Docker nor Podman is usable, the service exits and the journal
+reports that no compute driver is available. The RPM remains installed. Install
+and start a container runtime, then restart the service. The VM driver is a
+separate release artifact and must be installed and selected explicitly; see
+CONFIGURATION.md.
 
 ## Register the gateway with the CLI
 

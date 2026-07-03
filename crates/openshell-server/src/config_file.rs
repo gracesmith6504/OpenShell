@@ -618,15 +618,15 @@ version = 2
     }
 
     /// Contract test: the RPM default config template must parse against the
-    /// current schema and must pin the settings that Podman deployments require.
+    /// current schema and must retain the settings that Podman deployments require.
     ///
     /// This test loads `deploy/rpm/gateway.toml.default` through the same
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental changes to the bind address or runtime-neutral driver selection
     #[test]
-    fn rpm_default_config_parses_and_has_podman_defaults() {
+    fn rpm_default_config_parses_and_auto_detects_compute_driver() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/rpm/gateway.toml.default");
         let config =
@@ -648,15 +648,10 @@ version = 2
             openshell_core::config::DEFAULT_SERVER_PORT
         );
 
-        let drivers = gw
-            .compute_drivers
-            .as_ref()
-            .expect("compute_drivers must be explicitly set in the RPM default config");
-        assert_eq!(
-            drivers,
-            &["podman".to_string()],
-            "RPM default must pin compute_drivers to [podman] to prevent unexpected \
-             driver selection when Docker is also installed"
+        assert!(
+            gw.compute_drivers.is_none(),
+            "RPM default must leave compute_drivers unset so the gateway auto-detects \
+             an available local runtime"
         );
     }
 }

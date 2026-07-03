@@ -29,6 +29,19 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
+When `compute_drivers` is unset, package-managed gateways auto-detect
+Kubernetes, then a reachable Podman socket, then Docker. The RPM service seeds
+a TOML file only to retain its `0.0.0.0:17670` callback address; it leaves
+driver selection unset. Existing RPM configuration files are not overwritten
+on upgrade, so remove an old `compute_drivers = ["podman"]` entry to opt into
+automatic Podman/Docker selection.
+
+The VM driver is never auto-detected. Debian packages and Homebrew include the
+driver binary. RPM and Snap do not; RPM users must install the matching
+standalone release artifact in a conventional libexec directory or set
+`[openshell.drivers.vm].driver_dir`. Select VM with
+`compute_drivers = ["vm"]` or `OPENSHELL_DRIVERS=vm`.
+
 ## Layout
 
 The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
