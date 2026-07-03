@@ -48,8 +48,8 @@ USAGE:
 
 OPTIONS:
     --compute-driver DRIVER
-                 Persist the gateway compute driver: auto, docker, podman,
-                 or vm. Install the required runtime or driver separately.
+                 Persist the gateway compute driver: docker, podman, or vm.
+                 Install the required runtime or driver separately.
     --help       Print this help message.
 
 ENVIRONMENT VARIABLES:
@@ -97,13 +97,13 @@ parse_install_args() {
   done
 
   case "$INSTALL_COMPUTE_DRIVER" in
-    "" | auto | docker | podman | vm)
+    "" | docker | podman | vm)
       ;;
     kubernetes)
       error "--compute-driver kubernetes is not supported by the local installer; use the OpenShell Helm chart"
       ;;
     *)
-      error "unsupported compute driver '${INSTALL_COMPUTE_DRIVER}'; expected auto, docker, podman, or vm"
+      error "unsupported compute driver '${INSTALL_COMPUTE_DRIVER}'; expected docker, podman, or vm"
       ;;
   esac
 }
@@ -748,8 +748,6 @@ configure_gateway_compute_driver() {
       ;;
     docker | vm)
       set -- "$@" --bind-address "127.0.0.1:${LOCAL_GATEWAY_PORT}"
-      ;;
-    auto)
       ;;
   esac
 

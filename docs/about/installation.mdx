@@ -29,10 +29,10 @@ runtime.
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh -s -- --compute-driver podman
 ```
 
-Supported values are `docker`, `podman`, `vm`, and `auto`. Podman selection
-also makes the gateway listener reachable from rootless containers. Docker and
-VM selection keep the listener on loopback. `auto` removes an existing driver
-pin so the gateway can detect a runtime. Set
+Supported values are `docker`, `podman`, and `vm`. Podman selection also makes
+the gateway listener reachable from rootless containers. Docker and VM
+selection keep the listener on loopback. Omit the option to retain automatic
+driver selection. Set
 `OPENSHELL_INSTALL_COMPUTE_DRIVER` instead when an environment variable is more
 convenient; the command-line option takes precedence.
 

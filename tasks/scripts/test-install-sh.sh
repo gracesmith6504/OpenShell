@@ -284,10 +284,10 @@ assert_driver_configuration \
   vm \
   "/test/bin/openshell-gateway config set --compute-driver vm --bind-address 127.0.0.1:17670"
 
-assert_driver_configuration \
-  "auto selection removes only the driver pin" \
-  auto \
-  "/test/bin/openshell-gateway config set --compute-driver auto"
+assert_driver_parse_fails \
+  "compute-driver leaves automatic selection to the default installation" \
+  "unsupported compute driver 'auto'" \
+  --compute-driver auto
 
 assert_driver_prerequisite_notice \
   "docker selection prints prerequisite guidance" \
