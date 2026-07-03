@@ -68,7 +68,9 @@ are relayed but are not currently parsed for policy enforcement.
 
 For admitted HTTP requests, the proxy can run an ordered supervisor middleware
 chain before credential injection. Host selectors choose the chain independently
-of the network rule that admitted the request. Built-ins run in-process;
+of the network rule that admitted the request. Policy entries use integer order
+values with stable name tie-breaking, and the gRPC contract represents operations
+and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and policy-owned config before delivery. Supervisors keep

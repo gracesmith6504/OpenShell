@@ -33,6 +33,7 @@ async fn max_middleware_body_bytes() -> usize {
         .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
             name: "test".into(),
             implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
         }])

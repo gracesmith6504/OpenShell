@@ -2801,6 +2801,7 @@ network_policies:
         let fail_open = ChainEntry {
             name: "m".into(),
             implementation: "openshell/secrets".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
         };
@@ -2845,12 +2846,14 @@ network_policies:
         let resolved = ChainEntry {
             name: "redact".into(),
             implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
         };
         let unresolved = ChainEntry {
             name: "missing".into(),
             implementation: "third-party/missing".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
         };

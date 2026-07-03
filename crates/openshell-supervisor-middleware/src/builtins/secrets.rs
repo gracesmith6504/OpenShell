@@ -7,19 +7,18 @@ use std::sync::LazyLock;
 use miette::{Result, miette};
 use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
 };
 use regex::Regex;
 
 pub const BINDING_ID: &str = openshell_core::middleware::BUILTIN_SECRETS;
-const OPERATION: &str = "HttpRequest";
-const PHASE: &str = "pre_credentials";
 const MAX_BODY_BYTES: u64 = 256 * 1024;
 
 pub fn describe() -> MiddlewareBinding {
     MiddlewareBinding {
         id: BINDING_ID.into(),
-        operation: OPERATION.into(),
-        phase: PHASE.into(),
+        operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+        phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         max_body_bytes: MAX_BODY_BYTES,
     }
 }

@@ -18,14 +18,16 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
     MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
-    SupervisorMiddlewareService, ValidateConfigRequest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
+    ValidateConfigRequest,
 };
 use tokio::sync::OnceCell;
 use tonic::Request;
 
 pub const API_VERSION: &str = "openshell.middleware.v1";
-const HTTP_REQUEST_OPERATION: &str = "HttpRequest";
-const PRE_CREDENTIALS_PHASE: &str = "pre_credentials";
+const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
+    SupervisorMiddlewareOperation::HttpRequest;
+const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     FailClosed,
@@ -48,6 +50,7 @@ impl OnError {
 pub struct ChainEntry {
     pub name: String,
     pub implementation: String,
+    pub order: i32,
     pub config: prost_types::Struct,
     pub on_error: OnError,
 }
@@ -68,6 +71,7 @@ impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
         Ok(Self {
             name: value.name.clone(),
             implementation: value.middleware.clone(),
+            order: value.order,
             config: value.config.clone().unwrap_or_default(),
             on_error: OnError::parse(&value.on_error)?,
         })
@@ -297,10 +301,12 @@ fn validate_external_manifest(
                 binding.id
             ));
         }
-        if binding.operation != HTTP_REQUEST_OPERATION || binding.phase != PRE_CREDENTIALS_PHASE {
+        if binding.operation != HTTP_REQUEST_OPERATION as i32
+            || binding.phase != PRE_CREDENTIALS_PHASE as i32
+        {
             return Err(miette!(
-                "middleware binding '{}' must support {HTTP_REQUEST_OPERATION}/{PRE_CREDENTIALS_PHASE}",
-                binding.id
+                "middleware binding '{}' must support HTTP_REQUEST/PRE_CREDENTIALS",
+                binding.id,
             ));
         }
         let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
@@ -523,6 +529,8 @@ impl ChainRunner {
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
         let manifests = self.manifests().await?;
+        let mut entries = entries.to_vec();
+        sort_chain_entries(&mut entries);
         entries
             .iter()
             .map(|entry| {
@@ -810,6 +818,15 @@ impl ChainRunner {
     }
 }
 
+/// Sort middleware using the policy-defined priority and a stable name tie-breaker.
+pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
+    entries.sort_by(|left, right| {
+        left.order
+            .cmp(&right.order)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
 fn build_evaluation(
     entry: &DescribedChainEntry,
     binding: &MiddlewareBinding,
@@ -820,7 +837,7 @@ fn build_evaluation(
     HttpRequestEvaluation {
         api_version: API_VERSION.into(),
         binding_id: binding.id.clone(),
-        phase: binding.phase.clone(),
+        phase: binding.phase,
         context: Some(RequestContext {
             request_id: input.request_id.clone(),
             sandbox_id: input.sandbox_id.clone(),
@@ -912,6 +929,7 @@ mod tests {
         ChainEntry {
             name: name.into(),
             implementation: BUILTIN_SECRETS.into(),
+            order: 0,
             config: prost_types::Struct {
                 fields: std::iter::once((
                     "secrets".into(),
@@ -951,6 +969,10 @@ mod tests {
         let input = input("payload");
         let evaluation = build_evaluation(entry, binding, &input, &BTreeMap::new(), b"payload");
 
+        assert_eq!(
+            evaluation.phase,
+            SupervisorMiddlewarePhase::PreCredentials as i32
+        );
         assert!(
             evaluation
                 .context
@@ -996,10 +1018,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_chain_sorts_by_order_then_name() {
+        let mut later = entry("later", OnError::FailClosed);
+        later.order = 20;
+        let mut beta = entry("beta", OnError::FailClosed);
+        beta.order = 10;
+        let mut alpha = entry("alpha", OnError::FailClosed);
+        alpha.order = 10;
+
+        let described = ChainRunner::default()
+            .describe_chain(&[later, beta, alpha])
+            .await
+            .expect("describe ordered chain");
+        let names: Vec<_> = described
+            .iter()
+            .map(|entry| entry.entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "later"]);
+    }
+
+    #[tokio::test]
     async fn fail_open_allows_unavailable_middleware() {
         let unavailable = ChainEntry {
             name: "missing".into(),
             implementation: "third-party/missing".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
         };
@@ -1016,6 +1059,7 @@ mod tests {
         let unavailable = ChainEntry {
             name: "missing".into(),
             implementation: "third-party/missing".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
         };
@@ -1036,8 +1080,14 @@ mod tests {
             .into_inner();
         assert_eq!(manifest.api_version, API_VERSION);
         assert_eq!(manifest.bindings[0].id, BUILTIN_SECRETS);
-        assert_eq!(manifest.bindings[0].operation, "HttpRequest");
-        assert_eq!(manifest.bindings[0].phase, "pre_credentials");
+        assert_eq!(
+            manifest.bindings[0].operation,
+            SupervisorMiddlewareOperation::HttpRequest as i32
+        );
+        assert_eq!(
+            manifest.bindings[0].phase,
+            SupervisorMiddlewarePhase::PreCredentials as i32
+        );
         assert_eq!(manifest.bindings[0].max_body_bytes, 256 * 1024);
     }
 
@@ -1088,8 +1138,8 @@ mod tests {
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
                     id: self.binding_id.clone(),
-                    operation: "HttpRequest".into(),
-                    phase: "pre_credentials".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
                 }],
             }))
@@ -1190,6 +1240,7 @@ mod tests {
         let unresolved = ChainEntry {
             name: "missing".into(),
             implementation: "third-party/missing".into(),
+            order: 10,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
         };
@@ -1214,6 +1265,7 @@ mod tests {
         let entry = ChainEntry {
             name: "external".into(),
             implementation: "example/redactor".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
         };
@@ -1229,7 +1281,7 @@ mod tests {
                 .as_ref()
                 .expect("described binding")
                 .phase,
-            "pre_credentials"
+            SupervisorMiddlewarePhase::PreCredentials as i32
         );
 
         let outcome = runner
@@ -1251,6 +1303,7 @@ mod tests {
         let external_entry = ChainEntry {
             name: "external".into(),
             implementation: "example/content-guard".into(),
+            order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
         };
@@ -1284,8 +1337,8 @@ mod tests {
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
                 id: "example/content-guard".into(),
-                operation: HTTP_REQUEST_OPERATION.into(),
-                phase: PRE_CREDENTIALS_PHASE.into(),
+                operation: HTTP_REQUEST_OPERATION as i32,
+                phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
             }],
         };
@@ -1346,6 +1399,7 @@ mod tests {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "guard".into(),
                 middleware: "example/content-guard".into(),
+                order: 0,
                 config: Some(prost_types::Struct::default()),
                 on_error: "fail_closed".into(),
                 endpoints: None,
@@ -1367,6 +1421,7 @@ mod tests {
                 &[ChainEntry {
                     name: "guard".into(),
                     implementation: "example/content-guard".into(),
+                    order: 0,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
                 }],

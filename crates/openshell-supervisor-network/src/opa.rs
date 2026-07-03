@@ -729,6 +729,7 @@ fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<V
             entries.push(chain_entry_from_value(config)?);
         }
     }
+    openshell_supervisor_middleware::sort_chain_entries(&mut entries);
     Ok(entries)
 }
 
@@ -761,6 +762,13 @@ fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
     Ok(ChainEntry {
         name,
         implementation,
+        order: get_field(value, "order")
+            .and_then(|value| match value {
+                regorus::Value::Number(number) => number.as_i64(),
+                _ => None,
+            })
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or_default(),
         config: get_field(value, "config")
             .map(regorus_value_to_struct)
             .unwrap_or_default(),
@@ -1630,6 +1638,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             let mut value = serde_json::json!({
                 "name": mw.name,
                 "middleware": mw.middleware,
+                "order": mw.order,
             });
             if let Some(config) = &mw.config {
                 value["config"] = openshell_core::proto_struct::struct_to_json_value(config);
@@ -6732,19 +6741,22 @@ network_policies:
     }
 
     #[test]
-    fn middleware_chain_uses_matching_selector_declaration_order() {
+    fn middleware_chain_uses_configured_order_and_name_tie_breaker() {
         let data = r#"
 network_middlewares:
   - name: global-redactor
     middleware: openshell/secrets
+    order: 20
     endpoints:
       include: ["api.example.com"]
   - name: policy-redactor
     middleware: openshell/secrets
+    order: 10
     endpoints:
       include: ["api.example.com"]
   - name: endpoint-redactor
     middleware: openshell/secrets
+    order: 10
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -6775,7 +6787,7 @@ network_policies:
         let names: Vec<_> = chain.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["global-redactor", "policy-redactor", "endpoint-redactor"]
+            vec!["endpoint-redactor", "policy-redactor", "global-redactor"]
         );
     }
 

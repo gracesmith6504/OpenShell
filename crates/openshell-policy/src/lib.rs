@@ -1493,6 +1493,7 @@ version: 1
 network_middlewares:
   - name: global-redactor
     middleware: openshell/secrets
+    order: 20
     on_error: fail_open
     endpoints:
       include: ["api.example.com", "*.service.test"]
@@ -1520,6 +1521,7 @@ network_policies:
         assert_eq!(proto.network_middlewares.len(), 2);
         assert_eq!(proto.network_middlewares[0].name, "global-redactor");
         assert_eq!(proto.network_middlewares[0].middleware, "openshell/secrets");
+        assert_eq!(proto.network_middlewares[0].order, 20);
         assert_eq!(proto.network_middlewares[0].on_error, "fail_open");
         assert_eq!(
             proto.network_middlewares[0]
@@ -1785,6 +1787,7 @@ network_policies:
         openshell_core::proto::NetworkMiddlewareConfig {
             name: name.into(),
             middleware: implementation.into(),
+            order: 0,
             config: None,
             on_error: String::new(),
             endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {

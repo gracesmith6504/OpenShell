@@ -20,12 +20,18 @@ pub use openshell_core::middleware::host_matches as middleware_host_matches;
 pub struct NetworkMiddlewareConfigDef {
     name: String,
     middleware: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    order: i32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     config: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     on_error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoints: Option<MiddlewareEndpointSelectorDef>,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +52,7 @@ pub fn into_proto(
             Ok(NetworkMiddlewareConfig {
                 name: definition.name,
                 middleware: definition.middleware,
+                order: definition.order,
                 config: Some(json_object_to_struct(
                     definition.config.into_iter().collect(),
                 )?),
@@ -67,6 +74,7 @@ pub fn from_proto(middlewares: &[NetworkMiddlewareConfig]) -> Vec<NetworkMiddlew
         .map(|middleware| NetworkMiddlewareConfigDef {
             name: middleware.name.clone(),
             middleware: middleware.middleware.clone(),
+            order: middleware.order,
             config: middleware
                 .config
                 .as_ref()
