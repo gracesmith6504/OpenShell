@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use super::PolicyViolation;
 
+pub use openshell_core::middleware::host_matches as middleware_host_matches;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkMiddlewareConfigDef {
@@ -81,23 +83,6 @@ pub fn from_proto(middlewares: &[NetworkMiddlewareConfig]) -> Vec<NetworkMiddlew
             }),
         })
         .collect()
-}
-
-/// Match a middleware host selector pattern using the runtime's glob semantics.
-///
-/// Invalid or empty patterns return an error instead of silently becoming a
-/// non-match.
-pub fn middleware_host_matches(pattern: &str, host: &str) -> Result<bool, String> {
-    if pattern.is_empty() {
-        return Err("host pattern must not be empty".to_string());
-    }
-    if pattern.chars().any(char::is_whitespace) {
-        return Err("host pattern must not contain whitespace".to_string());
-    }
-
-    let pattern = glob::Pattern::new(&pattern.to_ascii_lowercase())
-        .map_err(|error| format!("invalid host pattern: {error}"))?;
-    Ok(pattern.matches(&host.to_ascii_lowercase()))
 }
 
 fn selector_matches_host(middleware: &NetworkMiddlewareConfig, host: &str) -> Result<bool, String> {

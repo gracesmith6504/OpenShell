@@ -73,10 +73,11 @@ operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and policy-owned config before delivery. Supervisors keep
 the last-known-good service registry when a live config reload fails. Built-in
-middleware identifiers and pure config validation live in `openshell-core` so
-policy admission does not depend on the supervisor runtime implementation. The
-policy and runtime also share the core JSON/protobuf adapter for middleware
-configuration, keeping serialization consistent across that boundary.
+middleware identifiers, host-selector matching, and pure config validation live
+in `openshell-core` so policy admission does not depend on the supervisor
+runtime implementation. The policy and runtime also share the core
+JSON/protobuf adapter for middleware configuration, keeping serialization
+consistent across that boundary.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

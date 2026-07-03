@@ -3630,6 +3630,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "glob",
  "ipnet",
  "miette",
  "prost",
@@ -3769,10 +3770,8 @@ dependencies = [
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
- "glob",
  "miette",
  "openshell-core",
- "prost-types",
  "serde",
  "serde_json",
  "serde_yml",

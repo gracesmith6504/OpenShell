@@ -1826,15 +1826,13 @@ network_policies:
     fn validate_rejects_invalid_builtin_middleware_config() {
         let mut policy = restrictive_default_policy();
         let mut middleware = middleware_config("redact-secrets", "openshell/secrets");
-        middleware.config = Some(prost_types::Struct {
-            fields: std::iter::once((
-                "secrets".into(),
-                prost_types::Value {
-                    kind: Some(prost_types::value::Kind::StringValue("allow".into())),
-                },
-            ))
-            .collect(),
-        });
+        middleware.config = Some(
+            openshell_core::proto_struct::json_object_to_struct(
+                std::iter::once(("secrets".into(), serde_json::Value::String("allow".into())))
+                    .collect(),
+            )
+            .unwrap(),
+        );
         policy.network_middlewares.push(middleware);
 
         let violations = validate_sandbox_policy(&policy).expect_err("invalid config");

@@ -741,14 +741,14 @@ fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bo
     let matches_include = include_patterns
         .iter()
         .try_fold(false, |matched, pattern| {
-            openshell_policy::middleware_host_matches(pattern, host)
+            openshell_core::middleware::host_matches(pattern, host)
                 .map(|matches| matched || matches)
                 .map_err(|error| miette::miette!(error))
         })?;
     let matches_exclude = exclude_patterns
         .iter()
         .try_fold(false, |matched, pattern| {
-            openshell_policy::middleware_host_matches(pattern, host)
+            openshell_core::middleware::host_matches(pattern, host)
                 .map(|matches| matched || matches)
                 .map_err(|error| miette::miette!(error))
         })?;
@@ -1155,7 +1155,7 @@ fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
         }
         for pattern in includes.iter().chain(&excludes) {
             if let Err(error) =
-                openshell_policy::middleware_host_matches(pattern, "validation.invalid")
+                openshell_core::middleware::host_matches(pattern, "validation.invalid")
             {
                 errors.push(format!(
                     "middleware config '{name}' has invalid endpoint selector pattern '{pattern}': {error}"
@@ -1220,10 +1220,10 @@ fn global_selector_matches_any_middleware(
         let excludes = json_string_array(selector.get("exclude"));
         !includes.is_empty()
             && includes.iter().any(|pattern| {
-                openshell_policy::middleware_host_matches(pattern, host).unwrap_or(false)
+                openshell_core::middleware::host_matches(pattern, host).unwrap_or(false)
             })
             && !excludes.iter().any(|pattern| {
-                openshell_policy::middleware_host_matches(pattern, host).unwrap_or(false)
+                openshell_core::middleware::host_matches(pattern, host).unwrap_or(false)
             })
     })
 }

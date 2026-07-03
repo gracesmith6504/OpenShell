@@ -53,10 +53,10 @@ behavior here, then consume it from the gateway, sandbox, and router.
 
 ## Middleware Contracts
 
-Built-in supervisor middleware identifiers and pure configuration validation
-live in `openshell_core::middleware`. Policy admission and the supervisor
-runtime consume the same contract without introducing a dependency from the
-policy crate to the supervisor implementation.
+Built-in supervisor middleware identifiers, host-selector matching, and pure
+configuration validation live in `openshell_core::middleware`. Policy admission
+and the supervisor runtime consume the same contract without introducing a
+dependency from the policy crate to the supervisor implementation.
 
 ## Protobuf Struct Conversion
 
