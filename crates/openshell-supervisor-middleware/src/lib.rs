@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use miette::{Result, miette};
+pub use openshell_core::middleware::{BUILTIN_SECRETS, validate_builtin_config};
 pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
@@ -23,18 +24,8 @@ use tokio::sync::OnceCell;
 use tonic::Request;
 
 pub const API_VERSION: &str = "openshell.middleware.v1";
-pub const BUILTIN_SECRETS: &str = builtins::secrets::BINDING_ID;
 const HTTP_REQUEST_OPERATION: &str = "HttpRequest";
 const PRE_CREDENTIALS_PHASE: &str = "pre_credentials";
-
-/// Validate the configuration for an in-process middleware implementation.
-///
-/// Policy admission uses this same implementation-specific validation before a
-/// configuration can reach the request path.
-pub fn validate_builtin_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
-    builtins::validate_config(implementation, config)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     FailClosed,

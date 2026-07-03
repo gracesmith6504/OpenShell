@@ -1532,7 +1532,7 @@ pub fn validate_sandbox_policy(
                 reason: "implementation must not be empty".to_string(),
             });
         } else if middleware.middleware.starts_with("openshell/")
-            && middleware.middleware != openshell_supervisor_middleware::BUILTIN_SECRETS
+            && middleware.middleware != openshell_core::middleware::BUILTIN_SECRETS
         {
             violations.push(PolicyViolation::InvalidMiddlewareConfig {
                 name: middleware.name.clone(),
@@ -1572,12 +1572,11 @@ pub fn validate_sandbox_policy(
             }
         }
 
-        if middleware.middleware == openshell_supervisor_middleware::BUILTIN_SECRETS {
+        if middleware.middleware == openshell_core::middleware::BUILTIN_SECRETS {
             let config = middleware.config.clone().unwrap_or_default();
-            if let Err(error) = openshell_supervisor_middleware::validate_builtin_config(
-                &middleware.middleware,
-                &config,
-            ) {
+            if let Err(error) =
+                openshell_core::middleware::validate_builtin_config(&middleware.middleware, &config)
+            {
                 violations.push(PolicyViolation::InvalidBuiltinMiddlewareConfig {
                     name: middleware.name.clone(),
                     reason: error.to_string(),

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) enum MiddlewareApplyResult {
+pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied(String),
 }
@@ -35,7 +35,7 @@ pub(super) fn middleware_chain_body_limit(
         .min()
 }
 
-pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -47,7 +47,7 @@ pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + S
         .await
 }
 
-pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,

@@ -50,3 +50,10 @@ router agree on provider defaults. Profiles define:
 
 Do not duplicate provider-specific inference behavior in callers. Add shared
 behavior here, then consume it from the gateway, sandbox, and router.
+
+## Middleware Contracts
+
+Built-in supervisor middleware identifiers and pure configuration validation
+live in `openshell_core::middleware`. Policy admission and the supervisor
+runtime consume the same contract without introducing a dependency from the
+policy crate to the supervisor implementation.

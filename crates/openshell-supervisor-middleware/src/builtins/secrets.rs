@@ -10,7 +10,7 @@ use openshell_core::proto::{
 };
 use regex::Regex;
 
-pub const BINDING_ID: &str = "openshell/secrets";
+pub const BINDING_ID: &str = openshell_core::middleware::BUILTIN_SECRETS;
 const OPERATION: &str = "HttpRequest";
 const PHASE: &str = "pre_credentials";
 const MAX_BODY_BYTES: u64 = 256 * 1024;
@@ -54,21 +54,7 @@ static SECRET_PATTERNS: LazyLock<[SecretPattern; 2]> = LazyLock::new(|| {
 });
 
 pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
-    let mode = config
-        .fields
-        .get("secrets")
-        .and_then(|value| match value.kind.as_ref() {
-            Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
-            _ => None,
-        })
-        .unwrap_or("redact");
-    if mode != "redact" {
-        return Err(miette!(
-            "{} only supports config.secrets: redact in phase 1",
-            BINDING_ID
-        ));
-    }
-    Ok(())
+    openshell_core::middleware::validate_builtin_config(BINDING_ID, config)
 }
 
 pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
