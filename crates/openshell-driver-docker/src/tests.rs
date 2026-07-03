@@ -114,6 +114,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
+        instance_state_dir: PathBuf::new(),
     }
 }
 
@@ -187,6 +188,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         config,
         events: broadcast::channel(WATCH_BUFFER).0,
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        instances: Arc::new(tokio::sync::Mutex::new(DockerInstanceOwnership::default())),
         supervisor_readiness: Arc::new(DisconnectedSupervisorReadiness),
         gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
             CdiGpuInventory::default(),
@@ -1716,6 +1718,10 @@ fn managed_container_summary(
             (LABEL_SANDBOX_ID.to_string(), sandbox.id),
             (LABEL_SANDBOX_NAME.to_string(), sandbox.name),
             (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
+            (
+                LABEL_INSTANCE_GENERATION.to_string(),
+                "instance-generation".to_string(),
+            ),
         ])),
         state: Some(state),
         created: Some(created),
@@ -1723,49 +1729,897 @@ fn managed_container_summary(
     }
 }
 
-fn selected_container_id(summaries: &[ContainerSummary]) -> &str {
-    preferred_container_summaries_by_sandbox_id(summaries)
-        .get("sbx-1")
-        .and_then(|summary| summary.id.as_deref())
-        .expect("sandbox has a preferred container")
+fn tracked_instances(authoritative_id: &str) -> TrackedSandboxInstances {
+    TrackedSandboxInstances {
+        sandbox_id: "sbx-1".to_string(),
+        sandbox_name: "demo".to_string(),
+        namespace: "default".to_string(),
+        authoritative_id: authoritative_id.to_string(),
+        retired_ids: HashSet::new(),
+        instance_generation: "instance-generation".to_string(),
+        replacement_intent: None,
+    }
+}
+
+fn journal_runtime_config(temp: &TempDir, namespace: &str) -> DockerDriverRuntimeConfig {
+    let mut config = runtime_config();
+    config.sandbox_namespace = namespace.to_string();
+    config.instance_state_dir = temp
+        .path()
+        .join(docker_instance_namespace_dir_name(namespace));
+    config
+}
+
+fn rename_as_nemoclaw_backup(summary: &mut ContainerSummary, timestamp: u64) {
+    let canonical = summary
+        .names
+        .as_ref()
+        .and_then(|names| names.first())
+        .expect("canonical name")
+        .trim_start_matches('/');
+    summary.names = Some(vec![format!(
+        "/{canonical}{NEMOCLAW_GPU_BACKUP_MARKER}{timestamp}"
+    )]);
+}
+
+fn replacement_ids(
+    summaries: &[ContainerSummary],
+    resolution: TrackedContainerResolution,
+) -> (&str, &str) {
+    match resolution {
+        TrackedContainerResolution::Replacement {
+            incumbent_index,
+            replacement_index,
+        } => (
+            container_summary_id(&summaries[incumbent_index]).unwrap(),
+            container_summary_id(&summaries[replacement_index]).unwrap(),
+        ),
+        other => panic!("expected replacement, got {other:?}"),
+    }
 }
 
 #[test]
-fn preferred_container_summary_selects_running_in_both_list_orders() {
-    let running = managed_container_summary("running", ContainerSummaryStateEnum::RUNNING, 10);
-    let newer_exited =
-        managed_container_summary("newer-exited", ContainerSummaryStateEnum::EXITED, 20);
+fn tracked_container_accepts_exited_backup_to_canonical_handoff_in_both_orders() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1_780_491_860_342);
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::CREATED, 20);
+    let backup_name = incumbent
+        .names
+        .as_ref()
+        .and_then(|names| names.first())
+        .expect("backup name")
+        .trim_start_matches('/')
+        .to_string();
+    let mut tracked = tracked_instances("incumbent");
+
+    assert!(matches!(
+        resolve_tracked_container(&[incumbent.clone(), successor.clone()], &tracked),
+        TrackedContainerResolution::ReplacementIntentRequired {
+            incumbent_index: 0,
+            replacement_index: 1,
+            backup_name: observed_backup_name,
+        } if observed_backup_name == backup_name
+    ));
+    assert!(matches!(
+        resolve_tracked_container(&[successor.clone(), incumbent.clone()], &tracked),
+        TrackedContainerResolution::ReplacementIntentRequired {
+            incumbent_index: 1,
+            replacement_index: 0,
+            backup_name: observed_backup_name,
+        } if observed_backup_name == backup_name
+    ));
+
+    tracked.replacement_intent = Some(DockerReplacementIntent {
+        incumbent_id: "incumbent".to_string(),
+        replacement_id: "successor".to_string(),
+        backup_name,
+    });
 
     assert_eq!(
-        selected_container_id(&[running.clone(), newer_exited.clone()]),
-        "running"
+        replacement_ids(
+            &[incumbent.clone(), successor.clone()],
+            resolve_tracked_container(&[incumbent.clone(), successor.clone()], &tracked),
+        ),
+        ("incumbent", "successor")
     );
-    assert_eq!(selected_container_id(&[newer_exited, running]), "running");
+    assert_eq!(
+        replacement_ids(
+            &[successor.clone(), incumbent.clone()],
+            resolve_tracked_container(&[successor, incumbent], &tracked),
+        ),
+        ("incumbent", "successor")
+    );
 }
 
 #[test]
-fn preferred_container_summary_selects_newer_same_state_in_both_list_orders() {
-    let older = managed_container_summary("older", ContainerSummaryStateEnum::EXITED, 10);
-    let newer = managed_container_summary("newer", ContainerSummaryStateEnum::EXITED, 20);
+fn tracked_container_requires_driver_lineage_for_handoff() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+    let mut successor =
+        managed_container_summary("successor", ContainerSummaryStateEnum::RUNNING, 20);
+    incumbent
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+    successor
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
 
-    assert_eq!(
-        selected_container_id(&[older.clone(), newer.clone()]),
-        "newer"
+    assert!(matches!(
+        resolve_tracked_container(
+            &[incumbent.clone(), successor.clone()],
+            &tracked_instances("incumbent")
+        ),
+        TrackedContainerResolution::HandoffPending { .. }
+    ));
+    let mut legacy = tracked_instances("incumbent");
+    legacy.instance_generation.clear();
+    assert!(matches!(
+        resolve_tracked_container(&[incumbent.clone(), successor.clone()], &legacy),
+        TrackedContainerResolution::HandoffPending { .. }
+    ));
+
+    incumbent.labels.as_mut().unwrap().insert(
+        LABEL_INSTANCE_GENERATION.to_string(),
+        "wrong-generation".to_string(),
     );
-    assert_eq!(selected_container_id(&[newer, older]), "newer");
+    successor.labels.as_mut().unwrap().insert(
+        LABEL_INSTANCE_GENERATION.to_string(),
+        "wrong-generation".to_string(),
+    );
+    assert!(matches!(
+        resolve_tracked_container(&[incumbent, successor], &tracked_instances("incumbent")),
+        TrackedContainerResolution::HandoffPending { .. }
+    ));
 }
 
 #[test]
-fn preferred_container_summary_selects_canonical_name_for_equal_time_clones() {
-    let canonical = managed_container_summary("aaa", ContainerSummaryStateEnum::EXITED, 10);
-    let mut backup = managed_container_summary("zzz", ContainerSummaryStateEnum::EXITED, 10);
-    backup.names = Some(vec!["/openshell-demo-nemoclaw-gpu-backup-1234".to_string()]);
+fn tracked_container_rejects_terminal_replacement_candidates() {
+    for state in [
+        ContainerSummaryStateEnum::EXITED,
+        ContainerSummaryStateEnum::DEAD,
+        ContainerSummaryStateEnum::REMOVING,
+        ContainerSummaryStateEnum::EMPTY,
+        ContainerSummaryStateEnum::PAUSED,
+    ] {
+        let mut incumbent =
+            managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+        rename_as_nemoclaw_backup(&mut incumbent, 1234);
+        let successor = managed_container_summary("successor", state, 20);
+        assert!(matches!(
+            resolve_tracked_container(&[incumbent, successor], &tracked_instances("incumbent")),
+            TrackedContainerResolution::HandoffPending { .. }
+        ));
+    }
+}
+
+#[test]
+fn tracked_container_invalidates_interrupted_intent_and_accepts_intended_successor_only() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+    let backup_name = incumbent.names.as_ref().unwrap()[0]
+        .trim_start_matches('/')
+        .to_string();
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::RUNNING, 20);
+    let mut tracked = tracked_instances("incumbent");
+    tracked.replacement_intent = Some(DockerReplacementIntent {
+        incumbent_id: "incumbent".to_string(),
+        replacement_id: "successor".to_string(),
+        backup_name,
+    });
 
     assert_eq!(
-        selected_container_id(&[canonical.clone(), backup.clone()]),
-        "aaa"
+        resolve_tracked_container(std::slice::from_ref(&successor), &tracked),
+        TrackedContainerResolution::ReplacementFromIntent {
+            replacement_index: 0,
+        }
     );
-    assert_eq!(selected_container_id(&[backup, canonical]), "aaa");
+    assert!(matches!(
+        resolve_tracked_container(&[], &tracked),
+        TrackedContainerResolution::ReplacementIntentInvalidated { candidate_ids }
+            if candidate_ids.is_empty()
+    ));
+    assert!(matches!(
+        resolve_tracked_container(
+            &[incumbent, successor, managed_container_summary(
+                "third",
+                ContainerSummaryStateEnum::RUNNING,
+                30,
+            )],
+            &tracked,
+        ),
+        TrackedContainerResolution::ReplacementIntentInvalidated { candidate_ids }
+            if candidate_ids.len() == 3
+    ));
+}
+
+#[test]
+fn tracked_container_completes_authorized_intent_when_successor_was_stopped_for_restart() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+    let backup_name = incumbent.names.as_ref().unwrap()[0]
+        .trim_start_matches('/')
+        .to_string();
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::EXITED, 20);
+    let mut tracked = tracked_instances("incumbent");
+    tracked.replacement_intent = Some(DockerReplacementIntent {
+        incumbent_id: "incumbent".to_string(),
+        replacement_id: "successor".to_string(),
+        backup_name,
+    });
+
+    assert!(matches!(
+        resolve_tracked_container(&[incumbent, successor.clone()], &tracked),
+        TrackedContainerResolution::Replacement {
+            incumbent_index: 0,
+            replacement_index: 1,
+        }
+    ));
+    assert_eq!(
+        resolve_tracked_container(&[successor], &tracked),
+        TrackedContainerResolution::ReplacementFromIntent {
+            replacement_index: 0,
+        }
+    );
+}
+
+#[test]
+fn tracked_container_rejects_non_exited_or_wrongly_named_incumbent_handoffs() {
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::RUNNING, 20);
+    for state in [
+        ContainerSummaryStateEnum::RUNNING,
+        ContainerSummaryStateEnum::RESTARTING,
+        ContainerSummaryStateEnum::CREATED,
+        ContainerSummaryStateEnum::PAUSED,
+        ContainerSummaryStateEnum::DEAD,
+        ContainerSummaryStateEnum::REMOVING,
+        ContainerSummaryStateEnum::EMPTY,
+    ] {
+        let mut incumbent = managed_container_summary("incumbent", state, 10);
+        rename_as_nemoclaw_backup(&mut incumbent, 1234);
+        assert!(matches!(
+            resolve_tracked_container(
+                &[incumbent, successor.clone()],
+                &tracked_instances("incumbent")
+            ),
+            TrackedContainerResolution::Authoritative { index: 0, .. }
+        ));
+    }
+
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    incumbent.names = Some(vec!["/some-unreserved-backup".to_string()]);
+    assert!(matches!(
+        resolve_tracked_container(&[incumbent, successor], &tracked_instances("incumbent")),
+        TrackedContainerResolution::Authoritative { index: 0, .. }
+    ));
+}
+
+#[test]
+fn tracked_container_keeps_known_incumbent_over_running_duplicate() {
+    let incumbent = managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    let mut duplicate =
+        managed_container_summary("duplicate", ContainerSummaryStateEnum::RUNNING, 20);
+    duplicate.names = Some(vec!["/copied-labels-but-not-canonical".to_string()]);
+
+    assert_eq!(
+        resolve_tracked_container(&[incumbent, duplicate], &tracked_instances("incumbent")),
+        TrackedContainerResolution::Authoritative {
+            index: 0,
+            unexpected_ids: vec!["duplicate".to_string()],
+        }
+    );
+}
+
+#[test]
+fn tracked_container_rejects_ambiguous_canonical_successors() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+    let first = managed_container_summary("first", ContainerSummaryStateEnum::CREATED, 20);
+    let second = managed_container_summary("second", ContainerSummaryStateEnum::RUNNING, 30);
+
+    assert!(matches!(
+        resolve_tracked_container(
+            &[incumbent, first, second],
+            &tracked_instances("incumbent")
+        ),
+        TrackedContainerResolution::HandoffPending {
+            incumbent_index: 0,
+            candidate_ids,
+        } if candidate_ids.len() == 2
+    ));
+}
+
+#[test]
+fn tracked_container_keeps_stopped_backup_pending_without_auto_resume() {
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+
+    assert_eq!(
+        resolve_tracked_container(&[incumbent], &tracked_instances("incumbent")),
+        TrackedContainerResolution::HandoffPending {
+            incumbent_index: 0,
+            candidate_ids: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn tracked_container_requires_generation_and_intent_after_observed_gap() {
+    let tracked = tracked_instances("incumbent");
+    assert_eq!(
+        resolve_tracked_container(&[], &tracked),
+        TrackedContainerResolution::Missing
+    );
+
+    let replacement =
+        managed_container_summary("replacement", ContainerSummaryStateEnum::RUNNING, 20);
+    assert_eq!(
+        resolve_tracked_container(std::slice::from_ref(&replacement), &tracked),
+        TrackedContainerResolution::ReplacementIntentRequiredWithoutIncumbent {
+            replacement_index: 0,
+        }
+    );
+
+    let mut unproven = replacement;
+    unproven
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+    assert_eq!(
+        resolve_tracked_container(&[unproven], &tracked),
+        TrackedContainerResolution::Conflict {
+            candidate_ids: vec!["replacement".to_string()],
+        }
+    );
+}
+
+#[test]
+fn tracked_container_allows_only_previously_retired_instance_to_roll_back() {
+    let mut tracked = tracked_instances("replacement");
+    tracked.retired_ids.insert("incumbent".to_string());
+    let restored = managed_container_summary("incumbent", ContainerSummaryStateEnum::RUNNING, 10);
+
+    assert_eq!(
+        resolve_tracked_container(&[restored], &tracked),
+        TrackedContainerResolution::Rollback { index: 0 }
+    );
+
+    let restored_stopped =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    assert_eq!(
+        resolve_tracked_container(&[restored_stopped], &tracked),
+        TrackedContainerResolution::Rollback { index: 0 }
+    );
+
+    let mut unknown = managed_container_summary("unknown", ContainerSummaryStateEnum::RUNNING, 20);
+    unknown
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+    assert_eq!(
+        resolve_tracked_container(&[unknown], &tracked),
+        TrackedContainerResolution::Conflict {
+            candidate_ids: vec!["unknown".to_string()],
+        }
+    );
+}
+
+#[test]
+fn tracked_container_reports_running_retired_backup_as_conflict() {
+    let mut tracked = tracked_instances("replacement");
+    tracked
+        .retired_ids
+        .extend(["incumbent".to_string(), "older".to_string()]);
+    let mut replacement =
+        managed_container_summary("replacement", ContainerSummaryStateEnum::RUNNING, 20);
+    replacement
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::RUNNING, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+
+    assert_eq!(
+        resolve_tracked_container(&[replacement, incumbent], &tracked),
+        TrackedContainerResolution::Authoritative {
+            index: 0,
+            unexpected_ids: vec!["incumbent".to_string()],
+        }
+    );
+
+    let restored = managed_container_summary("incumbent", ContainerSummaryStateEnum::RUNNING, 10);
+    let mut older = managed_container_summary("older", ContainerSummaryStateEnum::RUNNING, 5);
+    rename_as_nemoclaw_backup(&mut older, 1000);
+    assert!(matches!(
+        resolve_tracked_container(&[restored, older], &tracked),
+        TrackedContainerResolution::Conflict { .. }
+    ));
+}
+
+#[test]
+fn docker_instance_namespace_directory_is_injective_and_path_safe() {
+    let slash = docker_instance_namespace_dir_name("a/b");
+    let dash = docker_instance_namespace_dir_name("a-b");
+    assert_ne!(slash, dash);
+    assert_ne!(docker_instance_namespace_dir_name(".."), "..");
+    assert_ne!(docker_instance_namespace_dir_name("."), ".");
+    assert_eq!(slash.len(), 64);
+    assert!(slash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn docker_instance_ownership_journal_round_trips_with_restricted_permissions() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "tenant/a");
+    let mut tracked = tracked_instances("incumbent");
+    tracked.namespace.clone_from(&config.sandbox_namespace);
+    tracked.retired_ids.insert("retired".to_string());
+    tracked.replacement_intent = Some(DockerReplacementIntent {
+        incumbent_id: "incumbent".to_string(),
+        replacement_id: "successor".to_string(),
+        backup_name: "openshell-demo-sbx-1-nemoclaw-gpu-backup-1234".to_string(),
+    });
+
+    persist_docker_instance_ownership(&tracked, &config).unwrap();
+    let path = docker_instance_state_path(&tracked.sandbox_id, &config).unwrap();
+    let persisted =
+        load_docker_instance_ownership(&tracked.sandbox_id, &tracked.sandbox_name, &config)
+            .unwrap()
+            .unwrap();
+    assert_eq!(persisted.namespace, "tenant/a");
+    assert_eq!(persisted.authoritative_id, "incumbent");
+    assert_eq!(persisted.retired_ids, vec!["retired".to_string()]);
+    assert_eq!(persisted.instance_generation, "instance-generation");
+    assert_eq!(persisted.replacement_intent, tracked.replacement_intent);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
+fn docker_instance_ownership_journal_rejects_identity_namespace_version_and_corruption() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "tenant-a");
+    let mut tracked = tracked_instances("incumbent");
+    tracked.namespace.clone_from(&config.sandbox_namespace);
+    persist_docker_instance_ownership(&tracked, &config).unwrap();
+
+    assert!(load_docker_instance_ownership("sbx-1", "wrong-name", &config).is_err());
+    let mut other_namespace = config.clone();
+    other_namespace.sandbox_namespace = "tenant-b".to_string();
+    assert!(load_docker_instance_ownership("sbx-1", "demo", &other_namespace).is_err());
+
+    let path = docker_instance_state_path("sbx-1", &config).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["version"] = serde_json::json!(99);
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(load_docker_instance_ownership("sbx-1", "demo", &config).is_err());
+
+    fs::write(&path, b"not-json").unwrap();
+    assert!(load_docker_instance_ownership("sbx-1", "demo", &config).is_err());
+}
+
+#[tokio::test]
+async fn docker_instance_ownership_journal_survives_intent_promotion_and_rollback_store_lag() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "default");
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    let first = test_driver_with_config(config.clone());
+    first
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+    let mut incumbent =
+        managed_container_summary("incumbent", ContainerSummaryStateEnum::EXITED, 10);
+    rename_as_nemoclaw_backup(&mut incumbent, 1234);
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::RUNNING, 20);
+
+    assert!(matches!(
+        first
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                &[incumbent.clone(), successor.clone()],
+            )
+            .await,
+        TrackedSandboxObservation::Conflict(_)
+    ));
+
+    let restarted = test_driver_with_config(config.clone());
+    restarted
+        .track_persisted_instance(&sandbox.id, &sandbox.name, "incumbent")
+        .await
+        .unwrap();
+    let stopped_successor = ContainerSummary {
+        state: Some(ContainerSummaryStateEnum::EXITED),
+        ..successor.clone()
+    };
+    assert!(matches!(
+        restarted
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&stopped_successor),
+            )
+            .await,
+        TrackedSandboxObservation::Container(summary)
+            if container_summary_id(&summary) == Some("successor")
+    ));
+
+    let store_still_incumbent = test_driver_with_config(config.clone());
+    store_still_incumbent
+        .track_persisted_instance(&sandbox.id, &sandbox.name, "incumbent")
+        .await
+        .unwrap();
+    {
+        let ownership = store_still_incumbent.instances.lock().await;
+        let tracked = ownership.sandboxes.get(&sandbox.id).unwrap();
+        assert_eq!(tracked.authoritative_id, "successor");
+        assert!(tracked.retired_ids.contains("incumbent"));
+    }
+
+    let restored = managed_container_summary("incumbent", ContainerSummaryStateEnum::RUNNING, 30);
+    assert!(matches!(
+        store_still_incumbent
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&restored),
+            )
+            .await,
+        TrackedSandboxObservation::Container(summary)
+            if container_summary_id(&summary) == Some("incumbent")
+    ));
+
+    let store_still_successor = test_driver_with_config(config);
+    store_still_successor
+        .track_persisted_instance(&sandbox.id, &sandbox.name, "successor")
+        .await
+        .unwrap();
+    let ownership = store_still_successor.instances.lock().await;
+    let tracked = ownership.sandboxes.get(&sandbox.id).unwrap();
+    assert_eq!(tracked.authoritative_id, "incumbent");
+    assert!(tracked.retired_ids.contains("successor"));
+}
+
+#[tokio::test]
+async fn driver_generation_recovers_replacement_after_observed_gap_and_restart() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "default");
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    let first = test_driver_with_config(config.clone());
+    first
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        first
+            .resolve_tracked_sandbox_observation(&sandbox.id, &sandbox.name, &[])
+            .await,
+        TrackedSandboxObservation::Conflict(_)
+    ));
+
+    let successor = managed_container_summary("successor", ContainerSummaryStateEnum::RUNNING, 20);
+    assert!(matches!(
+        first
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&successor),
+            )
+            .await,
+        TrackedSandboxObservation::Conflict(_)
+    ));
+
+    let restarted = test_driver_with_config(config);
+    restarted
+        .track_persisted_instance(&sandbox.id, &sandbox.name, "incumbent")
+        .await
+        .unwrap();
+    assert!(matches!(
+        restarted
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&successor),
+            )
+            .await,
+        TrackedSandboxObservation::Container(summary)
+            if container_summary_id(&summary) == Some("successor")
+    ));
+}
+
+#[tokio::test]
+async fn forgetting_unmapped_sandbox_removes_ownership_journal() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "default");
+    let tracked = tracked_instances("incumbent");
+    persist_docker_instance_ownership(&tracked, &config).unwrap();
+    let path = docker_instance_state_path("sbx-1", &config).unwrap();
+    assert!(path.exists());
+
+    let driver = test_driver_with_config(config);
+    driver.forget_tracked_sandbox("sbx-1", "demo").await;
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn cancelled_create_does_not_publish_authority_or_leave_journal() {
+    let temp = TempDir::new().unwrap();
+    let config = journal_runtime_config(&temp, "default");
+    let driver = test_driver_with_config(config.clone());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    let cancelled = AtomicBool::new(true);
+
+    let err = driver
+        .track_created_instance(
+            &sandbox,
+            "incumbent",
+            "instance-generation",
+            Some(&cancelled),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Cancelled);
+    assert!(
+        !docker_instance_state_path("sbx-1", &config)
+            .unwrap()
+            .exists()
+    );
+    assert!(driver.instances.lock().await.sandboxes.is_empty());
+}
+
+#[tokio::test]
+async fn pending_delete_cancels_reservation_before_provision_start_gate() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    let cancellation = driver.reserve_pending_sandbox(&sandbox).await.unwrap();
+    assert!(!cancellation.load(AtomicOrdering::Acquire));
+
+    let removed = driver
+        .remove_pending_sandbox(&sandbox.id, &sandbox.name)
+        .await
+        .expect("pending reservation");
+    assert!(removed.task.is_none());
+    assert!(cancellation.load(AtomicOrdering::Acquire));
+    assert!(removed.cancelled.load(AtomicOrdering::Acquire));
+}
+
+#[tokio::test]
+async fn ownership_conflict_notice_is_operator_visible_and_deduplicated() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    driver
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+    let mut replacement =
+        managed_container_summary("replacement", ContainerSummaryStateEnum::RUNNING, 20);
+    replacement
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+    let mut rx = driver.events.subscribe();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            driver
+                .resolve_tracked_sandbox_observation(
+                    &sandbox.id,
+                    &sandbox.name,
+                    std::slice::from_ref(&replacement),
+                )
+                .await,
+            TrackedSandboxObservation::Conflict(_)
+        ));
+    }
+
+    let event = rx.try_recv().expect("first conflict publishes a warning");
+    let watch_sandboxes_event::Payload::PlatformEvent(event) = event.payload.unwrap() else {
+        panic!("expected platform event");
+    };
+    let event = event.event.unwrap();
+    assert_eq!(event.r#type, "Warning");
+    assert_eq!(event.reason, "ContainerIdentityConflict");
+    assert_eq!(
+        event.metadata.get("authoritative_instance_id"),
+        Some(&"incumbent".to_string())
+    );
+    assert_eq!(
+        event.metadata.get("candidate_instance_ids"),
+        Some(&"replacement".to_string())
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn ownership_notice_before_subscription_is_retried_for_first_watcher() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    driver
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+    let mut replacement =
+        managed_container_summary("replacement", ContainerSummaryStateEnum::RUNNING, 20);
+    replacement
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(LABEL_INSTANCE_GENERATION);
+
+    assert!(matches!(
+        driver
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&replacement),
+            )
+            .await,
+        TrackedSandboxObservation::Conflict(_)
+    ));
+
+    let mut rx = driver.events.subscribe();
+    assert!(matches!(
+        driver
+            .resolve_tracked_sandbox_observation(
+                &sandbox.id,
+                &sandbox.name,
+                std::slice::from_ref(&replacement),
+            )
+            .await,
+        TrackedSandboxObservation::Conflict(_)
+    ));
+    let event = rx.try_recv().expect("notice is retried after subscription");
+    assert!(matches!(
+        event.payload,
+        Some(watch_sandboxes_event::Payload::PlatformEvent(_))
+    ));
+}
+
+#[test]
+fn conflict_snapshot_prevents_delete_event_across_recreate_gap() {
+    let tracked = tracked_instances("incumbent");
+    let previous_sandbox = sandbox_from_container_summary(
+        &managed_container_summary("incumbent", ContainerSummaryStateEnum::RUNNING, 10),
+        &DisconnectedSupervisorReadiness,
+    )
+    .unwrap();
+    let conflict = ownership_conflict_snapshot(
+        "sbx-1",
+        &tracked,
+        "ContainerInstanceMissing",
+        "authoritative instance is missing",
+    );
+    let previous = HashMap::from([("sbx-1".to_string(), previous_sandbox)]);
+    let current = HashMap::from([("sbx-1".to_string(), conflict)]);
+    let (events, mut rx) = broadcast::channel(WATCH_BUFFER);
+
+    emit_snapshot_diff(&events, &previous, &current);
+
+    let event = rx.try_recv().expect("conflict snapshot update");
+    assert!(matches!(
+        event.payload,
+        Some(watch_sandboxes_event::Payload::Sandbox(_))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn forgetting_explicitly_deleted_sandbox_removes_retained_authority() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    driver
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+
+    driver
+        .forget_tracked_sandbox(&sandbox.id, &sandbox.name)
+        .await;
+
+    assert!(matches!(
+        driver
+            .resolve_tracked_sandbox_observation(&sandbox.id, &sandbox.name, &[])
+            .await,
+        TrackedSandboxObservation::Untracked
+    ));
+}
+
+#[tokio::test]
+async fn tracked_identity_resolves_name_only_and_rejects_mismatched_name() {
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = DriverSandbox {
+        id: "sbx-1".to_string(),
+        name: "demo".to_string(),
+        ..Default::default()
+    };
+    driver
+        .track_created_instance(&sandbox, "incumbent", "instance-generation", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        driver.resolve_tracked_sandbox_id("", "demo").await.unwrap(),
+        Some("sbx-1".to_string())
+    );
+    assert_eq!(
+        driver
+            .resolve_tracked_sandbox_id("sbx-1", "wrong-name")
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    driver.forget_tracked_sandbox("", "demo").await;
+    assert_eq!(
+        driver.resolve_tracked_sandbox_id("", "demo").await.unwrap(),
+        None
+    );
 }
 
 #[test]

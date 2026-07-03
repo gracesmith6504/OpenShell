@@ -19,6 +19,49 @@ Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
 `host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
 gateway IP so containers can call back to the host process.
 
+## Container Instance Ownership
+
+Docker labels identify containers for discovery and cleanup. They do not grant
+authority to represent a persisted sandbox because another Docker client can
+copy them. The driver records the authoritative container ID from the Docker
+create response and restores it from `Sandbox.status.agent_pod` at gateway
+startup. New containers also receive a driver-issued instance-generation label.
+That label is not a secret; it is checked against an owner-only journal under
+`$XDG_STATE_HOME/openshell/docker-sandbox-instances/<sha256(namespace)>/`, so
+generic copied identity labels are insufficient to authorize a replacement.
+The local Docker driver assumes that Docker-daemon access remains trusted host
+authority.
+
+The journal is written after Docker returns the created container ID and before
+the driver publishes it as managed. It durably records the current ID, earlier
+IDs, generation, and any exact replacement intent. A crash before the first
+journal write fails closed as unresolved ownership. A crash after a replacement
+journal commit can recover even if the public sandbox status still contains the
+previous ID.
+
+The driver permits one compatibility handoff used by NemoClaw's Docker GPU
+patch. The current authoritative container must remain present in the `exited`
+state under the exact `<canonical-name>-nemoclaw-gpu-backup-<digits>` name while
+exactly one active replacement uses the canonical name and carries the recorded
+generation. The first consistent observation journals an intent for those exact
+container IDs; a subsequent consistent observation adopts the replacement. If
+polling observes the gap or misses the overlap, the durable sandbox is retained.
+One canonical, generation-matching replacement can then be authorized and
+adopted through the same two-observation intent without resurrecting a skeletal
+sandbox record.
+
+Ambiguous candidates, terminal replacements, interrupted intents, and missing
+or incorrect generations fail closed as ownership conflicts. Containers created
+by an older driver without a journaled generation cannot use the external
+handoff; recreate them through OpenShell first so the driver can establish the
+generation. Explicit sandbox deletion removes every exact identity match, then
+clears the driver's in-memory and journaled ownership.
+
+Missing instances, ignored unowned containers, duplicate candidates, rejected
+replacements, and accepted handoff or rollback transitions produce deduplicated
+warnings and warning-level driver platform events. Notices generated before a
+watcher subscribes remain eligible for delivery on the first watched snapshot.
+
 ## Container Contract
 
 The driver-controlled container settings are part of the sandbox security

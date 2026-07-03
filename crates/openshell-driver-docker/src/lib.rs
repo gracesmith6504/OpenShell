@@ -49,15 +49,18 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
-use std::cmp::Ordering;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -67,6 +70,8 @@ use url::Url;
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const NEMOCLAW_GPU_BACKUP_MARKER: &str = "-nemoclaw-gpu-backup-";
+const LABEL_INSTANCE_GENERATION: &str = "openshell.ai/docker-instance-generation";
 
 const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
@@ -238,6 +243,7 @@ struct DockerDriverRuntimeConfig {
     allow_all_default_gpu: bool,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+    instance_state_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +261,7 @@ pub struct DockerComputeDriver {
     config: DockerDriverRuntimeConfig,
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
+    instances: Arc<Mutex<DockerInstanceOwnership>>,
     supervisor_readiness: Arc<dyn SupervisorReadiness>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
 }
@@ -262,6 +269,102 @@ pub struct DockerComputeDriver {
 struct PendingSandboxRecord {
     sandbox: DriverSandbox,
     task: Option<JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct DockerInstanceOwnership {
+    sandboxes: HashMap<String, TrackedSandboxInstances>,
+    last_notices: HashMap<String, String>,
+    restoration_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedSandboxInstances {
+    sandbox_id: String,
+    sandbox_name: String,
+    namespace: String,
+    authoritative_id: String,
+    retired_ids: HashSet<String>,
+    instance_generation: String,
+    replacement_intent: Option<DockerReplacementIntent>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct PersistedDockerInstanceOwnership {
+    version: u32,
+    sandbox_id: String,
+    sandbox_name: String,
+    namespace: String,
+    authoritative_id: String,
+    retired_ids: Vec<String>,
+    #[serde(default)]
+    instance_generation: String,
+    #[serde(default)]
+    replacement_intent: Option<DockerReplacementIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct DockerReplacementIntent {
+    incumbent_id: String,
+    replacement_id: String,
+    backup_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrackedContainerResolution {
+    OwnershipUnresolved {
+        candidate_ids: Vec<String>,
+    },
+    Authoritative {
+        index: usize,
+        unexpected_ids: Vec<String>,
+    },
+    Replacement {
+        incumbent_index: usize,
+        replacement_index: usize,
+    },
+    ReplacementFromIntent {
+        replacement_index: usize,
+    },
+    ReplacementIntentRequired {
+        incumbent_index: usize,
+        replacement_index: usize,
+        backup_name: String,
+    },
+    ReplacementIntentRequiredWithoutIncumbent {
+        replacement_index: usize,
+    },
+    ReplacementIntentInvalidated {
+        candidate_ids: Vec<String>,
+    },
+    HandoffPending {
+        incumbent_index: usize,
+        candidate_ids: Vec<String>,
+    },
+    Rollback {
+        index: usize,
+    },
+    Missing,
+    Conflict {
+        candidate_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug)]
+struct OwnershipNotice {
+    sandbox_id: String,
+    key: String,
+    reason: &'static str,
+    message: String,
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+enum TrackedSandboxObservation {
+    Container(ContainerSummary),
+    Conflict(DriverSandbox),
+    Untracked,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +504,15 @@ impl DockerComputeDriver {
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?;
         let guest_tls = docker_guest_tls_paths(&docker_config)?;
+        let instance_state_dir = openshell_core::paths::xdg_state_dir()
+            .map_err(|err| {
+                Error::config(format!("resolve Docker instance state directory: {err}"))
+            })?
+            .join("openshell")
+            .join("docker-sandbox-instances")
+            .join(docker_instance_namespace_dir_name(
+                &docker_config.sandbox_namespace,
+            ));
 
         let driver = Self {
             docker: Arc::new(docker),
@@ -421,9 +533,11 @@ impl DockerComputeDriver {
                 allow_all_default_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                instance_state_dir,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            instances: Arc::new(Mutex::new(DockerInstanceOwnership::default())),
             supervisor_readiness,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
@@ -632,13 +746,27 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
-        let container = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
+        let tracked_id = self
+            .resolve_tracked_sandbox_id(sandbox_id, sandbox_name)
             .await?;
-        if let Some(sandbox) = container.and_then(|summary| {
-            sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
-        }) {
-            return Ok(Some(sandbox));
+        let containers = self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?;
+        if let Some(tracked_id) = tracked_id {
+            match self
+                .resolve_tracked_sandbox_observation(&tracked_id, sandbox_name, &containers)
+                .await
+            {
+                TrackedSandboxObservation::Container(summary) => {
+                    if let Some(sandbox) =
+                        sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+                    {
+                        return Ok(Some(sandbox));
+                    }
+                }
+                TrackedSandboxObservation::Conflict(sandbox) => return Ok(Some(sandbox)),
+                TrackedSandboxObservation::Untracked => {}
+            }
         }
 
         Ok(self.pending_snapshot(sandbox_id, sandbox_name).await)
@@ -646,12 +774,7 @@ impl DockerComputeDriver {
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
-        let container_sandboxes = preferred_container_summaries_by_sandbox_id(&containers)
-            .into_values()
-            .filter_map(|summary| {
-                sandbox_from_container_summary(summary, self.supervisor_readiness.as_ref())
-            })
-            .collect::<Vec<_>>();
+        let container_sandboxes = self.resolve_tracked_sandbox_snapshots(&containers).await;
         let mut by_id = self.pending_snapshot_map().await;
         for sandbox in container_sandboxes {
             by_id.insert(sandbox.id.clone(), sandbox);
@@ -680,15 +803,15 @@ impl DockerComputeDriver {
             gpu_devices.as_deref(),
         )?;
 
-        if self
-            .find_managed_container_summary(&sandbox.id, &sandbox.name)
+        if !self
+            .find_managed_container_summaries(&sandbox.id, &sandbox.name)
             .await?
-            .is_some()
+            .is_empty()
         {
             return Err(Status::already_exists("sandbox already exists"));
         }
 
-        self.reserve_pending_sandbox(sandbox).await?;
+        let cancellation = self.reserve_pending_sandbox(sandbox).await?;
         let image = sandbox_image(sandbox).unwrap_or_default();
         self.publish_docker_progress(
             &sandbox.id,
@@ -706,22 +829,45 @@ impl DockerComputeDriver {
         let driver = self.clone();
         let sandbox_for_task = sandbox.clone();
         let sandbox_id = sandbox.id.clone();
-        let task = tokio::spawn(async move {
-            driver.provision_sandbox(sandbox_for_task).await;
-        });
+        let task_cancellation = cancellation.clone();
+        let (start_tx, start_rx) = oneshot::channel();
+        let mut task = Some(tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                driver
+                    .provision_sandbox(sandbox_for_task, task_cancellation)
+                    .await;
+            }
+        }));
 
-        let mut pending = self.pending.lock().await;
-        if let Some(record) = pending.get_mut(&sandbox_id) {
-            record.task = Some(task);
+        let task_registered = {
+            let mut pending = self.pending.lock().await;
+            if let Some(record) = pending.get_mut(&sandbox_id)
+                && !record.cancelled.load(AtomicOrdering::Acquire)
+            {
+                record.task = task.take();
+                true
+            } else {
+                false
+            }
+        };
+        if task_registered {
+            let _ = start_tx.send(());
         } else {
-            task.abort();
+            cancellation.store(true, AtomicOrdering::Release);
+            drop(start_tx);
+            if let Some(task) = task {
+                let _ = task.await;
+            }
         }
 
         Ok(())
     }
 
-    async fn provision_sandbox(&self, sandbox: DriverSandbox) {
-        match self.provision_sandbox_inner(&sandbox).await {
+    async fn provision_sandbox(&self, sandbox: DriverSandbox, cancellation: Arc<AtomicBool>) {
+        match self
+            .provision_sandbox_inner(&sandbox, cancellation.as_ref())
+            .await
+        {
             Ok(()) => {
                 self.clear_pending_sandbox(&sandbox.id).await;
             }
@@ -734,7 +880,14 @@ impl DockerComputeDriver {
     async fn provision_sandbox_inner(
         &self,
         sandbox: &DriverSandbox,
+        cancellation: &AtomicBool,
     ) -> Result<(), DockerProvisioningFailure> {
+        if cancellation.load(AtomicOrdering::Acquire) {
+            return Err(DockerProvisioningFailure::new(
+                "ContainerCreateCancelled",
+                "Docker sandbox creation was cancelled",
+            ));
+        }
         let validated = Self::validated_sandbox(sandbox, &self.config).map_err(|status| {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
@@ -744,6 +897,12 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
             })?;
+        if cancellation.load(AtomicOrdering::Acquire) {
+            return Err(DockerProvisioningFailure::new(
+                "ContainerCreateCancelled",
+                "Docker sandbox creation was cancelled",
+            ));
+        }
         let token_file_created = write_sandbox_token_file(sandbox, &self.config)
             .await
             .map_err(|status| {
@@ -764,7 +923,8 @@ impl DockerComputeDriver {
                 }
                 DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
             })?;
-        let create_body = build_container_create_body_with_gpu_devices(
+        let instance_generation = uuid::Uuid::new_v4().to_string();
+        let mut create_body = build_container_create_body_with_gpu_devices(
             sandbox,
             &self.config,
             &validated.driver_config,
@@ -776,7 +936,12 @@ impl DockerComputeDriver {
             }
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
-        self.docker
+        create_body.labels.get_or_insert_default().insert(
+            LABEL_INSTANCE_GENERATION.to_string(),
+            instance_generation.clone(),
+        );
+        let created = self
+            .docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::default()
@@ -795,6 +960,30 @@ impl DockerComputeDriver {
                     create_status_from_docker_error("create docker sandbox container", err),
                 )
             })?;
+        if let Err(status) = self
+            .track_created_instance(
+                sandbox,
+                &created.id,
+                &instance_generation,
+                Some(cancellation),
+            )
+            .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &created.id,
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                )
+                .await;
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            return Err(DockerProvisioningFailure::from_status(
+                "ContainerOwnershipPersistFailed",
+                status,
+            ));
+        }
         self.publish_docker_progress(
             &sandbox.id,
             "Created",
@@ -821,6 +1010,8 @@ impl DockerComputeDriver {
             if token_file_created {
                 cleanup_sandbox_token_file(sandbox, &self.config);
             }
+            self.forget_tracked_sandbox(&sandbox.id, &sandbox.name)
+                .await;
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
                 create_status_from_docker_error("start docker sandbox container", err),
@@ -851,18 +1042,24 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self.remove_pending_sandbox(sandbox_id, sandbox_name).await;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
+        let tracked_id = self
+            .resolve_tracked_sandbox_id(sandbox_id, sandbox_name)
+            .await?;
+        let effective_id = tracked_id.as_deref().unwrap_or(sandbox_id);
+        let mut pending = self
+            .remove_pending_sandbox(effective_id, sandbox_name)
+            .await;
+        if let Some(record) = pending.as_mut()
+            && let Some(task) = record.task.take()
         {
-            task.abort();
+            let _ = task.await;
         }
 
         let containers = self
-            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .find_managed_container_summaries(effective_id, sandbox_name)
             .await?;
         if containers.is_empty() {
-            if let Some(record) = pending {
+            if let Some(record) = pending.as_ref() {
                 let container_name = container_name_for_sandbox(&record.sandbox);
                 match self
                     .docker
@@ -874,10 +1071,14 @@ impl DockerComputeDriver {
                 {
                     Ok(()) => {
                         cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        self.forget_tracked_sandbox(&record.sandbox.id, &record.sandbox.name)
+                            .await;
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
                         cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        self.forget_tracked_sandbox(&record.sandbox.id, &record.sandbox.name)
+                            .await;
                         return Ok(true);
                     }
                     Err(err) => {
@@ -885,13 +1086,16 @@ impl DockerComputeDriver {
                     }
                 }
             }
+            cleanup_sandbox_token_file_for_delete(effective_id, None, &self.config);
+            self.forget_tracked_sandbox(effective_id, sandbox_name)
+                .await;
             return Ok(false);
         }
         let targets = managed_container_targets(&containers);
         if targets.is_empty() {
-            if pending.is_some() {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
-            }
+            cleanup_sandbox_token_file_for_delete(effective_id, pending.as_ref(), &self.config);
+            self.forget_tracked_sandbox(effective_id, sandbox_name)
+                .await;
             return Ok(pending.is_some());
         }
 
@@ -919,20 +1123,33 @@ impl DockerComputeDriver {
             )));
         }
 
-        cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+        cleanup_sandbox_token_file_for_delete(effective_id, pending.as_ref(), &self.config);
+        self.forget_tracked_sandbox(effective_id, sandbox_name)
+            .await;
         Ok(deleted || pending.is_some())
     }
 
     async fn stop_sandbox_inner(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        let tracked_id = self
+            .resolve_tracked_sandbox_id(sandbox_id, sandbox_name)
+            .await?;
+        let effective_id = tracked_id.as_deref().unwrap_or(sandbox_id);
+        let mut pending = self
+            .remove_pending_sandbox(effective_id, sandbox_name)
+            .await;
+        if let Some(record) = pending.as_mut()
+            && let Some(task) = record.task.take()
+        {
+            let _ = task.await;
+        }
         let containers = self
-            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .find_managed_container_summaries(effective_id, sandbox_name)
             .await?;
         if containers.is_empty() {
-            if let Some(record) = self.remove_pending_sandbox(sandbox_id, sandbox_name).await {
-                if let Some(task) = record.task {
-                    task.abort();
-                }
+            if let Some(record) = pending {
                 cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                self.forget_tracked_sandbox(&record.sandbox.id, &record.sandbox.name)
+                    .await;
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -990,16 +1207,32 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        expected_instance_id: &str,
+        should_start: bool,
     ) -> Result<bool, Status> {
-        let Some(container) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
-            .await?
-        else {
+        self.track_persisted_instance(sandbox_id, sandbox_name, expected_instance_id)
+            .await?;
+        let containers = self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?;
+        if containers.is_empty() {
             return Ok(false);
+        }
+        let container = match self
+            .resolve_tracked_sandbox_observation(sandbox_id, sandbox_name, &containers)
+            .await
+        {
+            TrackedSandboxObservation::Container(container) => container,
+            TrackedSandboxObservation::Conflict(_) | TrackedSandboxObservation::Untracked => {
+                return Ok(false);
+            }
         };
         let Some(target) = summary_container_target(&container) else {
             return Ok(false);
         };
+        if !should_start {
+            return Ok(true);
+        }
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         if !container_state_needs_resume(state) {
             return Ok(true);
@@ -1013,6 +1246,18 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("start docker sandbox container", err)),
         }
+    }
+
+    pub async fn complete_persisted_delete(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Result<bool, Status> {
+        let result = self.delete_sandbox_inner(sandbox_id, sandbox_name).await;
+        if result.is_ok() && !sandbox_id.is_empty() {
+            remove_docker_instance_ownership(sandbox_id, &self.config);
+        }
+        result
     }
 
     pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
@@ -1078,7 +1323,10 @@ impl DockerComputeDriver {
         Ok(stopped)
     }
 
-    async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
+    async fn reserve_pending_sandbox(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<Arc<AtomicBool>, Status> {
         let mut pending = self.pending.lock().await;
         if pending
             .values()
@@ -1087,6 +1335,7 @@ impl DockerComputeDriver {
             return Err(Status::already_exists("sandbox already exists"));
         }
 
+        let cancelled = Arc::new(AtomicBool::new(false));
         pending.insert(
             sandbox.id.clone(),
             PendingSandboxRecord {
@@ -1097,9 +1346,10 @@ impl DockerComputeDriver {
                     false,
                 ),
                 task: None,
+                cancelled: cancelled.clone(),
             },
         );
-        Ok(())
+        Ok(cancelled)
     }
 
     async fn pending_snapshot(
@@ -1136,7 +1386,9 @@ impl DockerComputeDriver {
         let id = pending.iter().find_map(|(id, record)| {
             pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name).then(|| id.clone())
         })?;
-        pending.remove(&id)
+        let record = pending.remove(&id)?;
+        record.cancelled.store(true, AtomicOrdering::Release);
+        Some(record)
     }
 
     async fn fail_pending_sandbox(
@@ -1178,13 +1430,30 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<(), Status> {
-        if let Some(summary) = self
-            .find_managed_container_summary(sandbox_id, sandbox_name)
+        let Some(tracked_id) = self
+            .resolve_tracked_sandbox_id(sandbox_id, sandbox_name)
             .await?
-            && let Some(sandbox) =
-                sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+        else {
+            return Ok(());
+        };
+        let containers = self
+            .find_managed_container_summaries(sandbox_id, sandbox_name)
+            .await?;
+        match self
+            .resolve_tracked_sandbox_observation(&tracked_id, sandbox_name, &containers)
+            .await
         {
-            self.publish_sandbox_snapshot(sandbox);
+            TrackedSandboxObservation::Container(summary) => {
+                if let Some(sandbox) =
+                    sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+                {
+                    self.publish_sandbox_snapshot(sandbox);
+                }
+            }
+            TrackedSandboxObservation::Conflict(sandbox) => {
+                self.publish_sandbox_snapshot(sandbox);
+            }
+            TrackedSandboxObservation::Untracked => {}
         }
         Ok(())
     }
@@ -1207,15 +1476,17 @@ impl DockerComputeDriver {
         });
     }
 
-    fn publish_platform_event(&self, sandbox_id: String, event: DriverPlatformEvent) {
-        let _ = self.events.send(WatchSandboxesEvent {
-            payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
-                WatchSandboxesPlatformEvent {
-                    sandbox_id,
-                    event: Some(event),
-                },
-            )),
-        });
+    fn publish_platform_event(&self, sandbox_id: String, event: DriverPlatformEvent) -> bool {
+        self.events
+            .send(WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
+                    WatchSandboxesPlatformEvent {
+                        sandbox_id,
+                        event: Some(event),
+                    },
+                )),
+            })
+            .is_ok()
     }
 
     fn publish_docker_progress(
@@ -1327,16 +1598,899 @@ impl DockerComputeDriver {
         ))
     }
 
-    async fn find_managed_container_summary(
+    async fn track_created_instance(
+        &self,
+        sandbox: &DriverSandbox,
+        instance_id: &str,
+        instance_generation: &str,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<(), Status> {
+        if instance_id.is_empty() {
+            return Err(Status::internal(
+                "Docker returned an empty container ID; instance ownership was not recorded",
+            ));
+        }
+        let tracked = TrackedSandboxInstances {
+            sandbox_id: sandbox.id.clone(),
+            sandbox_name: sandbox.name.clone(),
+            namespace: self.config.sandbox_namespace.clone(),
+            authoritative_id: instance_id.to_string(),
+            retired_ids: HashSet::new(),
+            instance_generation: instance_generation.to_string(),
+            replacement_intent: None,
+        };
+        persist_docker_instance_ownership(&tracked, &self.config).map_err(|err| {
+            Status::internal(format!("persist Docker instance ownership failed: {err}"))
+        })?;
+        if cancellation.is_some_and(|cancelled| cancelled.load(AtomicOrdering::Acquire)) {
+            remove_docker_instance_ownership(&sandbox.id, &self.config);
+            return Err(Status::cancelled("Docker sandbox creation was cancelled"));
+        }
+        {
+            let mut ownership = self.instances.lock().await;
+            if cancellation.is_some_and(|cancelled| cancelled.load(AtomicOrdering::Acquire)) {
+                drop(ownership);
+                remove_docker_instance_ownership(&sandbox.id, &self.config);
+                return Err(Status::cancelled("Docker sandbox creation was cancelled"));
+            }
+            ownership
+                .sandboxes
+                .insert(sandbox.id.clone(), tracked.clone());
+            ownership.last_notices.remove(&sandbox.id);
+        }
+        Ok(())
+    }
+
+    async fn resolve_tracked_sandbox_id(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Result<Option<ContainerSummary>, Status> {
-        Ok(self
-            .find_managed_container_summaries(sandbox_id, sandbox_name)
-            .await?
-            .into_iter()
-            .max_by(compare_container_summary_preference))
+    ) -> Result<Option<String>, Status> {
+        let ownership = self.instances.lock().await;
+        if !sandbox_id.is_empty() {
+            let Some(tracked) = ownership.sandboxes.get(sandbox_id) else {
+                return Ok(None);
+            };
+            if !sandbox_name.is_empty() && tracked.sandbox_name != sandbox_name {
+                return Err(Status::not_found("sandbox identity does not match"));
+            }
+            return Ok(Some(sandbox_id.to_string()));
+        }
+
+        let mut matching_ids = ownership
+            .sandboxes
+            .iter()
+            .filter(|(_, tracked)| tracked.sandbox_name == sandbox_name)
+            .map(|(id, _)| id.clone());
+        let Some(id) = matching_ids.next() else {
+            return Ok(None);
+        };
+        if matching_ids.next().is_some() {
+            return Err(Status::failed_precondition(
+                "sandbox name matches multiple tracked instances",
+            ));
+        }
+        Ok(Some(id))
+    }
+
+    async fn track_persisted_instance(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        expected_instance_id: &str,
+    ) -> Result<(), Status> {
+        let expected_instance_id = expected_instance_id.to_string();
+        let (instance_id, retired_ids, instance_generation, replacement_intent) =
+            match load_docker_instance_ownership(sandbox_id, sandbox_name, &self.config) {
+                Ok(Some(persisted))
+                    if !persisted.authoritative_id.is_empty()
+                        && (expected_instance_id.is_empty()
+                            || persisted.authoritative_id == expected_instance_id
+                            || persisted.retired_ids.contains(&expected_instance_id)) =>
+                {
+                    let authoritative_id = persisted.authoritative_id;
+                    let retired_ids = persisted
+                        .retired_ids
+                        .into_iter()
+                        .filter(|retired_id| {
+                            !retired_id.is_empty() && retired_id != &authoritative_id
+                        })
+                        .collect();
+                    (
+                        authoritative_id,
+                        retired_ids,
+                        persisted.instance_generation,
+                        persisted.replacement_intent,
+                    )
+                }
+                Ok(Some(persisted)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        persisted_instance_id = %persisted.authoritative_id,
+                        expected_instance_id = %expected_instance_id,
+                        "Ignoring stale Docker instance ownership state"
+                    );
+                    (expected_instance_id, HashSet::new(), String::new(), None)
+                }
+                Ok(None) => (expected_instance_id, HashSet::new(), String::new(), None),
+                Err(err) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Ignoring unreadable Docker instance ownership state"
+                    );
+                    (expected_instance_id, HashSet::new(), String::new(), None)
+                }
+            };
+        let tracked = TrackedSandboxInstances {
+            sandbox_id: sandbox_id.to_string(),
+            sandbox_name: sandbox_name.to_string(),
+            namespace: self.config.sandbox_namespace.clone(),
+            authoritative_id: instance_id,
+            retired_ids,
+            instance_generation,
+            replacement_intent,
+        };
+
+        persist_docker_instance_ownership(&tracked, &self.config).map_err(|err| {
+            Status::internal(format!("persist Docker instance ownership failed: {err}"))
+        })?;
+        {
+            let mut ownership = self.instances.lock().await;
+            ownership
+                .sandboxes
+                .insert(sandbox_id.to_string(), tracked.clone());
+            ownership.last_notices.remove(sandbox_id);
+        }
+
+        Ok(())
+    }
+
+    async fn forget_tracked_sandbox(&self, sandbox_id: &str, sandbox_name: &str) {
+        let tracked_id = match self
+            .resolve_tracked_sandbox_id(sandbox_id, sandbox_name)
+            .await
+        {
+            Ok(Some(tracked_id)) => Some(tracked_id),
+            Ok(None) if !sandbox_id.is_empty() => Some(sandbox_id.to_string()),
+            Ok(None) | Err(_) => None,
+        };
+        let mut ownership = self.instances.lock().await;
+        if let Some(tracked_id) = tracked_id {
+            ownership.sandboxes.remove(&tracked_id);
+            ownership.last_notices.remove(&tracked_id);
+            drop(ownership);
+            remove_docker_instance_ownership(&tracked_id, &self.config);
+        }
+    }
+
+    pub async fn complete_instance_restore(&self) {
+        self.instances.lock().await.restoration_complete = true;
+    }
+
+    async fn resolve_tracked_sandbox_snapshots(
+        &self,
+        summaries: &[ContainerSummary],
+    ) -> Vec<DriverSandbox> {
+        let mut grouped = HashMap::<String, Vec<ContainerSummary>>::new();
+        for summary in summaries {
+            let Some(sandbox_id) = summary
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            else {
+                continue;
+            };
+            grouped
+                .entry(sandbox_id.clone())
+                .or_default()
+                .push(summary.clone());
+        }
+
+        let tracked_ids = {
+            let ownership = self.instances.lock().await;
+            ownership.sandboxes.keys().cloned().collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::with_capacity(tracked_ids.len());
+        for sandbox_id in &tracked_ids {
+            let (sandbox_name, namespace) = {
+                let ownership = self.instances.lock().await;
+                ownership
+                    .sandboxes
+                    .get(sandbox_id)
+                    .map(|tracked| (tracked.sandbox_name.clone(), tracked.namespace.clone()))
+                    .unwrap_or_default()
+            };
+            let candidates = matching_managed_container_summaries(
+                grouped.remove(sandbox_id).unwrap_or_default(),
+                &namespace,
+                sandbox_id,
+                &sandbox_name,
+            );
+            match self
+                .resolve_tracked_sandbox_observation(sandbox_id, &sandbox_name, &candidates)
+                .await
+            {
+                TrackedSandboxObservation::Container(summary) => {
+                    if let Some(sandbox) =
+                        sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+                    {
+                        snapshots.push(sandbox);
+                    }
+                }
+                TrackedSandboxObservation::Conflict(sandbox) => snapshots.push(sandbox),
+                TrackedSandboxObservation::Untracked => {}
+            }
+        }
+
+        let restoration_complete = self.instances.lock().await.restoration_complete;
+        if restoration_complete {
+            for (sandbox_id, candidates) in grouped {
+                let mut candidate_ids = candidates
+                    .iter()
+                    .filter_map(container_summary_id)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                candidate_ids.sort();
+                let key = format!("unowned:{}", candidate_ids.join(","));
+                let should_publish = {
+                    let mut ownership = self.instances.lock().await;
+                    if ownership.last_notices.get(&sandbox_id) == Some(&key) {
+                        false
+                    } else {
+                        ownership
+                            .last_notices
+                            .insert(sandbox_id.clone(), key.clone());
+                        true
+                    }
+                };
+                if should_publish {
+                    let notice = OwnershipNotice {
+                        sandbox_id: sandbox_id.clone(),
+                        key: key.clone(),
+                        reason: "UnownedSandboxContainersIgnored",
+                        message: format!(
+                            "Ignored Docker containers with sandbox identity {sandbox_id} because no durable OpenShell instance owns them"
+                        ),
+                        metadata: HashMap::from([(
+                            "candidate_instance_ids".to_string(),
+                            candidate_ids.join(","),
+                        )]),
+                    };
+                    if !self.publish_ownership_notice(notice) {
+                        let mut ownership = self.instances.lock().await;
+                        if ownership.last_notices.get(&sandbox_id) == Some(&key) {
+                            ownership.last_notices.remove(&sandbox_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        snapshots
+    }
+
+    async fn resolve_tracked_sandbox_observation(
+        &self,
+        sandbox_id: &str,
+        _sandbox_name: &str,
+        summaries: &[ContainerSummary],
+    ) -> TrackedSandboxObservation {
+        let (observation, notice, should_publish) = {
+            let mut ownership = self.instances.lock().await;
+            let Some(tracked) = ownership.sandboxes.get_mut(sandbox_id) else {
+                return TrackedSandboxObservation::Untracked;
+            };
+            let resolution = resolve_tracked_container(summaries, tracked);
+            let (observation, notice) = match resolution {
+                TrackedContainerResolution::OwnershipUnresolved { mut candidate_ids } => {
+                    candidate_ids.sort();
+                    let message = if candidate_ids.is_empty() {
+                        "Docker sandbox ownership is unresolved because the durable record has no instance ID"
+                            .to_string()
+                    } else {
+                        format!(
+                            "Refused Docker candidates {} because the durable sandbox record has no authoritative instance ID",
+                            candidate_ids.join(",")
+                        )
+                    };
+                    (
+                        TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                            sandbox_id,
+                            tracked,
+                            "ContainerOwnershipUnresolved",
+                            &message,
+                        )),
+                        Some(OwnershipNotice {
+                            sandbox_id: sandbox_id.to_string(),
+                            key: format!("unresolved:{}", candidate_ids.join(",")),
+                            reason: "ContainerOwnershipUnresolved",
+                            message,
+                            metadata: HashMap::from([(
+                                "candidate_instance_ids".to_string(),
+                                candidate_ids.join(","),
+                            )]),
+                        }),
+                    )
+                }
+                TrackedContainerResolution::Authoritative {
+                    index,
+                    unexpected_ids,
+                } => {
+                    let notice = if unexpected_ids.is_empty() {
+                        None
+                    } else {
+                        let mut ids = unexpected_ids;
+                        ids.sort();
+                        Some(OwnershipNotice {
+                            sandbox_id: sandbox_id.to_string(),
+                            key: format!("duplicates:{}", ids.join(",")),
+                            reason: "ContainerIdentityConflict",
+                            message: format!(
+                                "Ignored duplicate Docker sandbox instances {}; retaining authoritative instance {}",
+                                ids.join(","),
+                                tracked.authoritative_id
+                            ),
+                            metadata: HashMap::from([
+                                (
+                                    "authoritative_instance_id".to_string(),
+                                    tracked.authoritative_id.clone(),
+                                ),
+                                ("candidate_instance_ids".to_string(), ids.join(",")),
+                            ]),
+                        })
+                    };
+                    (
+                        TrackedSandboxObservation::Container(summaries[index].clone()),
+                        notice,
+                    )
+                }
+                TrackedContainerResolution::ReplacementIntentRequired {
+                    incumbent_index,
+                    replacement_index,
+                    backup_name,
+                } => {
+                    let incumbent_id = container_summary_id(&summaries[incumbent_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let replacement_id = container_summary_id(&summaries[replacement_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut next = tracked.clone();
+                    next.replacement_intent = Some(DockerReplacementIntent {
+                        incumbent_id: incumbent_id.clone(),
+                        replacement_id: replacement_id.clone(),
+                        backup_name,
+                    });
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            let message = format!(
+                                "Recorded replacement intent from Docker instance {incumbent_id} to canonical instance {replacement_id}; adoption requires a subsequent consistent observation"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerReplacementPending",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!(
+                                        "replacement-intent:{incumbent_id}:{replacement_id}"
+                                    ),
+                                    reason: "SandboxReplacementIntentRecorded",
+                                    message,
+                                    metadata: HashMap::from([
+                                        ("authoritative_instance_id".to_string(), incumbent_id),
+                                        ("replacement_instance_id".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused to authorize Docker replacement {replacement_id} because replacement intent could not be persisted: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("intent-persist-failed:{replacement_id}"),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        ("candidate_instance_ids".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::ReplacementIntentRequiredWithoutIncumbent {
+                    replacement_index,
+                } => {
+                    let incumbent_id = tracked.authoritative_id.clone();
+                    let replacement_id = container_summary_id(&summaries[replacement_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut next = tracked.clone();
+                    next.replacement_intent = Some(DockerReplacementIntent {
+                        incumbent_id: incumbent_id.clone(),
+                        replacement_id: replacement_id.clone(),
+                        backup_name: String::new(),
+                    });
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            let message = format!(
+                                "Recorded replacement intent from missing Docker instance {incumbent_id} to canonical instance {replacement_id} after validating its driver-issued generation; adoption requires a subsequent consistent observation"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerReplacementPending",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!(
+                                        "replacement-intent-without-incumbent:{incumbent_id}:{replacement_id}"
+                                    ),
+                                    reason: "SandboxReplacementIntentRecorded",
+                                    message,
+                                    metadata: HashMap::from([
+                                        ("authoritative_instance_id".to_string(), incumbent_id),
+                                        ("replacement_instance_id".to_string(), replacement_id),
+                                        (
+                                            "replacement_basis".to_string(),
+                                            "driver-issued-instance-generation".to_string(),
+                                        ),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused to authorize Docker replacement {replacement_id} because replacement intent could not be persisted: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("intent-persist-failed:{replacement_id}"),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        ("candidate_instance_ids".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::ReplacementIntentInvalidated { mut candidate_ids } => {
+                    candidate_ids.sort();
+                    let invalidated = tracked.replacement_intent.clone();
+                    let mut next = tracked.clone();
+                    next.replacement_intent = None;
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            let message = format!(
+                                "Invalidated Docker replacement intent because the exact safe overlap was interrupted; observed candidates {}",
+                                candidate_ids.join(",")
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerReplacementPending",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!(
+                                        "replacement-intent-invalidated:{}",
+                                        candidate_ids.join(",")
+                                    ),
+                                    reason: "SandboxReplacementIntentInvalidated",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        (
+                                            "candidate_instance_ids".to_string(),
+                                            candidate_ids.join(","),
+                                        ),
+                                        (
+                                            "invalidated_replacement_instance_id".to_string(),
+                                            invalidated
+                                                .map(|intent| intent.replacement_id)
+                                                .unwrap_or_default(),
+                                        ),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused Docker candidates because stale replacement intent could not be cleared: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: "intent-clear-persist-failed".to_string(),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([(
+                                        "authoritative_instance_id".to_string(),
+                                        tracked.authoritative_id.clone(),
+                                    )]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::ReplacementFromIntent { replacement_index } => {
+                    let replacement_id = container_summary_id(&summaries[replacement_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let incumbent_id = tracked.replacement_intent.as_ref().map_or_else(
+                        || tracked.authoritative_id.clone(),
+                        |intent| intent.incumbent_id.clone(),
+                    );
+                    let mut next = tracked.clone();
+                    next.retired_ids.insert(incumbent_id.clone());
+                    next.authoritative_id.clone_from(&replacement_id);
+                    next.replacement_intent = None;
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            (
+                                TrackedSandboxObservation::Container(
+                                    summaries[replacement_index].clone(),
+                                ),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!(
+                                        "replacement-completed:{incumbent_id}:{replacement_id}"
+                                    ),
+                                    reason: "SandboxInstanceReplaced",
+                                    message: format!(
+                                        "Completed authorized Docker replacement {incumbent_id} to canonical instance {replacement_id} after the retained backup was removed"
+                                    ),
+                                    metadata: HashMap::from([
+                                        ("previous_instance_id".to_string(), incumbent_id),
+                                        ("authoritative_instance_id".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused to complete authorized Docker replacement {replacement_id} because ownership intent could not be persisted: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("replacement-complete-failed:{replacement_id}"),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        ("candidate_instance_ids".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::Replacement {
+                    incumbent_index,
+                    replacement_index,
+                } => {
+                    let incumbent_id = container_summary_id(&summaries[incumbent_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let replacement_id = container_summary_id(&summaries[replacement_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut next = tracked.clone();
+                    next.retired_ids.insert(incumbent_id.clone());
+                    next.authoritative_id.clone_from(&replacement_id);
+                    next.replacement_intent = None;
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            (
+                                TrackedSandboxObservation::Container(
+                                    summaries[replacement_index].clone(),
+                                ),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("replacement:{incumbent_id}:{replacement_id}"),
+                                    reason: "SandboxInstanceReplaced",
+                                    message: format!(
+                                        "Accepted canonical Docker instance {replacement_id} as the replacement for retained compatibility backup {incumbent_id}"
+                                    ),
+                                    metadata: HashMap::from([
+                                        ("previous_instance_id".to_string(), incumbent_id),
+                                        ("authoritative_instance_id".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused Docker replacement {replacement_id} because ownership intent could not be persisted: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("persist-failed:{replacement_id}"),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        ("candidate_instance_ids".to_string(), replacement_id),
+                                    ]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::HandoffPending {
+                    incumbent_index,
+                    mut candidate_ids,
+                } => {
+                    candidate_ids.sort();
+                    let incumbent_id = container_summary_id(&summaries[incumbent_index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let message = if candidate_ids.is_empty() {
+                        format!(
+                            "Docker instance {incumbent_id} is retained as a stopped compatibility backup; waiting for one canonical replacement"
+                        )
+                    } else {
+                        format!(
+                            "Docker instance {incumbent_id} is retained as a stopped compatibility backup, but replacement candidates {} are ambiguous",
+                            candidate_ids.join(",")
+                        )
+                    };
+                    (
+                        TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                            sandbox_id,
+                            tracked,
+                            "ContainerReplacementPending",
+                            &message,
+                        )),
+                        Some(OwnershipNotice {
+                            sandbox_id: sandbox_id.to_string(),
+                            key: format!(
+                                "handoff-pending:{incumbent_id}:{}",
+                                candidate_ids.join(",")
+                            ),
+                            reason: "ContainerReplacementPending",
+                            message,
+                            metadata: HashMap::from([
+                                ("authoritative_instance_id".to_string(), incumbent_id),
+                                (
+                                    "candidate_instance_ids".to_string(),
+                                    candidate_ids.join(","),
+                                ),
+                            ]),
+                        }),
+                    )
+                }
+                TrackedContainerResolution::Rollback { index } => {
+                    let failed_instance_id = tracked.authoritative_id.clone();
+                    let restored_instance_id = container_summary_id(&summaries[index])
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut next = tracked.clone();
+                    next.authoritative_id.clone_from(&restored_instance_id);
+                    next.retired_ids.remove(&restored_instance_id);
+                    next.retired_ids.insert(failed_instance_id.clone());
+                    next.replacement_intent = None;
+                    match persist_docker_instance_ownership(&next, &self.config) {
+                        Ok(()) => {
+                            *tracked = next;
+                            (
+                                TrackedSandboxObservation::Container(summaries[index].clone()),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!(
+                                        "rollback:{failed_instance_id}:{restored_instance_id}"
+                                    ),
+                                    reason: "SandboxInstanceRollback",
+                                    message: format!(
+                                        "Restored canonical Docker instance {restored_instance_id} after replacement {failed_instance_id} disappeared"
+                                    ),
+                                    metadata: HashMap::from([
+                                        ("failed_instance_id".to_string(), failed_instance_id),
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            restored_instance_id,
+                                        ),
+                                    ]),
+                                }),
+                            )
+                        }
+                        Err(err) => {
+                            let message = format!(
+                                "Refused Docker rollback to {restored_instance_id} because ownership intent could not be persisted: {err}"
+                            );
+                            (
+                                TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                                    sandbox_id,
+                                    tracked,
+                                    "ContainerOwnershipPersistFailed",
+                                    &message,
+                                )),
+                                Some(OwnershipNotice {
+                                    sandbox_id: sandbox_id.to_string(),
+                                    key: format!("rollback-persist-failed:{restored_instance_id}"),
+                                    reason: "ContainerOwnershipPersistFailed",
+                                    message,
+                                    metadata: HashMap::from([
+                                        (
+                                            "authoritative_instance_id".to_string(),
+                                            tracked.authoritative_id.clone(),
+                                        ),
+                                        (
+                                            "candidate_instance_ids".to_string(),
+                                            restored_instance_id,
+                                        ),
+                                    ]),
+                                }),
+                            )
+                        }
+                    }
+                }
+                TrackedContainerResolution::Missing => {
+                    let message = format!(
+                        "Authoritative Docker instance {} is missing; refusing out-of-band replacement until an overlapping handoff is observed",
+                        tracked.authoritative_id
+                    );
+                    (
+                        TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                            sandbox_id,
+                            tracked,
+                            "ContainerInstanceMissing",
+                            &message,
+                        )),
+                        Some(OwnershipNotice {
+                            sandbox_id: sandbox_id.to_string(),
+                            key: format!("missing:{}", tracked.authoritative_id),
+                            reason: "ContainerInstanceMissing",
+                            message,
+                            metadata: HashMap::from([(
+                                "authoritative_instance_id".to_string(),
+                                tracked.authoritative_id.clone(),
+                            )]),
+                        }),
+                    )
+                }
+                TrackedContainerResolution::Conflict { mut candidate_ids } => {
+                    candidate_ids.sort();
+                    let message = format!(
+                        "Refused unexpected Docker replacement candidates {} because authoritative instance {} was not retained for an overlapping handoff",
+                        candidate_ids.join(","),
+                        tracked.authoritative_id
+                    );
+                    (
+                        TrackedSandboxObservation::Conflict(ownership_conflict_snapshot(
+                            sandbox_id,
+                            tracked,
+                            "ContainerIdentityConflict",
+                            &message,
+                        )),
+                        Some(OwnershipNotice {
+                            sandbox_id: sandbox_id.to_string(),
+                            key: format!("conflict:{}", candidate_ids.join(",")),
+                            reason: "ContainerIdentityConflict",
+                            message,
+                            metadata: HashMap::from([
+                                (
+                                    "authoritative_instance_id".to_string(),
+                                    tracked.authoritative_id.clone(),
+                                ),
+                                (
+                                    "candidate_instance_ids".to_string(),
+                                    candidate_ids.join(","),
+                                ),
+                            ]),
+                        }),
+                    )
+                }
+            };
+
+            let should_publish = if let Some(notice) = notice.as_ref() {
+                if ownership.last_notices.get(sandbox_id) == Some(&notice.key) {
+                    false
+                } else {
+                    ownership
+                        .last_notices
+                        .insert(sandbox_id.to_string(), notice.key.clone());
+                    true
+                }
+            } else {
+                ownership.last_notices.remove(sandbox_id);
+                false
+            };
+            (observation, notice, should_publish)
+        };
+
+        if should_publish && let Some(notice) = notice {
+            let sandbox_id = notice.sandbox_id.clone();
+            let key = notice.key.clone();
+            if !self.publish_ownership_notice(notice) {
+                let mut ownership = self.instances.lock().await;
+                if ownership.last_notices.get(&sandbox_id) == Some(&key) {
+                    ownership.last_notices.remove(&sandbox_id);
+                }
+            }
+        }
+        observation
+    }
+
+    fn publish_ownership_notice(&self, notice: OwnershipNotice) -> bool {
+        warn!(
+            sandbox_id = %notice.sandbox_id,
+            reason = notice.reason,
+            message = %notice.message,
+            "Docker sandbox instance ownership event"
+        );
+        let mut event = platform_event("docker", "Warning", notice.reason, notice.message);
+        event.metadata = notice.metadata;
+        self.publish_platform_event(notice.sandbox_id, event)
     }
 
     async fn ensure_image_available(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -1511,7 +2665,10 @@ impl ComputeDriver for DockerComputeDriver {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
-        let event_sandbox_id = request.sandbox_id.clone();
+        let event_sandbox_id = self
+            .resolve_tracked_sandbox_id(&request.sandbox_id, &request.sandbox_name)
+            .await?
+            .unwrap_or_else(|| request.sandbox_id.clone());
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
@@ -1619,8 +2776,9 @@ fn pending_sandbox_snapshot(
 }
 
 fn pending_sandbox_matches(sandbox: &DriverSandbox, sandbox_id: &str, sandbox_name: &str) -> bool {
-    (!sandbox_id.is_empty() && sandbox.id == sandbox_id)
-        || (!sandbox_name.is_empty() && sandbox.name == sandbox_name)
+    (!sandbox_id.is_empty() || !sandbox_name.is_empty())
+        && (sandbox_id.is_empty() || sandbox.id == sandbox_id)
+        && (sandbox_name.is_empty() || sandbox.name == sandbox_name)
 }
 
 fn provisioning_condition() -> DriverCondition {
@@ -2188,6 +3346,149 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
     if let Some(dir) = path.parent() {
         let _ = std::fs::remove_dir(dir);
     }
+}
+
+fn docker_instance_state_path(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Option<PathBuf> {
+    if config.instance_state_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(sandbox_id.as_bytes());
+    Some(config.instance_state_dir.join(format!("{digest:x}.json")))
+}
+
+fn load_docker_instance_ownership(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<PersistedDockerInstanceOwnership>, String> {
+    let Some(path) = docker_instance_state_path(sandbox_id, config) else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", path.display())),
+    };
+    let persisted: PersistedDockerInstanceOwnership = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("decode {}: {err}", path.display()))?;
+    if persisted.version != 1 {
+        return Err(format!(
+            "decode {}: unsupported ownership state version {}",
+            path.display(),
+            persisted.version
+        ));
+    }
+    if persisted.sandbox_id != sandbox_id || persisted.sandbox_name != sandbox_name {
+        return Err(format!(
+            "decode {}: ownership identity does not match sandbox",
+            path.display()
+        ));
+    }
+    if persisted.namespace != config.sandbox_namespace {
+        return Err(format!(
+            "decode {}: ownership namespace does not match driver namespace",
+            path.display()
+        ));
+    }
+    Ok(Some(persisted))
+}
+
+fn persist_docker_instance_ownership(
+    tracked: &TrackedSandboxInstances,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), String> {
+    let Some(path) = docker_instance_state_path(&tracked.sandbox_id, config) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("ownership state path {} has no parent", path.display()))?;
+    openshell_core::paths::create_dir_restricted(parent)
+        .map_err(|err| format!("create {}: {err}", parent.display()))?;
+    let mut retired_ids = tracked.retired_ids.iter().cloned().collect::<Vec<_>>();
+    retired_ids.sort();
+    let bytes = serde_json::to_vec(&PersistedDockerInstanceOwnership {
+        version: 1,
+        sandbox_id: tracked.sandbox_id.clone(),
+        sandbox_name: tracked.sandbox_name.clone(),
+        namespace: tracked.namespace.clone(),
+        authoritative_id: tracked.authoritative_id.clone(),
+        retired_ids,
+        instance_generation: tracked.instance_generation.clone(),
+        replacement_intent: tracked.replacement_intent.clone(),
+    })
+    .map_err(|err| format!("encode {}: {err}", path.display()))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".instance-ownership-")
+        .tempfile_in(parent)
+        .map_err(|err| {
+            format!(
+                "create temporary ownership state in {}: {err}",
+                parent.display()
+            )
+        })?;
+    temp.write_all(&bytes)
+        .map_err(|err| format!("write temporary ownership state: {err}"))?;
+    openshell_core::paths::set_file_owner_only(temp.path())
+        .map_err(|err| format!("restrict temporary ownership state: {err}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("sync temporary ownership state: {err}"))?;
+    temp.persist(&path)
+        .map_err(|err| format!("persist {}: {}", path.display(), err.error))?;
+    if let Err(err) = sync_directory(parent) {
+        // The rename already committed the new ownership state. Keep the
+        // in-memory transition aligned with that file and report only the
+        // reduced host-power-loss durability of the directory entry.
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "Failed to sync committed Docker instance ownership directory"
+        );
+    }
+    Ok(())
+}
+
+fn remove_docker_instance_ownership(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
+    let Some(path) = docker_instance_state_path(sandbox_id, config) else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent()
+                && let Err(err) = sync_directory(parent)
+            {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to sync Docker instance ownership state removal"
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                path = %path.display(),
+                error = %err,
+                "Failed to remove Docker instance ownership state"
+            );
+        }
+    }
+}
+
+fn docker_instance_namespace_dir_name(namespace: &str) -> String {
+    format!("{:x}", Sha256::digest(namespace.as_bytes()))
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("sync directory {}: {err}", path.display()))
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
@@ -2792,22 +4093,8 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some((amount * multiplier).round() as i64))
 }
 
-fn compare_container_summary_preference(
-    left: &ContainerSummary,
-    right: &ContainerSummary,
-) -> Ordering {
-    let left_running = matches!(left.state, Some(ContainerSummaryStateEnum::RUNNING));
-    let right_running = matches!(right.state, Some(ContainerSummaryStateEnum::RUNNING));
-
-    left_running
-        .cmp(&right_running)
-        .then_with(|| {
-            is_canonical_container_summary(left).cmp(&is_canonical_container_summary(right))
-        })
-        .then_with(|| left.created.cmp(&right.created))
-        // Docker container IDs are unique and make equal-state, equal-time
-        // selection deterministic regardless of daemon response order.
-        .then_with(|| left.id.cmp(&right.id))
+fn container_summary_id(summary: &ContainerSummary) -> Option<&str> {
+    summary.id.as_deref().filter(|id| !id.is_empty())
 }
 
 fn is_canonical_container_summary(summary: &ContainerSummary) -> bool {
@@ -2830,6 +4117,332 @@ fn is_canonical_container_summary(summary: &ContainerSummary) -> bool {
             .iter()
             .any(|name| name.trim_start_matches('/') == expected)
     })
+}
+
+fn nemoclaw_gpu_backup_container_name(
+    summary: &ContainerSummary,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Option<String> {
+    let canonical_name = container_name_for_sandbox(&DriverSandbox {
+        id: sandbox_id.to_string(),
+        name: sandbox_name.to_string(),
+        ..Default::default()
+    });
+    let expected_prefix = format!("{canonical_name}{NEMOCLAW_GPU_BACKUP_MARKER}");
+    summary.names.as_ref().and_then(|names| {
+        names.iter().find_map(|name| {
+            let normalized = name.trim_start_matches('/');
+            normalized
+                .strip_prefix(&expected_prefix)
+                .is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .then(|| normalized.to_string())
+        })
+    })
+}
+
+fn is_nemoclaw_gpu_backup_container(
+    summary: &ContainerSummary,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> bool {
+    nemoclaw_gpu_backup_container_name(summary, sandbox_id, sandbox_name).is_some()
+}
+
+fn container_instance_generation(summary: &ContainerSummary) -> Option<&str> {
+    summary
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_INSTANCE_GENERATION))
+        .map(String::as_str)
+        .filter(|token| !token.is_empty())
+}
+
+fn container_state_allows_replacement_intent(state: Option<ContainerSummaryStateEnum>) -> bool {
+    matches!(
+        state,
+        Some(
+            ContainerSummaryStateEnum::CREATED
+                | ContainerSummaryStateEnum::RUNNING
+                | ContainerSummaryStateEnum::RESTARTING
+        )
+    )
+}
+
+fn container_state_allows_authorized_transition(state: Option<ContainerSummaryStateEnum>) -> bool {
+    matches!(
+        state,
+        Some(
+            ContainerSummaryStateEnum::CREATED
+                | ContainerSummaryStateEnum::RUNNING
+                | ContainerSummaryStateEnum::RESTARTING
+                | ContainerSummaryStateEnum::EXITED
+        )
+    )
+}
+
+fn replacement_lineage_matches(
+    incumbent: &ContainerSummary,
+    replacement: &ContainerSummary,
+    tracked: &TrackedSandboxInstances,
+) -> bool {
+    !tracked.instance_generation.is_empty()
+        && container_instance_generation(incumbent) == Some(tracked.instance_generation.as_str())
+        && container_instance_generation(replacement) == Some(tracked.instance_generation.as_str())
+}
+
+fn replacement_intent_observation_matches(
+    summaries: &[ContainerSummary],
+    tracked: &TrackedSandboxInstances,
+    intent: &DockerReplacementIntent,
+) -> bool {
+    if tracked.authoritative_id != intent.incumbent_id || summaries.len() != 2 {
+        return false;
+    }
+    let Some(incumbent) = summaries
+        .iter()
+        .find(|summary| container_summary_id(summary) == Some(intent.incumbent_id.as_str()))
+    else {
+        return false;
+    };
+    let Some(replacement) = summaries
+        .iter()
+        .find(|summary| container_summary_id(summary) == Some(intent.replacement_id.as_str()))
+    else {
+        return false;
+    };
+    matches!(incumbent.state, Some(ContainerSummaryStateEnum::EXITED))
+        && nemoclaw_gpu_backup_container_name(incumbent, &tracked.sandbox_id, &tracked.sandbox_name)
+            .as_deref()
+            == Some(intent.backup_name.as_str())
+        && is_canonical_container_summary(replacement)
+        && container_state_allows_authorized_transition(replacement.state)
+        && replacement_lineage_matches(incumbent, replacement, tracked)
+}
+
+fn replacement_intent_successor_only_matches(
+    summaries: &[ContainerSummary],
+    tracked: &TrackedSandboxInstances,
+    intent: &DockerReplacementIntent,
+) -> bool {
+    if tracked.authoritative_id != intent.incumbent_id || summaries.len() != 1 {
+        return false;
+    }
+    let replacement = &summaries[0];
+    container_summary_id(replacement) == Some(intent.replacement_id.as_str())
+        && is_canonical_container_summary(replacement)
+        && container_state_allows_authorized_transition(replacement.state)
+        && !tracked.instance_generation.is_empty()
+        && container_instance_generation(replacement) == Some(tracked.instance_generation.as_str())
+}
+
+fn resolve_tracked_container(
+    summaries: &[ContainerSummary],
+    tracked: &TrackedSandboxInstances,
+) -> TrackedContainerResolution {
+    if tracked.authoritative_id.is_empty() {
+        return TrackedContainerResolution::OwnershipUnresolved {
+            candidate_ids: summaries
+                .iter()
+                .filter_map(container_summary_id)
+                .map(str::to_string)
+                .collect(),
+        };
+    }
+    if let Some(intent) = tracked.replacement_intent.as_ref() {
+        if replacement_intent_successor_only_matches(summaries, tracked, intent) {
+            return TrackedContainerResolution::ReplacementFromIntent {
+                replacement_index: 0,
+            };
+        }
+        if !replacement_intent_observation_matches(summaries, tracked, intent) {
+            return TrackedContainerResolution::ReplacementIntentInvalidated {
+                candidate_ids: summaries
+                    .iter()
+                    .filter_map(container_summary_id)
+                    .map(str::to_string)
+                    .collect(),
+            };
+        }
+    }
+    let authoritative_index = summaries.iter().position(|summary| {
+        container_summary_id(summary) == Some(tracked.authoritative_id.as_str())
+    });
+
+    if let Some(index) = authoritative_index {
+        let incumbent = &summaries[index];
+        let canonical_successors = summaries
+            .iter()
+            .enumerate()
+            .filter(|(candidate_index, summary)| {
+                *candidate_index != index
+                    && is_canonical_container_summary(summary)
+                    && container_summary_id(summary).is_some()
+                    && container_state_allows_authorized_transition(summary.state)
+            })
+            .map(|(candidate_index, _)| candidate_index)
+            .collect::<Vec<_>>();
+        let incumbent_stopped = matches!(incumbent.state, Some(ContainerSummaryStateEnum::EXITED));
+        let incumbent_backup_name = nemoclaw_gpu_backup_container_name(
+            incumbent,
+            &tracked.sandbox_id,
+            &tracked.sandbox_name,
+        );
+        let incumbent_is_backup = incumbent_backup_name.is_some();
+        if incumbent_stopped && incumbent_is_backup && canonical_successors.len() == 1 {
+            let replacement_index = canonical_successors[0];
+            let replacement_id =
+                container_summary_id(&summaries[replacement_index]).unwrap_or_default();
+            let replacement_generation_matches =
+                replacement_lineage_matches(incumbent, &summaries[replacement_index], tracked);
+            let allowed_ids = [
+                container_summary_id(incumbent).unwrap_or_default(),
+                container_summary_id(&summaries[replacement_index]).unwrap_or_default(),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>();
+            let has_ambiguous_candidate = summaries.iter().any(|summary| {
+                let Some(candidate_id) = container_summary_id(summary) else {
+                    return true;
+                };
+                !allowed_ids.contains(candidate_id)
+            });
+            if replacement_generation_matches && !has_ambiguous_candidate {
+                let backup_name = incumbent_backup_name.unwrap_or_default();
+                let intent_matches = tracked.replacement_intent.as_ref().is_some_and(|intent| {
+                    intent.incumbent_id == tracked.authoritative_id
+                        && intent.replacement_id == replacement_id
+                        && intent.backup_name == backup_name
+                });
+                if intent_matches {
+                    return TrackedContainerResolution::Replacement {
+                        incumbent_index: index,
+                        replacement_index,
+                    };
+                }
+                if container_state_allows_replacement_intent(summaries[replacement_index].state) {
+                    return TrackedContainerResolution::ReplacementIntentRequired {
+                        incumbent_index: index,
+                        replacement_index,
+                        backup_name,
+                    };
+                }
+            }
+        }
+        if incumbent_stopped && incumbent_is_backup {
+            return TrackedContainerResolution::HandoffPending {
+                incumbent_index: index,
+                candidate_ids: summaries
+                    .iter()
+                    .enumerate()
+                    .filter(|(candidate_index, _)| *candidate_index != index)
+                    .filter_map(|(_, summary)| container_summary_id(summary).map(str::to_string))
+                    .collect(),
+            };
+        }
+
+        let unexpected_ids = summaries
+            .iter()
+            .enumerate()
+            .filter(|(candidate_index, _)| *candidate_index != index)
+            .filter_map(|(_, summary)| {
+                let candidate_id = container_summary_id(summary)?;
+                let expected_retired_backup = tracked.retired_ids.contains(candidate_id)
+                    && matches!(summary.state, Some(ContainerSummaryStateEnum::EXITED))
+                    && is_nemoclaw_gpu_backup_container(
+                        summary,
+                        &tracked.sandbox_id,
+                        &tracked.sandbox_name,
+                    );
+                (!expected_retired_backup).then(|| candidate_id.to_string())
+            })
+            .collect();
+        return TrackedContainerResolution::Authoritative {
+            index,
+            unexpected_ids,
+        };
+    }
+
+    let rollback_candidates = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, summary)| {
+            container_summary_id(summary).is_some_and(|id| tracked.retired_ids.contains(id))
+                && is_canonical_container_summary(summary)
+                && container_state_allows_authorized_transition(summary.state)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if rollback_candidates.len() == 1 {
+        let rollback_index = rollback_candidates[0];
+        let rollback_id = container_summary_id(&summaries[rollback_index]).unwrap_or_default();
+        let only_known_retired = summaries.iter().all(|summary| {
+            container_summary_id(summary).is_some_and(|candidate_id| {
+                candidate_id == rollback_id
+                    || (tracked.retired_ids.contains(candidate_id)
+                        && matches!(summary.state, Some(ContainerSummaryStateEnum::EXITED))
+                        && is_nemoclaw_gpu_backup_container(
+                            summary,
+                            &tracked.sandbox_id,
+                            &tracked.sandbox_name,
+                        ))
+            })
+        });
+        if only_known_retired {
+            return TrackedContainerResolution::Rollback {
+                index: rollback_index,
+            };
+        }
+    }
+
+    if summaries.len() == 1 {
+        let candidate = &summaries[0];
+        if is_canonical_container_summary(candidate)
+            && container_state_allows_replacement_intent(candidate.state)
+            && !tracked.instance_generation.is_empty()
+            && container_instance_generation(candidate)
+                == Some(tracked.instance_generation.as_str())
+        {
+            return TrackedContainerResolution::ReplacementIntentRequiredWithoutIncumbent {
+                replacement_index: 0,
+            };
+        }
+    }
+
+    let candidate_ids = summaries
+        .iter()
+        .filter_map(container_summary_id)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if candidate_ids.is_empty() {
+        TrackedContainerResolution::Missing
+    } else {
+        TrackedContainerResolution::Conflict { candidate_ids }
+    }
+}
+
+fn ownership_conflict_snapshot(
+    sandbox_id: &str,
+    tracked: &TrackedSandboxInstances,
+    reason: &str,
+    message: &str,
+) -> DriverSandbox {
+    DriverSandbox {
+        id: sandbox_id.to_string(),
+        name: tracked.sandbox_name.clone(),
+        namespace: tracked.namespace.clone(),
+        spec: None,
+        status: Some(DriverSandboxStatus {
+            sandbox_name: tracked.sandbox_name.clone(),
+            instance_id: tracked.authoritative_id.clone(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![error_condition(reason, message)],
+            deleting: false,
+        }),
+    }
 }
 
 fn matching_managed_container_summaries(
@@ -2858,33 +4471,6 @@ fn matching_managed_container_summaries(
             namespace_matches && id_matches && name_matches
         })
         .collect()
-}
-
-fn preferred_container_summaries_by_sandbox_id(
-    summaries: &[ContainerSummary],
-) -> HashMap<&str, &ContainerSummary> {
-    let mut preferred = HashMap::new();
-    for summary in summaries {
-        let Some(sandbox_id) = summary
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-        else {
-            continue;
-        };
-
-        match preferred.entry(sandbox_id.as_str()) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(summary);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if compare_container_summary_preference(summary, entry.get()).is_gt() {
-                    entry.insert(summary);
-                }
-            }
-        }
-    }
-    preferred
 }
 
 fn sandbox_from_container_summary(
@@ -3465,7 +5051,7 @@ fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> CoreResult<()> 
                 dir.display(),
             ))
         })?;
-    std::io::Write::write_all(&mut temp, bytes).map_err(|err| {
+    Write::write_all(&mut temp, bytes).map_err(|err| {
         Error::config(format!(
             "failed to write supervisor binary to temp file: {err}",
         ))

@@ -87,13 +87,46 @@ impl ShutdownCleanup for DockerComputeDriver {
 /// `Ok(false)` if no backend resource exists.
 #[tonic::async_trait]
 trait StartupResume: Send + Sync {
-    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String>;
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        expected_instance_id: &str,
+        should_start: bool,
+    ) -> Result<bool, String>;
+
+    async fn complete_delete(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String>;
+
+    async fn complete_restore(&self) -> Result<(), String>;
 }
 
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
-    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
-        Self::resume_sandbox(self, sandbox_id, sandbox_name)
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        expected_instance_id: &str,
+        should_start: bool,
+    ) -> Result<bool, String> {
+        Self::resume_sandbox(
+            self,
+            sandbox_id,
+            sandbox_name,
+            expected_instance_id,
+            should_start,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    }
+
+    async fn complete_restore(&self) -> Result<(), String> {
+        self.complete_instance_restore().await;
+        Ok(())
+    }
+
+    async fn complete_delete(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
+        self.complete_persisted_delete(sandbox_id, sandbox_name)
             .await
             .map_err(|err| err.to_string())
     }
@@ -739,45 +772,99 @@ impl ComputeRuntime {
     /// Resume sandboxes whose store records say they should be running.
     /// Drivers that do not auto-restart compute resources across gateway
     /// restarts (currently only Docker) implement `StartupResume`. For
-    /// each sandbox in the store whose phase is not `Deleting` or
-    /// `Error`, we ask the driver to resume the underlying resource. If
-    /// the driver reports that the resource no longer exists or fails to
-    /// start, the sandbox is moved to the `Error` phase so the failure
-    /// surfaces in the UI.
+    /// each non-deleting sandbox, we first restore the driver's durable
+    /// instance ownership. Sandboxes whose phase should be running are then
+    /// resumed. Ownership conflicts remain in the store and are surfaced by
+    /// the driver's precise conflict snapshot instead of being treated as a
+    /// deletion.
     ///
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-resume state on its first poll.
     pub async fn resume_persisted_sandboxes(&self) -> Result<(), String> {
+        const RESTORE_PAGE_SIZE: u32 = 1000;
+
         let Some(resume) = &self.startup_resume else {
             return Ok(());
         };
 
-        let records = self
-            .store
-            .list(Sandbox::object_type(), 1000, 0)
-            .await
-            .map_err(|e| e.to_string())?;
-
         let mut resumed = 0usize;
-        let mut missing = 0usize;
-        let mut failed = 0usize;
+        let mut unresolved = 0usize;
+        let mut completed_deletes = 0usize;
+        let mut offset = 0_u32;
+        let mut records_to_restore = Vec::new();
 
-        for record in records {
-            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
-                Ok(sandbox) => sandbox,
-                Err(err) => {
-                    warn!(error = %err, "Failed to decode sandbox record during startup resume");
-                    continue;
-                }
-            };
+        loop {
+            let records = self
+                .store
+                .list(Sandbox::object_type(), RESTORE_PAGE_SIZE, offset)
+                .await
+                .map_err(|e| e.to_string())?;
+            if records.is_empty() {
+                break;
+            }
+            let record_count = records.len();
+            offset = offset.saturating_add(u32::try_from(record_count).unwrap_or(u32::MAX));
+            records_to_restore.extend(records);
+            if record_count < RESTORE_PAGE_SIZE as usize {
+                break;
+            }
+        }
+
+        for record in records_to_restore {
+            let sandbox = Sandbox::decode(record.payload.as_slice())
+                .map_err(|err| format!("decode sandbox record during startup resume: {err}"))?;
 
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            // Finish a persisted deletion before restoring ownership. This
+            // covers crashes both before backend cleanup and after backend
+            // cleanup but before the driver's Deleted event.
+            if phase == SandboxPhase::Deleting {
+                resume
+                    .complete_delete(sandbox.object_id(), sandbox.object_name())
+                    .await?;
+                self.apply_deleted(sandbox.object_id()).await?;
+                completed_deletes += 1;
+                continue;
+            }
+            let expected_instance_id = sandbox
+                .status
+                .as_ref()
+                .map(|status| status.agent_pod.as_str())
+                .unwrap_or_default();
             if !sandbox_phase_should_be_running(phase) {
+                let resolved = resume
+                    .resume_sandbox(
+                        sandbox.object_id(),
+                        sandbox.object_name(),
+                        expected_instance_id,
+                        false,
+                    )
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "restore Docker instance ownership for sandbox {} during gateway startup: {err}",
+                            sandbox.object_id()
+                        )
+                    })?;
+                if !resolved {
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        ?phase,
+                        "Docker instance ownership is unresolved; retaining durable state"
+                    );
+                    unresolved += 1;
+                }
                 continue;
             }
 
             match resume
-                .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+                .resume_sandbox(
+                    sandbox.object_id(),
+                    sandbox.object_name(),
+                    expected_instance_id,
+                    true,
+                )
                 .await
             {
                 Ok(true) => {
@@ -790,89 +877,33 @@ impl ComputeRuntime {
                     resumed += 1;
                 }
                 Ok(false) => {
-                    // Backend resource is gone but the store still
-                    // remembers the sandbox. Mark Error so the UI
-                    // surfaces the inconsistency; the reconcile loop
-                    // will eventually prune it after the orphan grace
-                    // period.
                     warn!(
                         sandbox_id = %sandbox.object_id(),
                         sandbox_name = %sandbox.object_name(),
-                        "Cannot resume sandbox: backend resource is missing"
+                        "Cannot resume sandbox: Docker instance ownership is unresolved; retaining durable state"
                     );
-                    self.mark_sandbox_error(
-                        &sandbox,
-                        "BackendResourceMissing",
-                        "Sandbox container disappeared while the gateway was offline",
-                    )
-                    .await;
-                    missing += 1;
+                    unresolved += 1;
                 }
                 Err(err) => {
-                    warn!(
-                        sandbox_id = %sandbox.object_id(),
-                        sandbox_name = %sandbox.object_name(),
-                        error = %err,
-                        "Failed to resume sandbox during gateway startup"
-                    );
-                    self.mark_sandbox_error(
-                        &sandbox,
-                        "ResumeFailed",
-                        &format!("Failed to resume sandbox during gateway startup: {err}"),
-                    )
-                    .await;
-                    failed += 1;
+                    return Err(format!(
+                        "resume sandbox {} during gateway startup: {err}",
+                        sandbox.object_id()
+                    ));
                 }
             }
         }
 
-        if resumed > 0 || missing > 0 || failed > 0 {
+        resume.complete_restore().await?;
+
+        if resumed > 0 || unresolved > 0 || completed_deletes > 0 {
             info!(
                 resumed,
-                missing_backend = missing,
-                failed,
+                unresolved_ownership = unresolved,
+                completed_deletes,
                 "Sandbox resume sweep complete"
             );
         }
         Ok(())
-    }
-
-    async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
-        let _guard = self.sync_lock.lock().await;
-        let sandbox_id = sandbox.object_id().to_string();
-        let reason = reason.to_string();
-        let message = message.to_string();
-        match self
-            .store
-            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |s| {
-                s.set_phase(SandboxPhase::Error as i32);
-                let name = s.object_name().to_string();
-                upsert_ready_condition(
-                    &mut s.status,
-                    &name,
-                    SandboxCondition {
-                        r#type: "Ready".to_string(),
-                        status: "False".to_string(),
-                        reason: reason.clone(),
-                        message: message.clone(),
-                        last_transition_time: String::new(),
-                    },
-                );
-            })
-            .await
-        {
-            Ok(updated) => {
-                self.sandbox_index.update_from_sandbox(&updated);
-                self.sandbox_watch_bus.notify(&sandbox_id);
-            }
-            Err(err) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "Failed to persist sandbox error state during startup resume"
-                );
-            }
-        }
     }
 
     async fn lease_coordinator(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
@@ -1139,7 +1170,8 @@ impl ComputeRuntime {
             let sandbox_name = incoming.name.clone();
 
             let supervisor_promoted = session_connected
-                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+                && !driver_status_blocks_supervisor_promotion(incoming.status.as_ref());
             if supervisor_promoted {
                 phase = SandboxPhase::Ready;
             }
@@ -1205,7 +1237,8 @@ impl ComputeRuntime {
                     .as_ref()
                     .map_or(old_phase, |status| derive_phase(Some(status)));
                 let supervisor_promoted = session_connected
-                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+                    && !driver_status_blocks_supervisor_promotion(incoming.status.as_ref());
                 if supervisor_promoted {
                     phase = SandboxPhase::Ready;
                 }
@@ -1310,6 +1343,9 @@ impl ComputeRuntime {
 
                 let sandbox_name = sandbox.object_name().to_string();
                 if connected {
+                    if sandbox_status_blocks_supervisor_promotion(sandbox.status.as_ref()) {
+                        return;
+                    }
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
                     sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else if current_phase == SandboxPhase::Ready {
@@ -1949,6 +1985,37 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
     SandboxPhase::Unknown
 }
 
+fn ownership_reason_blocks_supervisor_promotion(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "containerreplacementpending"
+            | "containerownershipunresolved"
+            | "containerinstancemissing"
+            | "containeridentityconflict"
+            | "containerownershippersistfailed"
+    )
+}
+
+fn driver_status_blocks_supervisor_promotion(status: Option<&DriverSandboxStatus>) -> bool {
+    status.is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && ownership_reason_blocks_supervisor_promotion(&condition.reason)
+        })
+    })
+}
+
+fn sandbox_status_blocks_supervisor_promotion(status: Option<&SandboxStatus>) -> bool {
+    status.is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && ownership_reason_blocks_supervisor_promotion(&condition.reason)
+        })
+    })
+}
+
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
     let gpu_requested = spec
         .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
@@ -1993,6 +2060,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "starting",
         "containerstarting",
         "containercreated",
+        "containerreplacementpending",
         "healthcheckstarting",
         "inspectfailed",
     ];
@@ -2474,6 +2542,10 @@ mod tests {
                 "ContainerCreated",
                 "Podman created the container before starting it",
             ),
+            (
+                "ContainerReplacementPending",
+                "Compatibility backup retained while canonical replacement starts",
+            ),
         ];
 
         for (reason, message) in transient_cases {
@@ -2887,6 +2959,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_conflict_updates_preserve_durable_and_owned_sandbox_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        let metadata = sandbox.metadata.as_mut().unwrap();
+        metadata.labels = HashMap::from([
+            ("team".to_string(), "nemoclaw".to_string()),
+            ("purpose".to_string(), "gpu".to_string()),
+        ]);
+        metadata.created_at_ms = 4242;
+        sandbox.spec = Some(SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(1) }),
+            }),
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            agent_pod: "incumbent-container".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+            current_policy_version: 7,
+            ..Default::default()
+        });
+        let original_spec = sandbox.spec.clone();
+        let original_labels = sandbox.metadata.as_ref().unwrap().labels.clone();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        runtime
+            .store
+            .put(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                "settings-sb-1",
+                sandbox.object_name(),
+                br#"{"revision":1,"settings":{"theme":"dark"}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = ssh_session_record("session-1", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe(sandbox.object_id());
+        let mut log_rx = runtime.tracing_log_bus.subscribe(sandbox.object_id());
+        let mut platform_rx = runtime
+            .tracing_log_bus
+            .platform_event_bus
+            .subscribe(sandbox.object_id());
+        runtime
+            .tracing_log_bus
+            .publish_external(openshell_core::proto::SandboxLogLine {
+                sandbox_id: sandbox.object_id().to_string(),
+                timestamp_ms: 1000,
+                level: "INFO".to_string(),
+                target: "ownership-test".to_string(),
+                message: "retained log".to_string(),
+                source: "gateway".to_string(),
+                fields: HashMap::new(),
+            });
+        runtime.tracing_log_bus.platform_event_bus.publish(
+            sandbox.object_id(),
+            openshell_core::proto::SandboxStreamEvent { payload: None },
+        );
+        assert!(log_rx.try_recv().is_ok());
+        assert!(platform_rx.try_recv().is_ok());
+
+        for (instance_id, reason, ready_status) in [
+            ("incumbent-container", "ContainerInstanceMissing", "False"),
+            ("incumbent-container", "ContainerIdentityConflict", "False"),
+            ("replacement-container", "SupervisorConnected", "True"),
+        ] {
+            runtime
+                .apply_sandbox_update(DriverSandbox {
+                    id: sandbox.object_id().to_string(),
+                    name: sandbox.object_name().to_string(),
+                    namespace: "default".to_string(),
+                    spec: None,
+                    status: Some(DriverSandboxStatus {
+                        sandbox_name: sandbox.object_name().to_string(),
+                        instance_id: instance_id.to_string(),
+                        agent_fd: String::new(),
+                        sandbox_fd: String::new(),
+                        conditions: vec![DriverCondition {
+                            r#type: "Ready".to_string(),
+                            status: ready_status.to_string(),
+                            reason: reason.to_string(),
+                            message: reason.to_string(),
+                            last_transition_time: String::new(),
+                        }],
+                        deleting: false,
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.spec, original_spec);
+        assert_eq!(stored.metadata.as_ref().unwrap().labels, original_labels);
+        assert_eq!(stored.metadata.as_ref().unwrap().created_at_ms, 4242);
+        assert_eq!(stored.current_policy_version(), 7);
+        assert_eq!(
+            stored.status.as_ref().unwrap().agent_pod,
+            "replacement-container"
+        );
+        assert!(
+            runtime
+                .store
+                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            runtime.tracing_log_bus.tail(sandbox.object_id(), 10).len(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .tracing_log_bus
+                .platform_event_bus
+                .tail(sandbox.object_id(), 10)
+                .len(),
+            1
+        );
+
+        while watch_rx.try_recv().is_ok() {}
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            log_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            platform_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -2934,6 +3165,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_supervisor_does_not_override_replacement_pending_update() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, "sb-1");
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "ContainerReplacementPending",
+                    "replacement intent requires another observation",
+                ))),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "ContainerReplacementPending");
+    }
+
+    #[tokio::test]
     async fn supervisor_session_connected_promotes_store_state_without_driver_refresh() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -2951,6 +3224,47 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_connected_does_not_override_replacement_pending_store_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "ContainerReplacementPending".to_string(),
+                message: "replacement intent requires another observation".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "ContainerReplacementPending");
     }
 
     #[tokio::test]
@@ -3237,8 +3551,10 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingResume {
-        calls: Mutex<Vec<(String, String)>>,
+        calls: Mutex<Vec<(String, String, String, bool)>>,
+        delete_calls: Mutex<Vec<(String, String)>>,
         results: Mutex<HashMap<String, Result<bool, String>>>,
+        restore_completed: Mutex<bool>,
     }
 
     impl RecordingResume {
@@ -3249,8 +3565,16 @@ mod tests {
                 .insert(sandbox_id.to_string(), result);
         }
 
-        async fn calls(&self) -> Vec<(String, String)> {
+        async fn calls(&self) -> Vec<(String, String, String, bool)> {
             self.calls.lock().await.clone()
+        }
+
+        async fn restore_completed(&self) -> bool {
+            *self.restore_completed.lock().await
+        }
+
+        async fn delete_calls(&self) -> Vec<(String, String)> {
+            self.delete_calls.lock().await.clone()
         }
     }
 
@@ -3260,11 +3584,15 @@ mod tests {
             &self,
             sandbox_id: &str,
             sandbox_name: &str,
+            expected_instance_id: &str,
+            should_start: bool,
         ) -> Result<bool, String> {
-            self.calls
-                .lock()
-                .await
-                .push((sandbox_id.to_string(), sandbox_name.to_string()));
+            self.calls.lock().await.push((
+                sandbox_id.to_string(),
+                sandbox_name.to_string(),
+                expected_instance_id.to_string(),
+                should_start,
+            ));
             self.results
                 .lock()
                 .await
@@ -3272,10 +3600,27 @@ mod tests {
                 .cloned()
                 .unwrap_or(Ok(true))
         }
+
+        async fn complete_restore(&self) -> Result<(), String> {
+            *self.restore_completed.lock().await = true;
+            Ok(())
+        }
+
+        async fn complete_delete(
+            &self,
+            sandbox_id: &str,
+            sandbox_name: &str,
+        ) -> Result<bool, String> {
+            self.delete_calls
+                .lock()
+                .await
+                .push((sandbox_id.to_string(), sandbox_name.to_string()));
+            Ok(true)
+        }
     }
 
     #[tokio::test]
-    async fn resume_persisted_sandboxes_resumes_running_phases() {
+    async fn resume_persisted_sandboxes_registers_owned_non_deleting_records() {
         let resume = Arc::new(RecordingResume::default());
         let runtime =
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
@@ -3288,32 +3633,72 @@ mod tests {
             ("sb-deleting", "deleting", SandboxPhase::Deleting),
             ("sb-error", "error", SandboxPhase::Error),
         ] {
-            let sandbox = sandbox_record(id, name, phase);
+            let mut sandbox = sandbox_record(id, name, phase);
+            sandbox.status = Some(SandboxStatus {
+                sandbox_name: name.to_string(),
+                agent_pod: format!("instance-{id}"),
+                ..Default::default()
+            });
+            sandbox.set_phase(phase as i32);
             runtime.store.put_message(&sandbox).await.unwrap();
         }
 
         runtime.resume_persisted_sandboxes().await.unwrap();
-
-        let mut called_ids = resume
-            .calls()
-            .await
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        called_ids.sort();
+        assert!(resume.restore_completed().await);
         assert_eq!(
-            called_ids,
+            resume.delete_calls().await,
+            vec![("sb-deleting".to_string(), "deleting".to_string())]
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-deleting")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut calls = resume.calls().await;
+        calls.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            calls,
             vec![
-                "sb-prov".to_string(),
-                "sb-ready".to_string(),
-                "sb-unknown".to_string(),
-                "sb-unspecified".to_string(),
+                (
+                    "sb-error".to_string(),
+                    "error".to_string(),
+                    "instance-sb-error".to_string(),
+                    false,
+                ),
+                (
+                    "sb-prov".to_string(),
+                    "prov".to_string(),
+                    "instance-sb-prov".to_string(),
+                    true,
+                ),
+                (
+                    "sb-ready".to_string(),
+                    "ready".to_string(),
+                    "instance-sb-ready".to_string(),
+                    true,
+                ),
+                (
+                    "sb-unknown".to_string(),
+                    "unknown".to_string(),
+                    "instance-sb-unknown".to_string(),
+                    true,
+                ),
+                (
+                    "sb-unspecified".to_string(),
+                    "unspecified".to_string(),
+                    "instance-sb-unspecified".to_string(),
+                    true,
+                ),
             ]
         );
     }
 
     #[tokio::test]
-    async fn resume_persisted_sandboxes_marks_missing_backend_as_error() {
+    async fn resume_persisted_sandboxes_retains_unresolved_backend_state() {
         let resume = Arc::new(RecordingResume::default());
         resume.set_result("sb-1", Ok(false)).await;
         let runtime =
@@ -3332,18 +3717,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Error
+            SandboxPhase::Ready
         );
-        let ready = stored
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
-            .expect("Ready condition present");
-        assert_eq!(ready.reason, "BackendResourceMissing");
+        assert!(resume.restore_completed().await);
     }
 
     #[tokio::test]
-    async fn resume_persisted_sandboxes_marks_failed_resume_as_error() {
+    async fn resume_persisted_sandboxes_fails_startup_without_completing_restore() {
         let resume = Arc::new(RecordingResume::default());
         resume
             .set_result("sb-1", Err("docker daemon angry".to_string()))
@@ -3354,7 +3734,9 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "broken", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.resume_persisted_sandboxes().await.unwrap();
+        let err = runtime.resume_persisted_sandboxes().await.unwrap_err();
+        assert!(err.contains("docker daemon angry"));
+        assert!(!resume.restore_completed().await);
 
         let stored = runtime
             .store
@@ -3364,15 +3746,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Error
+            SandboxPhase::Provisioning
         );
-        let ready = stored
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
-            .expect("Ready condition present");
-        assert_eq!(ready.reason, "ResumeFailed");
-        assert!(ready.message.contains("docker daemon angry"));
     }
 
     #[tokio::test]

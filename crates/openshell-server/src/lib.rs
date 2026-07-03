@@ -369,9 +369,15 @@ pub(crate) async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
     // snapshot on its first poll.
-    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to resume persisted sandboxes during startup");
-    }
+    state
+        .compute
+        .resume_persisted_sandboxes()
+        .await
+        .map_err(|err| {
+            Error::execution(format!(
+                "failed to restore persisted sandbox ownership during startup: {err}"
+            ))
+        })?;
 
     state.compute.spawn_watchers(shutdown_rx.clone());
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
