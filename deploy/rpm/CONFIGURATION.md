@@ -27,9 +27,7 @@ bind_address = "127.0.0.1:17670"
 The loopback default avoids exposing the gateway on host network interfaces.
 Rootless Podman sandbox containers cannot reach host loopback from their
 network namespace. Configure `bind_address = "0.0.0.0:17670"` before creating
-Podman-backed sandboxes. The install script prints the equivalent
-`openshell-gateway config set` command when automatic detection finds Podman,
-but it does not apply the change or pin the detected driver.
+Podman-backed sandboxes.
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then a
 reachable Podman socket, then Docker. Set `compute_drivers = ["docker"]` or

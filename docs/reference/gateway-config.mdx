@@ -43,14 +43,6 @@ The command prints one machine-readable value: `kubernetes`, `podman`,
 opt-in VM driver. The command only inspects the current environment; it does
 not read or update the gateway configuration.
 
-Gateway startup evaluates the same order on every process start. It logs the
-selected driver and warns when multiple runtimes are available. Pin a driver
-when you do not want later runtime changes to affect selection:
-
-```shell
-openshell-gateway config set --compute-driver docker
-```
-
 Use `openshell-gateway config set` for typed updates to driver selection and
 the listener address:
 

@@ -27,19 +27,6 @@ Non-reserved names select an extension driver and require a
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
-The gateway evaluates automatic selection at every process start and logs both
-the selected driver and the available drivers. When more than one runtime is
-available, it warns that the selected driver can change after environment
-changes and shows how to pin the intended choice:
-
-```shell
-openshell-gateway config set --compute-driver docker
-```
-
-Auto-selected Podman on a loopback listener also logs the rootless Podman
-bind-address command. These startup warnings cover runtimes installed after
-the original OpenShell installation.
-
 For Linux package-managed gateways, persist the selection without editing TOML
 directly:
 
@@ -47,19 +34,6 @@ directly:
 openshell-gateway config set --compute-driver docker
 systemctl --user restart openshell-gateway
 ```
-
-The Debian, RPM, and Homebrew installer runs
-`openshell-gateway config detect-driver` after package installation. Detection
-does not change the gateway configuration. When Podman is detected, the
-installer tells rootless Podman users to select Podman and make the listener
-reachable through the host bridge:
-
-```shell
-openshell-gateway config set --bind-address 0.0.0.0:17670
-```
-
-Restart the gateway service after running the command. The installer does not
-pin the detected driver or install and manage Docker, Podman, or the VM driver.
 
 Package availability differs by installation method:
 

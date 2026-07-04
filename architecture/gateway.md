@@ -470,20 +470,16 @@ Driver implementation settings live in the TOML driver tables. See
 0003 for the full schema.
 
 `openshell-gateway config detect-driver` exposes the gateway's automatic driver
-detection as a side-effect-free, machine-readable command. Package installers
-use it for runtime-specific guidance without persisting an inferred driver or
-changing the listener. `openshell-gateway config set` provides typed,
-comment-preserving updates for operator-managed settings. It resolves the same
-explicit or XDG config path as gateway startup, validates the complete
-document, and replaces it atomically. Service environment overrides remain an
-operator escape hatch because they take precedence over later TOML edits.
+detection as a side-effect-free, machine-readable command.
+`openshell-gateway config set` provides typed, comment-preserving updates for
+operator-managed settings. It resolves the same explicit or XDG config path as
+gateway startup, validates the complete document, and replaces it atomically.
+Service environment overrides remain an operator escape hatch because they
+take precedence over later TOML edits.
 
-When selection remains automatic, the gateway probes all available runtimes at
-every process start, logs the selected driver, and warns when multiple drivers
-are available. The warning includes the config command for pinning an intended
-driver. Auto-selected Podman on a loopback listener also emits the rootless
-Podman bind-address command. Keeping this guidance in the gateway covers
-runtimes installed or removed after the original package installation.
+When selection remains automatic, the gateway probes available runtimes at
+every process start. Runtime-specific recovery guidance belongs to gateway and
+installer diagnostics so it stays synchronized with detection behavior.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

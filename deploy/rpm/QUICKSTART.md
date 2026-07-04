@@ -56,17 +56,12 @@ socket activation:
 systemctl --user enable --now podman.socket
 ```
 
-The install script uses the gateway's automatic detection after installing the
-package. When it detects Podman, it prints the following command for rootless
-Podman users:
+Make the gateway reachable from rootless Podman containers before creating a
+sandbox:
 
 ```shell
 openshell-gateway config set --bind-address 0.0.0.0:17670
 ```
-
-The installer does not apply the command, pin the auto-detected driver, or
-install and start Podman. For a direct RPM transaction, run it before starting
-Podman-backed sandboxes.
 
 ### Network access
 
@@ -98,22 +93,6 @@ Verify the service is running:
 
 ```shell
 systemctl --user status openshell-gateway
-```
-
-If neither Docker nor Podman is usable, the service exits and the journal
-reports that no compute driver is available. The RPM remains installed and the
-supervised service retries automatically. Install and start a container
-runtime; restart the service manually if it does not recover. The VM driver is
-a separate release artifact and must be installed and selected explicitly; see
-CONFIGURATION.md.
-
-Automatic selection is evaluated on every gateway start. The gateway logs its
-selection and warns when multiple runtimes are available. Pin Docker before a
-restart if Podman is later installed but Docker should remain selected:
-
-```shell
-openshell-gateway config set --compute-driver docker
-systemctl --user restart openshell-gateway
 ```
 
 ## Register the gateway with the CLI
