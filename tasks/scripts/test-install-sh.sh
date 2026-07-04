@@ -78,15 +78,41 @@ assert_gateway_failure() {
 
   for expected in \
     "TEST gateway diagnostics" \
-    "OpenShell remains installed" \
+    "OpenShell package installation succeeded" \
+    "gateway service is not healthy" \
     "install and start Docker or Podman" \
-    "install openshell-driver-vm and explicitly configure compute_drivers = [\"vm\"]"; do
+    "supervised service will normally retry automatically"; do
     if ! grep -Fq -- "$expected" "$err"; then
       echo "FAIL: ${name}: missing expected message: ${expected}" >&2
       cat "$err" >&2 || true
       exit 1
     fi
   done
+}
+
+assert_gateway_healthy() {
+  if ! (
+    export PLATFORM="linux"
+    TARGET_USER="test-user"
+    TARGET_HOME="${tmpdir}/home"
+
+    as_target_user() { return 0; }
+    register_local_gateway() { return 0; }
+    wait_for_local_gateway_listener() { return 0; }
+    wait_for_local_gateway_status() { return 0; }
+
+    start_user_gateway
+  ) >"$out" 2>"$err"; then
+    echo "FAIL: healthy gateway service should succeed" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+
+  if ! grep -Fq -- "gateway service is healthy" "$err"; then
+    echo "FAIL: healthy gateway service should report its outcome" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
 }
 
 assert_detected_driver_guidance() {
@@ -204,6 +230,8 @@ assert_detected_driver_guidance \
   "no detected driver does not print bind guidance" \
   none \
   ""
+
+assert_gateway_healthy
 
 assert_gateway_failure \
   "systemd enable failure is actionable" \

@@ -113,30 +113,40 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
-/// Auto-detect the appropriate compute driver based on the runtime environment.
+/// Detect available compute drivers based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
 /// VM is never auto-detected (requires explicit `--drivers vm`).
 ///
-/// Returns the first driver where the environment check passes.
-/// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<ComputeDriverKind> {
+/// Returns every available driver in selection priority order.
+///
+/// VM is excluded because it requires explicit operator selection.
+#[must_use]
+pub fn detect_drivers() -> Vec<ComputeDriverKind> {
+    let mut drivers = Vec::new();
+
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(ComputeDriverKind::Kubernetes);
+        drivers.push(ComputeDriverKind::Kubernetes);
     }
 
     // Podman: check for a reachable local API socket.
     if is_podman_available() {
-        return Some(ComputeDriverKind::Podman);
+        drivers.push(ComputeDriverKind::Podman);
     }
 
     // Docker: check if the CLI is available or a local Docker socket exists.
     if is_docker_available() {
-        return Some(ComputeDriverKind::Docker);
+        drivers.push(ComputeDriverKind::Docker);
     }
 
-    None
+    drivers
+}
+
+/// Returns the first available driver in automatic selection priority order.
+#[must_use]
+pub fn detect_driver() -> Option<ComputeDriverKind> {
+    detect_drivers().into_iter().next()
 }
 
 /// Check if a binary is available on the system PATH.

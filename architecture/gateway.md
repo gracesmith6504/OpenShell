@@ -429,6 +429,27 @@ requested present -> generate and write. This guards continuity across restarts
 and upgrades while still recovering cleanly if an operator deletes everything
 and starts over.
 
+### Package installer invariants
+
+Package installers follow these boundaries across Debian, RPM, and Homebrew:
+
+- Select the supported native package method deterministically for the host.
+- Install matching OpenShell CLI and gateway artifacts in the package manager's
+  standard executable path.
+- Install and enable the gateway as a supervised user service.
+- Preserve existing gateway configuration and state across installs and
+  upgrades.
+- Keep the listener on loopback with TLS unless the operator changes it.
+- Do not install, remove, start, or configure optional Docker and Podman
+  runtimes.
+- Leave compute-driver selection automatic unless the operator explicitly pins
+  a driver.
+- Treat package installation and gateway health as separate outcomes. A
+  gateway startup failure leaves the package and service installed, returns a
+  nonzero installer status, and prints recovery instructions.
+- Remain safe to rerun after the operator fixes an optional runtime or service
+  prerequisite.
+
 Operators who manage TLS PKI with cert-manager enable `certManager.enabled`;
 cert-manager takes precedence over built-in TLS generation and the chart still
 renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can
@@ -456,6 +477,13 @@ comment-preserving updates for operator-managed settings. It resolves the same
 explicit or XDG config path as gateway startup, validates the complete
 document, and replaces it atomically. Service environment overrides remain an
 operator escape hatch because they take precedence over later TOML edits.
+
+When selection remains automatic, the gateway probes all available runtimes at
+every process start, logs the selected driver, and warns when multiple drivers
+are available. The warning includes the config command for pinning an intended
+driver. Auto-selected Podman on a loopback listener also emits the rootless
+Podman bind-address command. Keeping this guidance in the gateway covers
+runtimes installed or removed after the original package installation.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

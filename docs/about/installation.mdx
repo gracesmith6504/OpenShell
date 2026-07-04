@@ -18,7 +18,14 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 
 The script detects your operating system and installs the OpenShell CLI and gateway with your native package manager. It then starts the local gateway server so you can begin creating sandboxes. Install and start Docker or Podman first. For other compute options, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).
 
-OpenShell packages do not have a hard dependency on Docker or Podman. A direct package-manager installation can therefore finish without a usable compute runtime. When `install.sh` cannot start the gateway, it prints service diagnostics and runtime recovery steps, exits nonzero, and leaves OpenShell installed.
+OpenShell packages do not have a hard dependency on Docker or Podman. Package
+installation and gateway health are separate outcomes. A direct package-manager
+installation can finish without a usable compute runtime. When `install.sh`
+cannot make the gateway healthy, it reports that package installation
+succeeded, prints service diagnostics and runtime recovery steps, exits
+nonzero, and leaves the supervised service installed. The service retries, so
+installing and starting Docker or Podman can make it healthy without
+reinstalling OpenShell.
 
 After installing the package, `install.sh` asks the gateway binary to detect the
 available compute driver. Detection does not change the gateway configuration
@@ -33,6 +40,17 @@ Rootless Podman containers cannot reach a gateway bound to host loopback. Run
 the command only when you use rootless Podman, then restart the gateway
 service. Docker and installations with no detected runtime retain the package's
 loopback listener. The command leaves driver selection automatic.
+
+The gateway repeats automatic detection at every process start and logs the
+selected driver. When multiple runtimes are available, it lists them and shows
+how to pin the intended driver. Installing Podman on a Docker-only host does
+not change the running gateway, but the next restart selects Podman because it
+has higher detection priority. Pin Docker before restarting if you want to keep
+using it:
+
+```shell
+openshell-gateway config set --compute-driver docker
+```
 
 You can also download release artifacts directly from the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 

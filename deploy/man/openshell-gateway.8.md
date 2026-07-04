@@ -122,6 +122,12 @@ detection as gateway startup and prints one value: **kubernetes**, **podman**,
 **docker**, or **none**. It does not detect the opt-in VM driver, read the
 gateway configuration, or change system state.
 
+When no driver is configured, gateway startup logs the auto-selected driver and
+every available driver. If multiple runtimes are available, it warns that
+selection is evaluated again at every start and shows how to pin the intended
+driver. Auto-selected Podman on a loopback listener also logs the command
+needed for rootless Podman callbacks.
+
 **openshell-gateway config set** updates the gateway TOML file without
 discarding comments or unrelated settings. It creates the default XDG config
 file when needed, validates the complete result, and replaces the file

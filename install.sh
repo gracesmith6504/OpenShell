@@ -727,11 +727,12 @@ start_user_gateway() {
   register_local_gateway
   wait_for_local_gateway_listener
   wait_for_local_gateway_status
+  info "gateway service is healthy"
 }
 
 gateway_startup_error() {
   _reason="$1"
-  error "${_reason}. Review the diagnostics above. OpenShell remains installed. If the logs report that no compute driver is available, install and start Docker or Podman, or install openshell-driver-vm and explicitly configure compute_drivers = [\"vm\"]. Then restart the gateway service."
+  error "${_reason}. OpenShell package installation succeeded, but the gateway service is not healthy. Review the diagnostics above. If no compute driver is available, install and start Docker or Podman, or install openshell-driver-vm and explicitly select VM. The supervised service will normally retry automatically; restart it if needed."
 }
 
 dump_local_gateway_diagnostics() {
@@ -934,7 +935,7 @@ install_linux_deb() {
 
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
-  info "installed ${APP_NAME} package from ${RELEASE_TAG}"
+  info "package installation succeeded: installed ${APP_NAME} from ${RELEASE_TAG}"
   report_detected_compute_driver
   start_user_gateway
 }
@@ -982,7 +983,7 @@ install_linux_rpm() {
 
   info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
   install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
-  info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
+  info "package installation succeeded: installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
   report_detected_compute_driver
   start_user_gateway
 }
@@ -1021,6 +1022,7 @@ install_macos_homebrew() {
     info "installing OpenShell with Homebrew..."
     as_target_user brew install --formula "$_formula_ref"
   fi
+  info "package installation succeeded: installed ${APP_NAME} with Homebrew from ${RELEASE_TAG}"
 
   _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
   if [ -n "$_brew_prefix" ]; then
@@ -1037,6 +1039,7 @@ install_macos_homebrew() {
   register_local_gateway
   wait_for_local_gateway_listener
   wait_for_local_gateway_status
+  info "gateway service is healthy"
 }
 
 restart_homebrew_gateway() {

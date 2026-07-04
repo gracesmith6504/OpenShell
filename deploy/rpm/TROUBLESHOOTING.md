@@ -133,8 +133,9 @@ journalctl --user -u openshell-gateway --no-pager -n 50
 
 Common causes:
 
-**No compute driver is available.** Install and start Docker or Podman, then
-restart the gateway:
+**No compute driver is available.** The package remains installed and the
+supervised service retries automatically. Install and start Docker or Podman,
+then restart the gateway manually if it does not recover:
 
 ```shell
 # Docker
@@ -146,11 +147,19 @@ systemctl --user enable --now podman.socket
 systemctl --user restart openshell-gateway
 ```
 
-The package remains installed after this startup failure. To use VM instead,
-install the matching `openshell-driver-vm` release artifact in a conventional
-libexec directory (or configure `driver_dir`), set
+To use VM instead, install the matching `openshell-driver-vm` release artifact
+in a conventional libexec directory (or configure `driver_dir`), set
 `compute_drivers = ["vm"]`, and restart the gateway. Configuration alone does
 not install the VM driver, and the gateway never auto-detects it.
+
+The gateway logs which driver it auto-selects at each start. If the journal
+lists multiple available runtimes, pin the intended choice before another
+runtime changes the automatic result:
+
+```shell
+openshell-gateway config set --compute-driver docker
+systemctl --user restart openshell-gateway
+```
 
 **cgroups v1 detected.** The Podman driver requires cgroups v2.
 Check the version:

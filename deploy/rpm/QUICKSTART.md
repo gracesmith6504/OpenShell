@@ -101,10 +101,20 @@ systemctl --user status openshell-gateway
 ```
 
 If neither Docker nor Podman is usable, the service exits and the journal
-reports that no compute driver is available. The RPM remains installed. Install
-and start a container runtime, then restart the service. The VM driver is a
-separate release artifact and must be installed and selected explicitly; see
+reports that no compute driver is available. The RPM remains installed and the
+supervised service retries automatically. Install and start a container
+runtime; restart the service manually if it does not recover. The VM driver is
+a separate release artifact and must be installed and selected explicitly; see
 CONFIGURATION.md.
+
+Automatic selection is evaluated on every gateway start. The gateway logs its
+selection and warns when multiple runtimes are available. Pin Docker before a
+restart if Podman is later installed but Docker should remain selected:
+
+```shell
+openshell-gateway config set --compute-driver docker
+systemctl --user restart openshell-gateway
+```
 
 ## Register the gateway with the CLI
 
