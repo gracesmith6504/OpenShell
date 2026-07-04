@@ -8,7 +8,7 @@ Get from `dnf install` to a running sandbox in five minutes.
 
 Install and start either Docker or Podman before starting the gateway. The RPM
 does not install a container runtime. When `compute_drivers` is unset, the
-gateway selects a reachable Podman socket first, then Docker.
+gateway auto-detects Kubernetes, then a reachable Podman socket, then Docker.
 
 For Docker, verify that the daemon is running:
 

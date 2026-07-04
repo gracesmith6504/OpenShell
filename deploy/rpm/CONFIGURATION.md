@@ -34,9 +34,9 @@ reachable Podman socket, then Docker. Set `compute_drivers = ["docker"]` or
 `compute_drivers = ["podman"]` to require a specific container runtime.
 
 The RPM does not include the VM driver. To use VM-backed sandboxes, download
-the matching `openshell-driver-vm` release artifact, install the binary under
-`~/.local/libexec/openshell`, `/usr/libexec/openshell`, or
-`/usr/local/libexec/openshell`, and select it explicitly:
+the matching `openshell-driver-vm` release artifact, install the binary in a
+conventional libexec directory (or set `driver_dir` to its location), and
+select it explicitly:
 
 ```toml
 [openshell.gateway]
@@ -46,20 +46,22 @@ compute_drivers = ["vm"]
 grpc_endpoint = "https://host.containers.internal:17670"
 ```
 
-Set `[openshell.drivers.vm].driver_dir` when installing the binary elsewhere.
-The gateway never auto-detects VM support.
+The gateway never auto-detects VM support. If it cannot find the binary, the
+startup error lists every directory it searched.
 
 ### Customizing the configuration
 
-Use the gateway config command to select a driver or update the listener:
+Use the gateway config command to select a driver or update the listener. For
+example, pin Docker:
 
 ```shell
-openshell-gateway config set --compute-driver docker --bind-address 127.0.0.1:17670
+openshell-gateway config set --compute-driver docker
 systemctl --user restart openshell-gateway
 ```
 
-Use `--compute-driver auto` to remove an existing driver pin. The command
-preserves comments and unrelated settings. You can also edit
+Pass `--bind-address IP:PORT` to update the listener. Use `--compute-driver
+auto` to remove an existing driver pin. The command preserves comments and
+unrelated settings. You can also edit
 `~/.config/openshell/gateway.toml` directly. The template at
 `/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
 and is not overwritten by RPM upgrades.
