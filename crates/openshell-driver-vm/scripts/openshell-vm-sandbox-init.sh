@@ -243,6 +243,12 @@ setup_overlay_root() {
     if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "image-prep" ]; then
         prepare_guest_image_rootfs
         sync
+        if mount -o remount,ro /overlay 2>/dev/null; then
+            :
+        else
+            umount /overlay
+        fi
+        sync
         ts "image-prep complete"
         exit 0
     fi
@@ -252,7 +258,7 @@ setup_overlay_root() {
 
     local lower_root="/lower"
     if [ -b /dev/vdc ]; then
-        mount -t ext4 -o ro /dev/vdc /image-cache
+        mount -t ext4 -o ro,noload /dev/vdc /image-cache
         if [ -d /image-cache/image-rootfs ]; then
             lower_root="/image-cache/image-rootfs"
             ts "using prepared image rootfs lowerdir"

@@ -1057,7 +1057,12 @@ impl VmContext {
                         self.ctx_id,
                         image_block_id_c.as_ptr(),
                         image_disk_c.as_ptr(),
-                        true,
+                        // Attach as writable at the hypervisor level so the
+                        // kernel can replay the ext4 journal if the image-prep
+                        // VM did not unmount cleanly. The guest still mounts
+                        // the filesystem with -o ro, so guest processes cannot
+                        // write to it. See: openshell-vm-sandbox-init.sh
+                        false,
                     )
                 },
                 "krun_add_disk",
