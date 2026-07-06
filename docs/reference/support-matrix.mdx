@@ -5,14 +5,13 @@ title: "Support Matrix"
 description: "Review OpenShell compatibility across host platforms, Kubernetes environments, and SDKs."
 position: 5
 ---
-
 ## Platforms
 
-| Platform | Installation methods | Versions |
-| --- | --- | --- |
-| macOS (Apple Silicon) | Homebrew, container images | macOS minimum version: TBD |
-| Linux (x86_64, arm64) | APT/DEB, RPM, Snap, container images | glibc 2.28 or later |
-| Windows (x86_64, arm64) | MSI, WinGet, container images | Windows minimum version: TBD; MSVC toolchain |
+| Platform                | Installation methods                 | Versions                                     |
+| ----------------------- | ------------------------------------ | -------------------------------------------- |
+| macOS (Apple Silicon)   | Homebrew, container images           | macOS minimum version: TBD                   |
+| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap, container images | glibc 2.28 or later                          |
+| Windows (x86_64, arm64) | MSI, WinGet, container images        | Windows minimum version: TBD; MSVC toolchain |
 
 ## Client
 
@@ -21,12 +20,12 @@ musl and are supported on macOS, Linux, and Windows.
 
 ## Compute Drivers
 
-| Driver | Supported hosts | Minimum version | Requirements |
-| --- | --- | --- | --- |
-| Docker | macOS, Linux, Windows | TBD | Docker Engine or Docker Desktop. |
-| Podman | macOS, Linux, Windows | 5.x | Podman socket, rootless networking, and cgroups v2. |
-| MicroVM | macOS, Linux | TBD | `Hypervisor.framework` on macOS; KVM on Linux. |
-| Kubernetes | Kubernetes clusters | 1.29 or later | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
+| Driver     | Supported hosts       | Minimum version | Requirements                                                                          |
+| ---------- | --------------------- | --------------- | ------------------------------------------------------------------------------------- |
+| Docker     | macOS, Linux, Windows | TBD             | Docker Engine or Docker Desktop.                                                      |
+| Podman     | macOS, Linux, Windows | 5.x             | Podman socket, rootless networking, and cgroups v2.                                   |
+| MicroVM    | macOS, Linux          | TBD             | `Hypervisor.framework` on macOS; KVM on Linux.                                        |
+| Kubernetes | Kubernetes clusters   | 1.29 or later   | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
 ## Supervisor Kernel Requirements
 
@@ -34,21 +33,21 @@ These requirements apply to the Linux environment running the supervisor. On
 macOS and Windows, they apply to the container or virtual machine kernel, not
 the host kernel.
 
-| Kernel capability | Requirement | Minimum | Behavior when unavailable |
-| --- | --- | --- | --- |
-| seccomp BPF | Required | Linux 3.17 or later | Supervisor security initialization fails. |
-| Network namespaces, veth, and nftables | Required | TBD | Network policy enforcement cannot start. |
-| Landlock LSM | Recommended | Linux 5.13 or later | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
-| cgroups v2 PID controller | Recommended | TBD | The compute driver or container runtime must provide PID limits. |
-| User namespaces | Optional | Linux 5.12 or later | Stronger Kubernetes host isolation is unavailable. |
+| Kernel capability                      | Requirement | Minimum             | Behavior when unavailable                                                      |
+| -------------------------------------- | ----------- | ------------------- | ------------------------------------------------------------------------------ |
+| seccomp BPF                            | Required    | Linux 3.17 or later | Supervisor security initialization fails.                                      |
+| Network namespaces, veth, and nftables | Required    | TBD                 | Network policy enforcement cannot start.                                       |
+| Landlock LSM                           | Recommended | Linux 5.13 or later | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
+| cgroups v2 PID controller              | Recommended | TBD                 | The compute driver or container runtime must provide PID limits.               |
+| User namespaces                        | Optional    | Linux 5.12 or later | Stronger Kubernetes host isolation is unavailable.                             |
 
 ## Kubernetes
 
-| Component | Supported version | Notes |
-| --- | --- | --- |
-| Kubernetes | 1.29 or later | Required for Helm deployments and sandbox scheduling. |
-| Helm | 3.x | Required to install and upgrade the OpenShell chart. |
-| Agent Sandbox controller and CRDs | Compatible release; version TBD | Required before installing the OpenShell chart. |
+| Component                         | Supported version               | Notes                                                 |
+| --------------------------------- | ------------------------------- | ----------------------------------------------------- |
+| Kubernetes                        | 1.29 or later                   | Required for Helm deployments and sandbox scheduling. |
+| Helm                              | 3.x                             | Required to install and upgrade the OpenShell chart.  |
+| Agent Sandbox controller and CRDs | Compatible release; version TBD | Required before installing the OpenShell chart.       |
 
 Install the Agent Sandbox controller and its `Sandbox` CRDs before deploying
 the OpenShell Helm chart. Refer to [Kubernetes setup](/kubernetes/setup) for
@@ -58,72 +57,64 @@ installation instructions.
 
 - GKE Standard and Autopilot clusters are supported.
 - OpenShift 4.x is supported with the OpenShift-specific SCC binding and chart
-  configuration. Refer to [OpenShift installation](/kubernetes/openshift) for
-  the required overrides.
+configuration. Refer to [OpenShift installation](/kubernetes/openshift) for
+the required overrides.
 
 ## SDKs
 
-| SDK | Minimum version |
-| --- | --- |
-| Python | 3.12 |
-| TypeScript | TBD |
-| Rust | 1.90 |
-| Go | TBD |
+| SDK        | Minimum version |
+| ---------- | --------------- |
+| Python     | 3.12            |
+| TypeScript | TBD             |
+| Rust       | 1.90            |
+| Go         | TBD             |
 
 ## API Compatibility
 
-The compatibility policy covers published gRPC services, Protobuf messages,
-generated SDK interfaces, documented error behavior, and the Compute Driver
-API used by out-of-tree drivers. It does not cover internal storage schemas or
-implementation details.
+The compatibility policy covers published gRPC services, Protobuf messages, generated SDK interfaces, documented error behavior Driver, Interceptor, and Middleware APIs.
 
 ### Compatibility Promise
 
-| Release phase | Compatibility policy |
-| --- | --- |
-| Beta | Patch releases are backward compatible. A minor release may contain a breaking API change only after the affected API is deprecated in the preceding minor release. The release must include migration guidance and coordinated SDK updates. |
-| Stable | Minor and patch releases are backward compatible within an API major version. Breaking changes require a new versioned Protobuf package and API major version. The previous stable API remains supported for at least 12 months or two minor releases after its replacement, whichever is longer. |
+| Release phase | Compatibility policy                                                                                                                                                                                                                                                                              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Beta          | Patch releases are backward compatible. A minor release may contain a breaking API change only after the affected API is deprecated in the preceding minor release. The release must include migration guidance and coordinated SDK updates.                                                      |
+| Stable        | Minor and patch releases are backward compatible within an API major version. Breaking changes require a new versioned Protobuf package and API major version. The previous stable API remains supported for at least 12 months or two minor releases after its replacement, whichever is longer. |
 
 During the beta milestone, the beta policy applies even when a Protobuf package
-uses a `v1` suffix. Within a supported API major version, existing clients
-continue to work with newer servers. New clients may require capabilities that
-are not available from older servers.
-
-### Capability Discovery
-
-The gateway publishes structured compatibility information for clients:
-
-| Compatibility field | Purpose |
-| --- | --- |
-| Supported API versions | Identifies the API versions served by the gateway. |
-| Capabilities | Uses stable identifiers to report available operations and behaviors. |
-| Minimum client version | Identifies clients that cannot safely communicate with the gateway. |
-| Deprecations | Identifies deprecated capabilities, their replacements, and their planned removal versions. |
-
-The CLI, TUI, and SDKs select behavior from the advertised capabilities rather
-than inferring feature support from the server version. When an older server
-does not advertise a capability, the client hides or disables the feature when
-possible and otherwise returns an actionable unsupported-version error.
+uses a `v1` suffix.
 
 ### Change Policy
 
-| Change | Policy |
+| Change      | Policy                                                                                                                                                                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Additive    | New optional fields, messages, methods, and enum values may be added when existing requests and responses retain their meaning and defaults.                                                                                                |
+| Deprecating | Keep the existing element functional, mark it deprecated in the schema and documentation, and identify its replacement and planned removal release.                                                                                         |
+| Breaking    | Removing or renaming an API element, reusing or renumbering a field, changing a field type or cardinality, making an existing input required, or changing documented semantics requires the beta process or a new stable API major version. |
+
+### Client and Server Compatibility
+
+OpenShell evaluates compatibility in both client/server directions. Clients
+include the CLI, TUI, and supported SDKs.
+
+| Combination | Expected behavior |
 | --- | --- |
-| Additive | New optional fields, messages, methods, and enum values may be added when existing requests and responses retain their meaning and defaults. |
-| Deprecating | The existing element remains functional while the schema and documentation identify it as deprecated, name its replacement, and state its planned removal release. |
-| Breaking | Removing or renaming an API element, reusing or renumbering a field, changing a field type or cardinality, making an existing input required, or changing documented semantics follows the beta process or ships in a new stable API major version. |
+| Older client with newer server | Operations available to the client retain their request, response, error, and behavioral semantics throughout the support window. |
+| Newer client with older server | Features shared by both releases continue to work. Features unavailable from the server are hidden or return an actionable unsupported-version error. |
+| Different patch versions | Existing features remain compatible in both directions. |
+| Different API major versions | Compatibility depends on the server continuing to expose the older API version during its deprecation window. |
+
+Clients use the capabilities advertised by the server to select supported
+behavior instead of inferring feature availability from the server version
+alone.
+
+Release validation exercises the oldest supported release of the CLI, TUI, and
+each SDK against the candidate server. Current clients run the shared-feature
+suite against each server release in the support window. Capability-specific
+tests verify the behavior of features that are newer than the server.
+
+### Schema Compatibility
 
 Removed Protobuf field and enum numbers and names remain reserved and are never
 reused. CI compares API changes with the default branch for source, wire, and
-JSON compatibility. Client-server validation covers behavioral compatibility
-by exercising the oldest supported release of the CLI, TUI, and each SDK
-against the candidate server. The current client release runs the
-shared-feature compatibility suite against every server version still in the
-support window. Features newer than the server use capability detection and
-return an actionable unsupported-version error.
-
-This policy draws from the
-[Kubernetes API deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/),
-[Google AIP-180](https://google.aip.dev/180),
-[Protobuf best practices](https://protobuf.dev/best-practices/dos-donts/), and
-[Buf breaking-change detection](https://buf.build/docs/breaking/).
+JSON compatibility. Client/server validation covers request semantics, response
+semantics, documented errors, and feature negotiation.
