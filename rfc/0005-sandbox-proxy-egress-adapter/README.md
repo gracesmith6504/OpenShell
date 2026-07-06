@@ -182,56 +182,64 @@ adapter renders it for its protocol.
 ```mermaid
 flowchart TD
     Start["Authorized egress + destination connector"]
-    Start --> FirstReq{"Forward HTTP adapter supplied first request?"}
+    Start --> FirstReq{"Forward HTTP adapter<br/>already has first request?"}
 
-    FirstReq -- Yes --> ForwardMode{"decision.endpoint.enforcement"}
-    ForwardMode -- "None" --> HttpCred["HTTP relay<br/>credential injection only"]
-    ForwardMode -- "Http" --> HttpL7["HTTP relay<br/>REST/GraphQL/JSON-RPC/MCP/WebSocket policy"]
-    ForwardMode -- "ProtocolProcessor" --> BadForward["Deny: HTTP request for native protocol endpoint"]
+    FirstReq -- Yes --> ForwardEnforcement{"Endpoint enforcement"}
+    ForwardEnforcement -- "None or HTTP" --> HttpReq["Parsed HTTP request"]
+    ForwardEnforcement -- "Protocol processor" --> BadForward["Deny: HTTP request for native protocol endpoint"]
 
-    FirstReq -- No --> TlsPolicy{"TLS handling skipped?"}
-    TlsPolicy -- Yes --> Readable["Readable client stream"]
-    TlsPolicy -- No --> Peek["Peek client bytes"]
+    FirstReq -- No --> Prepare["Prepare readable client stream"]
+    Prepare --> TlsPolicy{"TLS handling enabled?"}
+    TlsPolicy -- No --> Readable["Client stream"]
+    TlsPolicy -- Yes --> Peek["Peek client bytes"]
     Peek --> Tls{"TLS ClientHello?"}
     Tls -- Yes --> Terminate["Shared TLS terminator"]
     Tls -- No --> Readable
     Terminate --> Readable
 
-    Readable --> Enforce{"decision.endpoint.enforcement"}
-    Enforce -- "None" --> Sniff{"Looks like HTTP?"}
-    Sniff -- Yes --> HttpCred
-    Sniff -- No --> TcpRelay["TcpRelay<br/>byte copy"]
+    Readable --> Enforce{"Endpoint enforcement"}
+    Enforce -- "None" --> Sniff{"HTTP request detected?"}
+    Sniff -- Yes --> ParseHttp["Parse HTTP request"]
+    Sniff -- No --> TcpRelay["TcpRelay<br/>connect upstream and copy bytes"]
+    ParseHttp --> HttpReq
 
-    Enforce -- "Http" --> MustHttp{"Looks like HTTP?"}
-    MustHttp -- Yes --> HttpL7
+    Enforce -- "HTTP" --> MustHttp{"HTTP request detected?"}
+    MustHttp -- Yes --> ParseHttp
     MustHttp -- No --> DenyHttp["Deny: expected HTTP"]
 
-    Enforce -- "ProtocolProcessor" --> Processor["TcpRelay<br/>protocol processor owns loop"]
+    Enforce -- "Protocol processor" --> Processor["TcpRelay hands stream to protocol processor"]
+    Processor --> ProcessorOwns["Processor owns message loop<br/>and calls connector when allowed"]
 
-    HttpCred --> ReqLoop["HTTP request loop"]
-    HttpL7 --> ReqLoop
-    ReqLoop --> ReqPolicy{"Request allowed?"}
-    ReqPolicy -- No --> ReqDeny["Local HTTP deny<br/>no upstream write"]
-    ReqPolicy -- Yes --> Middleware{"Supervisor middleware chain configured?"}
-    Middleware -- Yes --> MwEval["Evaluate HTTP_REQUEST / PRE_CREDENTIALS<br/>allow, deny, or mutate"]
-    Middleware -- No --> StaticCreds["Resolve static placeholders"]
-    MwEval --> MwAllowed{"Middleware allowed?"}
-    MwAllowed -- No --> MwDeny["Local middleware deny<br/>no credential injection"]
-    MwAllowed -- Yes --> StaticCreds
-    StaticCreds --> TokenGrant["Apply endpoint token grant if configured"]
-    TokenGrant --> Rewrite["Rewrite configured credential slots"]
-    Rewrite --> HttpDial["Connect or reuse upstream"]
-    HttpDial --> HttpResponse["Write request and relay response"]
-    HttpResponse --> Upgrade{"101 WebSocket upgrade?"}
-    Upgrade -- No --> ReqLoop
-    Upgrade -- Yes --> WsInspect{"WebSocket inspection or rewrite configured?"}
-    WsInspect -- No --> RawUpgrade["Raw upgraded stream"]
-    WsInspect -- Yes --> WsRelay["WebSocket relay<br/>text-frame rewrite / message policy"]
-
-    Processor --> ProcessorDial["Processor calls connector when protocol allows"]
-    TcpRelay --> TcpDial["Connect upstream"]
-    TcpDial --> ByteCopy["Copy bytes"]
+    subgraph HttpLoop["HTTP relay request loop"]
+        HttpReq --> HttpMode{"HTTP endpoint policy?"}
+        HttpMode -- "L4-only HTTP" --> ReqAllowed["Request admitted by connection decision"]
+        HttpMode -- "REST / GraphQL / JSON-RPC / MCP / WebSocket" --> ReqPolicy{"Request policy allowed?"}
+        ReqPolicy -- No --> ReqDeny["Local HTTP deny<br/>no upstream write"]
+        ReqPolicy -- Yes --> ReqAllowed
+        ReqAllowed --> Middleware{"Supervisor middleware<br/>configured?"}
+        Middleware -- Yes --> MwEval["Run HTTP_REQUEST / PRE_CREDENTIALS middleware"]
+        Middleware -- No --> Creds["Resolve static placeholders<br/>and token grants"]
+        MwEval --> MwAllowed{"Middleware allowed?"}
+        MwAllowed -- No --> MwDeny["Local middleware deny<br/>no credential injection"]
+        MwAllowed -- Yes --> Creds
+        Creds --> Rewrite["Inject credentials into configured slots"]
+        Rewrite --> HttpDial["Connect or reuse upstream"]
+        HttpDial --> HttpResponse["Write request and relay response"]
+        HttpResponse --> Upgrade{"101 WebSocket upgrade?"}
+        Upgrade -- No --> NextReq{"Another HTTP request<br/>on this connection?"}
+        NextReq -- Yes --> HttpReq
+        NextReq -- No --> Done["HTTP relay done"]
+        Upgrade -- Yes --> WsInspect{"WebSocket inspection<br/>or rewrite configured?"}
+        WsInspect -- No --> RawUpgrade["Raw upgraded stream"]
+        WsInspect -- Yes --> WsRelay["WebSocket relay<br/>text-frame rewrite / message policy"]
+    end
 ```
+
+Read this as two phases. The top half chooses the relay shape from the adapter
+surface and endpoint enforcement. The `HTTP relay request loop` only receives a
+parsed HTTP request. Supervisor middleware is not another policy funnel; it is
+an optional request-path hook after HTTP policy allows the request and before
+OpenShell-managed credential injection.
 
 Relay rules:
 
