@@ -28,12 +28,12 @@ downloaded and run without a local gateway or package manager.
 
 ## Compute Drivers
 
-| Driver     | Supported hosts       | Minimum version                                 | Requirements                                                                          |
-| ---------- | --------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Docker     | macOS, Linux, Windows | 28.0.4 or later                                 | Docker Engine or Docker Desktop.                                                      |
-| Podman     | macOS, Linux, Windows | 5.x                                             | Podman socket, rootless networking, and cgroups v2.                                   |
-| MicroVM    | macOS, Linux          | macOS 13.3 or later; Linux kernel 5.13 or later | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
-| Kubernetes | Kubernetes clusters   | 1.29 or later                                   | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
+| Driver     | Supported hosts       | Minimum version                            | Requirements                                                                          |
+| ---------- | --------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Docker     | macOS, Linux, Windows | 28.0.4 or later                            | Docker Engine or Docker Desktop.                                                      |
+| Podman     | macOS, Linux, Windows | 5.x                                        | Podman socket, rootless networking, and cgroups v2.                                   |
+| MicroVM    | macOS, Linux          | macOS 13.3 or later; KVM support on Linux  | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
+| Kubernetes | Kubernetes clusters   | 1.29 or later                              | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
 ## Supervisor Kernel Requirements
 
