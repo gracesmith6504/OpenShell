@@ -7,11 +7,11 @@ position: 5
 ---
 ## Platforms
 
-| Platform                | Installation methods                 | Versions                                     |
-| ----------------------- | ------------------------------------ | -------------------------------------------- |
-| macOS (Apple Silicon)   | Homebrew, container images           | macOS minimum version: TBD                   |
-| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap, container images | glibc 2.28 or later                          |
-| Windows (x86_64, arm64) | MSI, WinGet, container images        | Windows minimum version: TBD; MSVC toolchain |
+| Platform                | Installation methods | Versions                                     |
+| ----------------------- | -------------------- | -------------------------------------------- |
+| macOS (Apple Silicon)   | Homebrew             | macOS 13.3 or later                          |
+| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | Linux kernel 5.13 or later                   |
+| Windows (x86_64, arm64) | MSI, WinGet          | Windows minimum version: TBD; MSVC toolchain |
 
 ## Client
 
@@ -22,9 +22,9 @@ musl and are supported on macOS, Linux, and Windows.
 
 | Driver     | Supported hosts       | Minimum version | Requirements                                                                          |
 | ---------- | --------------------- | --------------- | ------------------------------------------------------------------------------------- |
-| Docker     | macOS, Linux, Windows | TBD             | Docker Engine or Docker Desktop.                                                      |
+| Docker     | macOS, Linux, Windows | 28.0.4 or later | Docker Engine or Docker Desktop.                                                      |
 | Podman     | macOS, Linux, Windows | 5.x             | Podman socket, rootless networking, and cgroups v2.                                   |
-| MicroVM    | macOS, Linux          | TBD             | `Hypervisor.framework` on macOS; KVM on Linux.                                        |
+| MicroVM    | macOS, Linux          | macOS 13.3 or later; Linux kernel 5.13 or later | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux. |
 | Kubernetes | Kubernetes clusters   | 1.29 or later   | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
 ## Supervisor Kernel Requirements
@@ -65,9 +65,9 @@ the required overrides.
 | SDK        | Minimum version |
 | ---------- | --------------- |
 | Python     | 3.12            |
-| TypeScript | TBD             |
+| TypeScript | 5.7             |
 | Rust       | 1.90            |
-| Go         | TBD             |
+| Go         | 1.24            |
 
 ## API Compatibility
 
