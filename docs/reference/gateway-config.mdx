@@ -18,6 +18,13 @@ Startup configuration is distinct from runtime settings such as `providers_v2_en
 Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
+This precedence applies only to startup configuration, including the
+`runtime_config_path` that selects the second file. Runtime setting keys are not
+exposed as gateway process flags or `OPENSHELL_*` environment variables. For a
+key present in the runtime settings file, that file is authoritative and the
+gateway rejects global API or CLI writes. A key omitted from the runtime file
+uses its stored global value and remains mutable through `openshell settings`.
+
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
 ## Package-Managed Locations

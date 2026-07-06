@@ -1492,6 +1492,15 @@ async fn handle_update_config_inner(
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
 
+        // Check this before dispatching the global mutation. Keep the check
+        // under settings_mutex so a runtime-file reload cannot change key
+        // ownership between this check and the stored-settings write.
+        if has_setting && state.runtime_settings.is_managed_key(key) {
+            return Err(Status::failed_precondition(format!(
+                "setting '{key}' is managed by the gateway runtime config file; update that file instead"
+            )));
+        }
+
         if has_merge_ops {
             return Err(Status::invalid_argument(
                 "merge_operations are not supported for global policy updates",
@@ -1607,12 +1616,6 @@ async fn handle_update_config_inner(
         if key != POLICY_SETTING_KEY {
             validate_registered_setting_key(key)?;
         }
-        if state.runtime_settings.is_managed_key(key) {
-            return Err(Status::failed_precondition(format!(
-                "setting '{key}' is managed by the gateway runtime config file; update that file instead"
-            )));
-        }
-
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let changed = if req.delete_setting {
             let removed = global_settings.settings.remove(key).is_some();
@@ -9283,7 +9286,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
