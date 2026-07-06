@@ -19,7 +19,7 @@ setup instructions.
 | Platform                | Installation methods | Versions                                     |
 | ----------------------- | -------------------- | -------------------------------------------- |
 | macOS (Apple Silicon)   | Homebrew             | macOS 13.3 or later                          |
-| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | Linux kernel 5.13 or later                   |
+| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | glibc 2.28 or later                          |
 | Windows (x86_64, arm64) | MSI, WinGet          | Windows minimum version: TBD; MSVC toolchain |
 
 The OpenShell client includes the CLI and TUI. Client binaries are built with
@@ -44,9 +44,9 @@ the host kernel.
 | Kernel capability                      | Requirement | Minimum             | Behavior when unavailable                                                      |
 | -------------------------------------- | ----------- | ------------------- | ------------------------------------------------------------------------------ |
 | seccomp BPF                            | Required    | Linux 3.17 or later | Supervisor security initialization fails.                                      |
-| Network namespaces, veth, and nftables | Required    | TBD                 | Network policy enforcement cannot start.                                       |
+| Network namespaces, veth, and nftables | Required    | Linux 3.13 or later | Network policy enforcement cannot start.                                       |
 | Landlock LSM                           | Recommended | Linux 5.13 or later | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
-| cgroups v2 PID controller              | Recommended | TBD                 | The compute driver or container runtime must provide PID limits.               |
+| cgroups v2 PID controller              | Recommended | Linux 4.5 or later  | The compute driver or container runtime must provide PID limits.               |
 | User namespaces                        | Optional    | Linux 5.12 or later | Stronger Kubernetes host isolation is unavailable.                             |
 
 ## Kubernetes
