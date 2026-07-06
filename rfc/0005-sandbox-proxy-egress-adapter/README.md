@@ -8,6 +8,8 @@ links:
   - https://github.com/NVIDIA/OpenShell/pull/1151
   - https://github.com/NVIDIA/OpenShell/pull/1286
   - https://github.com/NVIDIA/OpenShell/pull/1511
+  - https://github.com/NVIDIA/OpenShell/pull/1738
+  - https://github.com/NVIDIA/OpenShell/pull/2027
 ---
 
 # RFC 0005 - Sandbox Proxy Egress Adapter Model
@@ -22,9 +24,9 @@ Refactor sandbox egress around one shared authorization and relay pipeline.
 CONNECT, forward HTTP, native TCP capture, policy DNS, `inference.local`,
 `policy.local`, and metadata loopback should become narrow adapters that
 translate userland entry points into common runtime intents. Policy evaluation,
-destination validation, credential injection, request-body rewrite, WebSocket
-handling, protocol parsing, and upstream dialing should happen behind shared
-boundaries.
+destination validation, supervisor middleware, credential injection,
+request-body rewrite, WebSocket handling, protocol processing, and upstream
+dialing should happen behind shared boundaries.
 
 The codebase has already moved in this direction by splitting networking into
 `openshell-supervisor-network` and process/netns work into
@@ -43,8 +45,9 @@ Supporting detail lives in:
 The sandbox proxy supports several connection surfaces: explicit CONNECT,
 forward HTTP, local inference and policy APIs, metadata loopback, TLS
 termination, REST and GraphQL inspection, WebSocket inspection, credential
-injection, and nftables-backed bypass detection. These features are valuable,
-but changes to policy and enforcement still tend to touch multiple entry paths.
+injection, supervisor middleware, and nftables-backed bypass detection. These
+features are valuable, but changes to policy and enforcement still tend to
+touch multiple entry paths.
 
 The risk is asymmetric enforcement. A security fix can be added to CONNECT and
 missed in forward HTTP; endpoint metadata can be selected differently from the
@@ -89,11 +92,11 @@ enforcement contracts.
    endpoint selection once per connection intent and returns one decision
    containing the matched policy, matched endpoint, process identity, allowed
    IP metadata, TLS behavior, protocol enforcement, and credential injection
-   plan.
+   and middleware plans.
 3. **Relays.** Relays receive an authorized destination connector, not an
    already-open upstream socket. HTTP relays evaluate every request before
    upstream write. TCP relays copy bytes for L4-only endpoints or hand the
-   stream to a protocol parser when endpoint policy requires native protocol
+   stream to a protocol processor when endpoint policy requires native protocol
    enforcement.
 
 ### Unified Adapter Flow
@@ -177,12 +180,12 @@ adapter renders it for its protocol.
 ```mermaid
 flowchart TD
     Start["Authorized egress + destination connector"]
-    Start --> FirstReq{"First HTTP request already parsed?"}
+    Start --> FirstReq{"Forward HTTP adapter supplied first request?"}
 
     FirstReq -- Yes --> ForwardMode{"decision.endpoint.enforcement"}
     ForwardMode -- "None" --> HttpCred["HTTP relay<br/>credential injection only"]
     ForwardMode -- "Http" --> HttpL7["HTTP relay<br/>REST/GraphQL/WebSocket policy"]
-    ForwardMode -- "TcpApplication" --> BadForward["Deny: HTTP request for TCP app endpoint"]
+    ForwardMode -- "ProtocolProcessor" --> BadForward["Deny: HTTP request for native protocol endpoint"]
 
     FirstReq -- No --> TlsPolicy{"TLS handling skipped?"}
     TlsPolicy -- Yes --> Readable["Readable client stream"]
@@ -201,13 +204,18 @@ flowchart TD
     MustHttp -- Yes --> HttpL7
     MustHttp -- No --> DenyHttp["Deny: expected HTTP"]
 
-    Enforce -- "TcpApplication" --> TcpParser["TcpRelay<br/>protocol parser owns loop"]
+    Enforce -- "ProtocolProcessor" --> Processor["TcpRelay<br/>protocol processor owns loop"]
 
     HttpCred --> ReqLoop["HTTP request loop"]
     HttpL7 --> ReqLoop
     ReqLoop --> ReqPolicy{"Request allowed?"}
     ReqPolicy -- No --> ReqDeny["Local HTTP deny<br/>no upstream write"]
-    ReqPolicy -- Yes --> StaticCreds["Resolve static placeholders"]
+    ReqPolicy -- Yes --> Middleware{"Supervisor middleware chain configured?"}
+    Middleware -- Yes --> MwEval["Evaluate HTTP_REQUEST / PRE_CREDENTIALS<br/>allow, deny, or mutate"]
+    Middleware -- No --> StaticCreds["Resolve static placeholders"]
+    MwEval --> MwAllowed{"Middleware allowed?"}
+    MwAllowed -- No --> MwDeny["Local middleware deny<br/>no credential injection"]
+    MwAllowed -- Yes --> StaticCreds
     StaticCreds --> TokenGrant["Apply endpoint token grant if configured"]
     TokenGrant --> Rewrite["Rewrite configured credential slots"]
     Rewrite --> HttpDial["Connect or reuse upstream"]
@@ -218,7 +226,7 @@ flowchart TD
     WsInspect -- No --> RawUpgrade["Raw upgraded stream"]
     WsInspect -- Yes --> WsRelay["WebSocket relay<br/>text-frame rewrite / message policy"]
 
-    TcpParser --> ParserDial["Parser calls connector when protocol allows"]
+    Processor --> ProcessorDial["Processor calls connector when protocol allows"]
     TcpRelay --> TcpDial["Connect upstream"]
     TcpDial --> ByteCopy["Copy bytes"]
 ```
@@ -227,9 +235,19 @@ Relay rules:
 
 - HTTP credential injection happens in both HTTP modes: L4-only HTTP and
   HTTP-inspected.
+- Supervisor middleware is a typed relay hook. V1 middleware runs on parsed
+  HTTP requests at `HTTP_REQUEST / PRE_CREDENTIALS`, after network and request
+  policy admit the request and before OpenShell injects credentials.
+- Middleware can allow, deny, replace the bounded request body, add approved
+  headers, and emit audit-safe findings/metadata. External middleware must not
+  receive OpenShell-managed credentials.
 - Credential injection includes static placeholder rewrite and endpoint-bound
   dynamic token grants. Token grants run after policy allow and before upstream
   write; failures deny without forwarding the request.
+- Middleware-transformed content must not create a new path for resolving
+  OpenShell credential placeholders unless the middleware hook is explicitly
+  trusted as credential-capable. The safe default is to fail closed on newly
+  introduced reserved placeholders before credential injection.
 - Static credential rewrite covers request target, query, headers, opt-in REST
   request bodies, and opt-in client-to-server WebSocket text frames.
 - HTTP L7 policy is evaluated before upstream write for each request.
@@ -242,9 +260,10 @@ Relay rules:
   switch to raw bidirectional copy.
 - `protocol: tcp` or an omitted protocol means L4 authorization plus byte copy,
   except that HTTP-looking streams may still use HTTP credential injection.
-- Future native protocol parsers, such as Redis, Postgres, or MySQL, own the
+- Future native protocol processors, such as Redis, Postgres, or MySQL, own the
   full message loop and can parse multiple commands or queries on one TCP
-  session.
+  session. A processor may be in-tree, middleware-backed, or a combination
+  where in-tree framing exposes typed middleware hooks.
 
 ### Adapter Responsibilities
 
@@ -252,8 +271,8 @@ CONNECT remains the generic explicit proxy mode for HTTPS and arbitrary TCP.
 The CONNECT adapter parses `CONNECT host:port` into an `EgressIntent`, asks the
 shared authorization boundary for an `EgressDecision`, returns the tunnel-ready
 response only after the connection is allowed, and then hands the tunnel to the
-relay. The upstream connection is opened by the HTTP relay or TCP parser when
-payload policy allows it.
+relay. The upstream connection is opened by the HTTP relay or protocol
+processor when payload policy allows it.
 
 Forward HTTP is compatibility for clients that send absolute-form HTTP
 requests. The adapter parses the first request, rewrites proxy framing only at
@@ -312,6 +331,10 @@ mappings. It should not add a parallel iptables path.
 
 A pluggable proxy must expose the right userland surfaces, implement the
 gateway APIs it needs, and prove equivalent policy enforcement through tests.
+If supervisor middleware is configured, the proxy runtime must also receive the
+effective middleware service registry, validate/refresh bindings, enforce
+`fail_open` and `fail_closed`, buffer within configured caps, invoke middleware
+on the request path, and emit middleware OCSF events.
 The nftables rules that force or reject userland traffic belong to the sandbox
 network boundary even if the proxy process later moves into a standalone binary
 or sidecar.
@@ -322,17 +345,18 @@ The detailed migration plan lives in [implementation-plan.md](implementation-pla
 The intended order is:
 
 1. Add regression coverage around the current split, forward HTTP invariants,
-   endpoint selection, token grants, WebSocket/body rewrite, metadata loopback,
-   and nftables bypass enforcement.
+   endpoint selection, supervisor middleware, token grants, WebSocket/body
+   rewrite, metadata loopback, and nftables bypass enforcement.
 2. Introduce `EgressIntent` and `EgressDecision` inside
    `openshell-supervisor-network`.
 3. Move destination validation and endpoint metadata materialization behind the
    shared decision and connector boundary.
-4. Consolidate forward HTTP, CONNECT HTTP inspection, credential injection,
-   request-body rewrite, and WebSocket handling behind shared HTTP/WebSocket
-   relay code.
+4. Consolidate forward HTTP, CONNECT HTTP inspection, supervisor middleware,
+   credential injection, request-body rewrite, and WebSocket handling behind
+   shared HTTP/WebSocket relay code.
 5. Move TLS detection and termination ahead of the HTTP/TCP relay split.
-6. Add the TCP relay/parser boundary, then policy DNS and native TCP capture.
+6. Add the TCP relay/protocol processor boundary, then policy DNS and native
+   TCP capture.
 7. Treat local services and deployment modes as explicit runtime contracts.
 
 ## Risks
@@ -352,6 +376,9 @@ The intended order is:
 - Provider-composed policy rules use a reserved namespace. Decisions and logs
   must distinguish provider-derived policy from user-authored policy without
   exposing provider rules as editable sandbox proposals.
+- Supervisor middleware adds a synchronous request-path dependency. Body caps,
+  timeout behavior, registry reloads, and `fail_open` choices must be visible
+  in telemetry so operators can diagnose whether content inspection ran.
 
 ## Alternatives
 
@@ -388,6 +415,12 @@ The existing L7 relay is the behavioral prior art for this RFC. It already
 proves per-request HTTP evaluation, GraphQL parsing, WebSocket frame handling,
 request-body rewrite, and token-grant injection can live behind relay
 boundaries.
+
+RFC 0009 supervisor middleware is the extension prior art. It defines
+`HTTP_REQUEST / PRE_CREDENTIALS` as a supervisor-owned hook that can inspect,
+deny, or transform admitted HTTP requests before credentials are injected. RFC
+0005 should place that hook inside the shared relay rather than making each
+adapter wire middleware separately.
 
 ## Open questions
 

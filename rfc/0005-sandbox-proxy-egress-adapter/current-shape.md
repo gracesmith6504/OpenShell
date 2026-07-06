@@ -134,6 +134,33 @@ HTTP proxy variables.
 These are userland-facing network surfaces. They should stay distinct from
 external egress while still fitting the adapter model.
 
+## Adjacent In-Flight Supervisor Middleware Shape
+
+PRs #1738 and #2027 propose supervisor middleware as an HTTP request hook in
+the proxy relay. That work is adjacent to this RFC rather than a separate entry
+adapter.
+
+```mermaid
+flowchart TD
+    Req["Parsed admitted HTTP request"] --> Policy["Network and request policy already allowed"]
+    Policy --> Hook["HTTP_REQUEST / PRE_CREDENTIALS middleware"]
+    Hook --> Outcome{"Middleware outcome"}
+    Outcome -- "deny" --> Deny["Local deny, no credential injection"]
+    Outcome -- "allow / mutate" --> Creds["Credential injection"]
+    Creds --> Upstream["Upstream write"]
+```
+
+The proposed middleware chain is selected by admitted destination host, runs in
+deterministic order, buffers bounded request bodies, applies `fail_open` or
+`fail_closed`, emits audit-safe findings, and runs before OpenShell-managed
+credentials are injected. It can inspect WebSocket upgrade requests because
+they are HTTP requests, but it does not inspect post-upgrade WebSocket frames
+in v1.
+
+RFC 0005 should account for this by treating middleware as part of the shared
+request processing plan. CONNECT and forward HTTP should not each learn how to
+select and invoke middleware independently.
+
 ## Current Network Namespace Enforcement
 
 ```mermaid
@@ -205,6 +232,7 @@ The refactor should preserve:
 - nftables bypass reject/log enforcement.
 - Provider credential injection and redaction.
 - Dynamic token grant injection through SPIFFE-backed provider credentials.
+- Supervisor middleware `HTTP_REQUEST / PRE_CREDENTIALS` when it lands.
 - REST request-body credential rewrite.
 - WebSocket text-frame credential rewrite.
 - REST endpoint method/path policy.

@@ -18,6 +18,9 @@ direction-focused.
   HTTP-inspected paths.
 - Add tests proving token grant success injects the configured header and token
   grant failure does not forward upstream.
+- Add tests proving supervisor middleware runs after request policy and before
+  credential injection, including allow, deny, mutation, `fail_open`,
+  `fail_closed`, and body-cap behavior.
 - Add tests for REST request-body credential rewrite, WebSocket text-frame
   credential rewrite, WebSocket GraphQL policy, and compression handling.
 - Add tests for `policy.local` proposal wait behavior and `inference.local`
@@ -35,7 +38,8 @@ direction-focused.
   together.
 - Include policy source on the decision: user-authored, provider-derived, or
   local-service internal.
-- Include protocol enforcement and credential injection plan on the decision.
+- Include protocol enforcement, supervisor middleware, and credential injection
+  plans on the decision.
 - Fail closed when required endpoint metadata cannot be materialized.
 - Emit consistent OCSF network denial events from the shared boundary.
 
@@ -58,13 +62,20 @@ direction-focused.
 - Preserve h2c rejection on inspected routes.
 - Keep the no-raw-copy invariant after the first request.
 
-## Phase 4 - HTTP, WebSocket, And Credential Relay Consolidation
+## Phase 4 - HTTP, WebSocket, Middleware, And Credential Relay Consolidation
 
 - Centralize HTTP request parsing, REST policy, GraphQL policy, WebSocket
-  upgrade policy, credential resolution, redaction, request rewrite, upstream
-  dial, and response relay.
+  upgrade policy, supervisor middleware, credential resolution, redaction,
+  request rewrite, upstream dial, and response relay.
 - Evaluate every HTTP request before upstream write.
 - Ensure denied HTTP requests do not create upstream TCP sessions.
+- Run `HTTP_REQUEST / PRE_CREDENTIALS` middleware after request allow and
+  before static or dynamic credential injection.
+- Preserve middleware ordering, body caps, failure policy, safe header
+  mutation, findings, and metadata emission.
+- Reject or strip newly introduced reserved credential placeholders from
+  middleware-transformed content unless a future hook is explicitly
+  credential-capable.
 - Preserve static placeholder rewrite for target, query, and headers.
 - Preserve dynamic token grant injection after request allow and before
   upstream write.
@@ -84,13 +95,16 @@ direction-focused.
 - Treat `tls: skip` as the explicit opt-out for TLS handling.
 - Remove duplicate HTTP-specific and TCP-specific TLS termination decisions.
 
-## Phase 6 - TCP Relay And Parser Boundary
+## Phase 6 - TCP Relay And Protocol Processor Boundary
 
-- Use `TcpRelay` for byte relay and TCP application parser dispatch.
+- Use `TcpRelay` for byte relay and native protocol processor dispatch.
 - Keep `protocol: tcp` or omitted protocol as L4 authorization plus byte copy.
-- Add a TCP application parser dispatch point for future protocol enforcement.
-- Let TCP application parsers own their message loop and call the connector
+- Add a native protocol processor dispatch point for future protocol
+  enforcement.
+- Let protocol processors own their message loop and call the connector
   when protocol state allows.
+- Allow processors to expose typed middleware hooks instead of requiring all
+  payload logic to live in-tree.
 
 ## Phase 7 - Policy DNS And Transparent TCP
 
@@ -123,7 +137,8 @@ direction-focused.
   `openshell-supervisor-process` split as the structural baseline.
 - Define the proxy runtime API needed for a future standalone binary:
   configured listeners, policy updates, provider credentials, token grants,
-  gateway calls, telemetry, denial/activity events, and shutdown.
+  supervisor middleware registry, gateway calls, telemetry, denial/activity
+  events, and shutdown.
 - Identify process identity requirements for standalone and sidecar modes.
 - Add capability negotiation with the gateway if standalone proxy versions can
   differ from gateway versions.
@@ -152,6 +167,9 @@ direction-focused.
   paths.
 - Integration-test token grant success, cache hit, malformed token, resolver
   unavailable, and token endpoint failure.
+- Integration-test supervisor middleware allow/deny/mutate, unavailable
+  service, unresolved binding, body over-capacity, safe header mutation,
+  finding emission, and no-credential-visible behavior.
 - Integration-test REST request-body credential rewrite for JSON,
   form-url-encoded, `text/*`, unsupported content types, chunked framing, body
   caps, and unresolved placeholders.
@@ -160,8 +178,8 @@ direction-focused.
   safe compression negotiation.
 - Integration-test TLS termination before HTTP/TCP relay split.
 - Integration-test `protocol: tcp` byte-copy behavior.
-- Add parser harness tests before adding Redis, Postgres, or similar TCP
-  application parsers.
+- Add protocol processor harness tests before adding Redis, Postgres, or
+  similar native protocol enforcement.
 - Integration-test policy DNS TTL, stale generation handling, and captured
   connect correlation.
 - Integration-test `inference.local`, `policy.local`, and metadata loopback

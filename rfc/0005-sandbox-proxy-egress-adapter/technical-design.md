@@ -8,7 +8,8 @@ This appendix carries implementation-level design details behind the main RFC.
 startup boundary. It builds policy-local context, waits for policy binary
 symlink resolution, creates the identity cache, writes the TLS CA, builds TLS
 state, resolves inference routes, wires provider credentials and token grants,
-and starts the proxy.
+and starts the proxy. The supervisor middleware work extends this boundary with
+middleware registry construction and reload behavior.
 
 This is a useful outer boundary, but it is not yet the proxy adapter boundary.
 The proxy still needs internal `EgressIntent` and `EgressDecision` boundaries
@@ -50,11 +51,12 @@ It should carry:
 - TLS behavior;
 - protocol enforcement;
 - credential injection plan;
+- supervisor middleware plan;
 - logging context and denial reason.
 
 Relay code should read this decision. It should not query OPA again for
-endpoint metadata, TLS mode, allowed IPs, credential behavior, or parser
-selection.
+endpoint metadata, TLS mode, allowed IPs, credential behavior, middleware
+selection, or processor selection.
 
 ## Protocol Enforcement
 
@@ -66,10 +68,10 @@ Use a protocol enforcement value derived from endpoint policy:
 | `rest` | HTTP | HTTP request parser with REST rules, plus opt-in request-body and WebSocket text-frame credential rewrite |
 | `graphql` | HTTP | HTTP request parser with GraphQL-over-HTTP rules |
 | `websocket` | HTTP | HTTP upgrade policy followed by WebSocket frame policy or GraphQL-over-WebSocket policy |
-| future `redis`, `postgres`, `mysql`, ... | TCP application | Protocol-specific TCP parser owns the message loop |
+| future `redis`, `postgres`, `mysql`, ... | Protocol processor | Protocol-specific processor owns framing, middleware hooks, and the message loop |
 
-`protocol: tcp` is effectively the default L4 mode. It should not run TCP
-application parsers. Avoid using the term "provider" for parser concepts
+`protocol: tcp` is effectively the default L4 mode. It should not run native
+protocol processors. Avoid using the term "provider" for processor concepts
 because providers are already a first-class credential and routing domain in
 OpenShell.
 
@@ -100,6 +102,7 @@ struct EgressDecision {
     outcome: PolicyOutcome,
     matched_policy: Option<MatchedPolicy>,
     endpoint: Option<MatchedEndpoint>,
+    request_processing: RequestProcessingPlan,
     log_context: EgressLogContext,
 }
 
@@ -119,13 +122,17 @@ struct MatchedEndpoint {
     allowed_ips: AllowedIpPolicy,
     tls: TlsPolicy,
     enforcement: ProtocolEnforcement,
+}
+
+struct RequestProcessingPlan {
+    middleware: SupervisorMiddlewarePlan,
     credentials: CredentialInjectionPlan,
 }
 
 enum ProtocolEnforcement {
     None,
     Http(HttpL7Config),
-    TcpApplication(TcpApplicationConfig),
+    ProtocolProcessor(ProtocolProcessorConfig),
 }
 
 enum HttpL7Protocol {
@@ -162,6 +169,32 @@ struct TokenGrantPlan {
     token_endpoint: String,
 }
 
+struct SupervisorMiddlewarePlan {
+    stages: Vec<SupervisorMiddlewareStage>,
+    min_body_limit: Option<usize>,
+    registry_generation: PolicyGeneration,
+}
+
+struct SupervisorMiddlewareStage {
+    policy_name: String,
+    binding_id: String,
+    operation: MiddlewareOperation,
+    phase: MiddlewarePhase,
+    order: i32,
+    on_error: MiddlewareOnError,
+    config: MiddlewareConfig,
+}
+
+enum MiddlewareOperation {
+    HttpRequest,
+    Future(String),
+}
+
+enum MiddlewarePhase {
+    PreCredentials,
+    Future(String),
+}
+
 struct RelayContext {
     decision: EgressDecision,
     connector: UpstreamConnector,
@@ -171,8 +204,8 @@ struct RelayContext {
 ```
 
 `UpstreamConnector` is the relay-owned dial boundary. It encapsulates the
-validated destination and lets relays/parsers open an upstream connection only
-after protocol policy allows it.
+validated destination and lets relays/processors open an upstream connection
+only after protocol policy allows it.
 
 ## Current Owners And Proposed Cleanup
 
@@ -184,6 +217,7 @@ after protocol policy allows it.
 | `openshell-supervisor-network::opa` | Policy engine and Rego queries | Return deterministic `EgressDecision` data instead of separate policy and endpoint lookups |
 | `openshell-supervisor-network::l7` | REST, GraphQL, WebSocket, inference helpers, TLS, token grants | Keep as protocol/relay implementation behind shared relay boundaries |
 | `openshell-supervisor-network::policy_local` | `policy.local` state and routes | Model as a local adapter with explicit limits and proposal/wait behavior |
+| `openshell-supervisor-middleware` | Middleware registry, built-ins, service contract, and chain execution | Treat as a relay hook dependency selected by `EgressDecision`, not as adapter-specific policy logic |
 | `openshell-supervisor-process::netns` | nftables bypass rules and namespace helpers | Remain owner of bypass enforcement; coordinate future capture rules with network proxy mappings |
 | `openshell-supervisor-process::bypass_monitor` | nftables LOG parsing and OCSF bypass telemetry | Remain telemetry producer for bypass violations |
 | `openshell-core::secrets` and provider credential state | Static placeholder sources and dynamic credential metadata | Feed credential injection plans; do not leak secrets into decision logs |
@@ -248,13 +282,15 @@ matches for logging and debugging.
 ## Credential Injection Boundary
 
 Credential injection belongs in the HTTP/WebSocket relay after policy allow and
-before upstream write.
+supervisor middleware, and before upstream write.
 
 1. Authorization selects the endpoint and computes a credential injection plan.
-2. The HTTP relay resolves credentials only when it has an allowed request.
-3. Static placeholder values are resolved and redacted from logs.
-4. Endpoint-bound token grants obtain or reuse a dynamic access token.
-5. The final upstream request or WebSocket frame is rewritten immediately
+2. Supervisor middleware runs on the admitted request before credentials are
+   visible.
+3. The HTTP relay resolves credentials only when it has an allowed request.
+4. Static placeholder values are resolved and redacted from logs.
+5. Endpoint-bound token grants obtain or reuse a dynamic access token.
+6. The final upstream request or WebSocket frame is rewritten immediately
    before write.
 
 Both L4-only HTTP and HTTP-inspected paths can inject credentials. The
@@ -283,22 +319,63 @@ token, and inject either an `Authorization: Bearer` header or a configured
 custom header. Token grant failures should return a local relay error and must
 not forward the request upstream.
 
-## Parser Boundary
+Middleware-transformed content should be treated as untrusted input from a
+credential perspective. External middleware must not receive OpenShell-managed
+credentials, and it should not be able to synthesize new reserved credential
+placeholders that OpenShell later resolves into secrets. Unless a future hook
+is explicitly built-in-only and credential-capable, the relay should fail
+closed or strip newly introduced reserved placeholders before static
+placeholder rewrite and token grant injection.
 
-Protocol parsers operate on streams owned by the relay.
+## Supervisor Middleware Boundary
+
+Supervisor middleware is a typed relay hook, not a replacement for protocol
+framing. The relay or protocol processor must first parse enough structure to
+construct the operation-specific middleware input.
+
+For v1, the operation is `HTTP_REQUEST / PRE_CREDENTIALS`:
+
+1. Network policy, destination validation, and request policy admit the
+   request.
+2. The HTTP relay selects the middleware chain from the request processing
+   plan.
+3. The relay buffers the request body within the smallest selected stage limit.
+4. The chain evaluates in deterministic order.
+5. A deny short-circuits before credential injection or upstream write.
+6. An allow can replace the request body, add approved headers, emit findings,
+   and pass metadata forward.
+7. The transformed request then enters credential injection and upstream write.
+
+Middleware selection is independent from the matched endpoint policy. It is a
+request processing plan selected by admitted destination host, order, and
+binding metadata. The decision boundary should materialize it with the same
+policy generation used for endpoint selection so a long-lived tunnel cannot mix
+old endpoint policy with a new middleware registry.
+
+V1 middleware can inspect WebSocket upgrade requests because those are HTTP
+requests. It does not inspect post-upgrade WebSocket frames. A future frame
+hook should be a separate operation such as `WEBSOCKET_MESSAGE /
+BEFORE_FORWARD` owned by the WebSocket relay.
+
+## Protocol Processor Boundary
+
+Protocol processors operate on streams owned by the relay.
 
 - HTTP parsing converts bytes into request metadata, evaluates request policy,
+  runs the `HTTP_REQUEST / PRE_CREDENTIALS` middleware hook when configured,
   and loops for keep-alive or pipelined requests.
 - WebSocket parsing starts only after an allowed HTTP upgrade. It validates the
   handshake/frame stream and owns client-to-server text-frame inspection when
   credential rewrite, transport message policy, GraphQL-over-WebSocket policy,
   or compression handling is configured.
-- TCP application parsers read client and upstream streams as needed and own
-  their message loop.
-- A TCP parser can deny before dialing, dial for a server handshake, or keep
-  evaluating commands/queries throughout the session.
+- Native TCP protocol processors read client and upstream streams as needed
+  and own their message loop.
+- A protocol processor can deny before dialing, dial for a server handshake, or
+  keep evaluating commands/queries throughout the session.
+- A protocol processor may be in-tree, middleware-backed, or a hybrid where
+  in-tree framing exposes typed middleware operations for content evaluation.
 
-This avoids a separate dial strategy enum. The parser knows which protocol
+This avoids a separate dial strategy enum. The processor knows which protocol
 milestone is sufficient to call the validated connector.
 
 ## Local Service Adapter Boundary
@@ -330,9 +407,10 @@ egress.
 | HTTP relay | Per-request read/write deadlines, body caps, request-body rewrite caps, upstream reuse |
 | WebSocket relay | Upgrade validation, frame limits, text-frame rewrite, compression limits, message policy |
 | TCP relay | Byte-copy idle timeout and half-close handling |
-| TCP parser | Protocol message timeouts and parser-specific limits |
+| Protocol processor | Protocol message timeouts, middleware hook timeouts, and processor-specific limits |
 | Local service adapter | Local route body limits, response caps, gateway call timeout |
 | Token grant resolver | SPIFFE Workload API timeout, token endpoint timeout, cache TTL |
+| Middleware runner | Service timeout, body cap, failure policy, registry generation |
 
 Timeouts should be recorded in telemetry at the owner boundary that can explain
 the failure.
