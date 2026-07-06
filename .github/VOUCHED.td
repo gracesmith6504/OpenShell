@@ -95,3 +95,4 @@ Ygnas
 alexm-redhat
 bornav
 olivercalder
+Schimuneck
