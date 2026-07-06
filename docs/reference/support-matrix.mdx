@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Support Matrix"
-description: "Review OpenShell compatibility across host platforms, Kubernetes environments, and SDKs."
+description: "Review OpenShell compatibility across host platforms, compute drivers, GPU environments, Kubernetes, and SDKs."
 position: 5
 ---
 OpenShell can run sandboxes on a local macOS, Linux, or Windows machine or as
 a distributed deployment on Kubernetes. The OpenShell CLI, TUI, and SDKs can
 manage a local gateway or connect to a remote gateway. This matrix lists the
-supported platforms, runtimes, and client toolchains.
+supported platforms, runtimes, GPU environments, and client toolchains.
 
 ## Platforms
 
@@ -34,6 +34,24 @@ downloaded and run without a local gateway or package manager.
 | Podman     | macOS, Linux, Windows | 5.x                                        | Podman socket, rootless networking, and cgroups v2.                                   |
 | MicroVM    | macOS, Linux          | macOS 13.3 or later; KVM support on Linux  | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
 | Kubernetes | Kubernetes clusters   | 1.29 or later                              | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
+
+## GPU Support
+
+OpenShell supports NVIDIA GPU-backed sandboxes across compute drivers when the
+host or cluster exposes compatible devices. Any LTS CUDA release is supported,
+with release validation focused on Tesla Recommended Driver (TRD) branches.
+GPU-capable sandbox images provide the CUDA user-space libraries required by
+the workload.
+
+| Compute driver | Supported environment       | Device interface          | Requirements and limits                                                                                                              |
+| -------------- | --------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Docker         | Linux; Windows through WSL2 | NVIDIA CDI                | Docker CDI is enabled and NVIDIA devices are visible. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device. |
+| Podman         | Linux; Windows through WSL2 | NVIDIA CDI                | NVIDIA CDI devices are visible to Podman. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device.             |
+| MicroVM        | Linux                       | QEMU/VFIO PCI passthrough | The host provides IOMMU and VFIO support, root privileges, and a compatible sandbox image. Each sandbox supports one GPU.                           |
+| Kubernetes     | Linux GPU nodes             | `nvidia.com/gpu`          | The NVIDIA device plugin or GPU Operator exposes allocatable GPU capacity, and the sandbox image includes the required user-space libraries.          |
+
+GPU requests use `--gpu`. [GPU resource management](/sandboxes/manage-sandboxes#gpu-resources)
+describes default, counted, and exact-device requests.
 
 ## Supervisor Kernel Requirements
 
