@@ -31,10 +31,6 @@ setup instructions.
 | MicroVM    | macOS, Linux          | macOS 13.3 or later; KVM support on Linux  | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
 | Kubernetes | Kubernetes clusters   | 1.29 or later                              | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
-Docker and Podman pass the configured `sandbox_pids_limit` to the container
-runtime. Sandbox creation fails if the runtime rejects the limit. A value of
-`0` leaves the runtime default unchanged.
-
 ## GPU Support
 
 OpenShell supports NVIDIA GPU-backed sandboxes across compute drivers when the
