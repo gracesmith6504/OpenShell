@@ -75,16 +75,11 @@ OpenShell runs on Kubernetes as a distributed, multi-tenant application.
 | Kubernetes                        | 1.29 or later                   | Required for Helm deployments and sandbox scheduling. |
 | Helm                              | 3.x                             | Required to install and upgrade the OpenShell chart.  |
 | Agent Sandbox controller and CRDs | Compatible release; version TBD | Required before installing the OpenShell chart.       |
+| User namespaces                   | 1.33 or later                   | Optional. Policy enforcement remains available without support, but Kubernetes cannot set `hostUsers: false` for UID remapping. See [User Namespace Isolation guidance](/security/best-practices#user-namespace-isolation). |
 
 Kubernetes deployments require the Agent Sandbox controller and its `Sandbox`
 CRDs before the OpenShell Helm chart is installed. The
 [Kubernetes setup guide](/kubernetes/setup) provides installation instructions.
-
-User namespaces are optional. Without user namespace support, OpenShell policy
-enforcement remains available, but Kubernetes cannot set `hostUsers: false` to
-map container UID 0 to an unprivileged host UID. The
-[User Namespace Isolation guidance](/security/best-practices#user-namespace-isolation)
-describes prerequisites and security effects.
 
 ### Distributions
 
