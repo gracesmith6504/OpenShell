@@ -89,6 +89,22 @@ uses a `v1` suffix. Within a supported API major version, existing clients
 continue to work with newer servers. New clients may require capabilities that
 are not available from older servers.
 
+### Capability Discovery
+
+The gateway publishes structured compatibility information for clients:
+
+| Compatibility field | Purpose |
+| --- | --- |
+| Supported API versions | Identifies the API versions served by the gateway. |
+| Capabilities | Uses stable identifiers to report available operations and behaviors. |
+| Minimum client version | Identifies clients that cannot safely communicate with the gateway. |
+| Deprecations | Identifies deprecated capabilities, their replacements, and their planned removal versions. |
+
+The CLI, TUI, and SDKs select behavior from the advertised capabilities rather
+than inferring feature support from the server version. When an older server
+does not advertise a capability, the client hides or disables the feature when
+possible and otherwise returns an actionable unsupported-version error.
+
 ### Change Policy
 
 | Change | Policy |
@@ -99,11 +115,12 @@ are not available from older servers.
 
 Removed Protobuf field and enum numbers and names remain reserved and are never
 reused. CI compares API changes with the default branch for source, wire, and
-JSON compatibility. Release validation exercises the oldest supported release
-of the CLI, TUI, and each SDK against the candidate server. The current client
-release runs the shared-feature compatibility suite against every server
-version still in the support window. Features newer than the server use
-capability detection and return an actionable unsupported-version error.
+JSON compatibility. Client-server validation covers behavioral compatibility
+by exercising the oldest supported release of the CLI, TUI, and each SDK
+against the candidate server. The current client release runs the
+shared-feature compatibility suite against every server version still in the
+support window. Features newer than the server use capability detection and
+return an actionable unsupported-version error.
 
 This policy draws from the
 [Kubernetes API deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/),
