@@ -99,9 +99,11 @@ are not available from older servers.
 
 Removed Protobuf field and enum numbers and names remain reserved and are never
 reused. CI compares API changes with the default branch for source, wire, and
-JSON compatibility. Release validation exercises older supported SDKs against
-the new server and the current SDKs against every server version still in the
-support window.
+JSON compatibility. Release validation exercises the oldest supported release
+of the CLI, TUI, and each SDK against the candidate server. The current client
+release runs the shared-feature compatibility suite against every server
+version still in the support window. Features newer than the server use
+capability detection and return an actionable unsupported-version error.
 
 This policy draws from the
 [Kubernetes API deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/),
