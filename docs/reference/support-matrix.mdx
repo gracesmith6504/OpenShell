@@ -16,15 +16,11 @@ OpenShell can be installed and run on macOS, Linux, or Windows using standard
 package installers. The [Installation guide](/about/installation) provides
 setup instructions.
 
-| Platform                | Installation methods | Versions                                     |
+| Platform                | Installation methods | Requirements                                 |
 | ----------------------- | -------------------- | -------------------------------------------- |
 | macOS (Apple Silicon)   | Homebrew             | macOS 13.3 or later                          |
 | Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | glibc 2.28 or later                          |
 | Windows (x86_64, arm64) | MSI, WinGet          | Windows minimum version: TBD; MSVC toolchain |
-
-The OpenShell client includes the CLI and TUI. Client binaries are built with
-musl and are supported on macOS, Linux, and Windows. The client can be
-downloaded and run without a local gateway or package manager.
 
 ## Compute Drivers
 
@@ -34,6 +30,10 @@ downloaded and run without a local gateway or package manager.
 | Podman     | macOS, Linux, Windows | 5.x                                        | Podman socket, rootless networking, and cgroups v2.                                   |
 | MicroVM    | macOS, Linux          | macOS 13.3 or later; KVM support on Linux  | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
 | Kubernetes | Kubernetes clusters   | 1.29 or later                              | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
+
+Docker and Podman pass the configured `sandbox_pids_limit` to the container
+runtime. Sandbox creation fails if the runtime rejects the limit. A value of
+`0` leaves the runtime default unchanged.
 
 ## GPU Support
 
@@ -59,13 +59,12 @@ These requirements apply to the Linux environment running the supervisor. On
 macOS and Windows, they apply to the container or virtual machine kernel, not
 the host kernel.
 
-| Kernel capability                      | Requirement | Minimum | Behavior when unavailable                                                      |
-| -------------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------ |
-| seccomp BPF                            | Required    | 3.17    | Supervisor security initialization fails.                                      |
-| Network namespaces, veth, and nftables | Required    | 3.13    | Network policy enforcement cannot start.                                       |
-| Landlock LSM                           | Recommended | 5.13    | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
-| cgroups v2 PID controller              | Recommended | 4.5     | The compute driver or container runtime must provide PID limits.               |
-| User namespaces                        | Optional    | 5.12    | Stronger Kubernetes host isolation is unavailable.                             |
+| Kernel capability                 | Requirement | Minimum | Behavior when unavailable                                                      |
+| --------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------ |
+| seccomp BPF                       | Required    | 3.17    | Supervisor security initialization fails.                                      |
+| Network namespaces and veth       | Required    | 3.13    | Supervisor initialization fails, and the sandbox does not become ready.        |
+| nftables bypass-detection rules   | Recommended | 3.13    | The sandbox starts with bypass detection degraded and emits an OCSF configuration event. |
+| Landlock LSM                      | Recommended | 5.13    | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
 
 ## Kubernetes
 
@@ -81,12 +80,25 @@ Kubernetes deployments require the Agent Sandbox controller and its `Sandbox`
 CRDs before the OpenShell Helm chart is installed. The
 [Kubernetes setup guide](/kubernetes/setup) provides installation instructions.
 
+User namespaces are optional. Without user namespace support, OpenShell policy
+enforcement remains available, but Kubernetes cannot set `hostUsers: false` to
+map container UID 0 to an unprivileged host UID. The
+[User Namespace Isolation guidance](/security/best-practices#user-namespace-isolation)
+describes prerequisites and security effects.
+
 ### Distributions
 
 - GKE Standard and Autopilot clusters are supported.
 - OpenShift 4.x is supported with the OpenShift-specific SCC binding and chart
 configuration. Refer to [OpenShift installation](/kubernetes/openshift) for
 the required overrides.
+
+## CLI and TUI Clients
+
+Package installers install the OpenShell CLI, TUI, and gateway and start a local
+gateway service. Standalone CLI and TUI binaries are also available from
+[GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) and can connect
+to a remote gateway without running a local gateway.
 
 ## SDKs
 
