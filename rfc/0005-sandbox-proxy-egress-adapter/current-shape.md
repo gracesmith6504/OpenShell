@@ -39,6 +39,13 @@ routes, identity cache, provider credential injection, and token grants.
 helpers, nftables bypass rules, and the bypass monitor that turns nftables LOG
 entries into OCSF events.
 
+In embedded supervisor mode, the network leaf can usually use process metadata
+resolved by the process/orchestrator side for binary-scoped policy and OCSF
+context. Future network-only, standalone, or sidecar proxy modes may
+intentionally lack that metadata. The adapter model should preserve this as an
+explicit "identity unavailable" state rather than fabricating an empty binary
+identity.
+
 ## Current Userland-Facing Surfaces
 
 The networking surface currently includes:

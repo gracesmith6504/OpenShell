@@ -14,6 +14,9 @@ direction-focused.
   paths.
 - Add tests for exact declared private endpoint trust and `allowed_ips`
   behavior across CONNECT and forward HTTP.
+- Add tests for identity-less runtime modes where process identity is
+  intentionally unavailable and binary/path scoped policy does not
+  accidentally match.
 - Add tests proving static credential injection works in L4-only HTTP and
   HTTP-inspected paths.
 - Add tests proving token grant success injects the configured header and token
@@ -42,6 +45,9 @@ direction-focused.
   local-service internal.
 - Include protocol enforcement, supervisor middleware, and credential injection
   plans on the decision.
+- Include process identity availability and fields used on the decision. Treat
+  missing process identity as an explicit runtime mode, not as an implicit
+  lookup failure.
 - Fail closed when required endpoint metadata cannot be materialized.
 - Emit consistent OCSF network denial events from the shared boundary.
 
@@ -144,7 +150,10 @@ direction-focused.
   configured listeners, policy updates, provider credentials, token grants,
   supervisor middleware registry, gateway calls, telemetry, denial/activity
   events, and shutdown.
-- Identify process identity requirements for standalone and sidecar modes.
+- Advertise process identity capability for embedded, network-only,
+  standalone, and sidecar modes. Reject policies that require unavailable
+  identity dimensions, or define those predicates as non-matching for the
+  runtime mode.
 - Add capability negotiation with the gateway if standalone proxy versions can
   differ from gateway versions.
 
@@ -164,6 +173,7 @@ direction-focused.
 - Unit-test authorization precedence for overlapping policy and endpoint rules.
 - Unit-test provider-derived rule namespace handling and `policy.local`
   filtering.
+- Unit-test identity-available and identity-unavailable authorization inputs.
 - Integration-test shared destination validation across CONNECT, forward HTTP,
   and transparent TCP.
 - Integration-test HTTP keep-alive and pipelined requests with REST, GraphQL,

@@ -92,9 +92,9 @@ enforcement contracts.
    policy evaluation.
 2. **Egress intent and decision.** Shared authorization evaluates L4 policy and
    endpoint selection once per connection intent and returns one decision
-   containing the matched policy, matched endpoint, process identity, allowed
-   IP metadata, TLS behavior, protocol enforcement, and credential injection
-   and middleware plans.
+   containing the matched policy, matched endpoint, optional process identity
+   evidence used for evaluation, allowed IP metadata, TLS behavior, protocol
+   enforcement, and credential injection and middleware plans.
 3. **Relays.** Relays receive an authorized destination connector, not an
    already-open upstream socket. HTTP relays evaluate every request before
    upstream write. TCP relays copy bytes for L4-only endpoints or hand the
@@ -342,6 +342,18 @@ If supervisor middleware is configured, the proxy runtime must also receive the
 effective middleware service registry, validate/refresh bindings, enforce
 `fail_open` and `fail_closed`, buffer within configured caps, invoke middleware
 on the request path, and emit middleware OCSF events.
+
+Process identity is mode-dependent. Embedded supervisor mode can usually
+resolve the workload process, binary, and ancestors. Network-only, standalone,
+and sidecar modes may intentionally have no local process identity. In those
+modes the adapter should pass an explicit unavailable identity envelope, and
+the decision should record identity as unavailable rather than treating it as
+an accidental lookup failure. Authorization must not turn a missing identity
+into a broader allow. Process-scoped predicates should either be treated as
+non-matching for that runtime or rejected during policy/capability validation.
+Policies that require binary/path scoping need an explicit capability check or
+fallback rule before they are allowed to run in identity-less modes.
+
 The nftables rules that force or reject userland traffic belong to the sandbox
 network boundary even if the proxy process later moves into a standalone binary
 or sidecar.
@@ -376,7 +388,9 @@ The intended order is:
   endpoints. Failures should remain fail-closed and sanitized.
 - Transparent TCP capture adds network namespace interception complexity and
   must coexist with the nftables bypass reject/log table.
-- Sidecar mode needs a reliable identity source for binary/path scoped policy.
+- Sidecar mode may intentionally lack process identity. Binary/path scoped
+  policy needs a reliable identity source or must be rejected/ignored for that
+  deployment mode.
 - Metadata loopback and `policy.local` expand sandbox-local control surfaces
   and need strict route validation, body limits, redaction, and authentication
   boundaries.
@@ -436,8 +450,8 @@ adapter wire middleware separately.
 2. Should direct IP connects to a policy-DNS-resolved TCP endpoint be accepted,
    or should DNS query correlation be required for stricter modes?
 3. What TTL cap and stale-generation grace period should policy DNS use?
-4. Which process identity source should sidecar mode use when it cannot inspect
-   payload process metadata through local `/proc`?
+4. Which policy features should be disabled, rejected, or treated as
+   non-matching when the proxy runtime advertises no process identity support?
 5. Which proxy capabilities should be negotiated with the gateway at startup?
 6. Should metadata loopback be modeled as an adapter inside
    `openshell-supervisor-network`, or remain orchestrated by `openshell-sandbox`

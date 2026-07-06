@@ -27,7 +27,7 @@ It should carry:
 - entry transport: CONNECT, forward HTTP, transparent TCP, local HTTP, policy
   DNS, or metadata loopback;
 - requested destination host/port or captured original IP/port;
-- process identity inputs collected by the adapter/runtime;
+- optional process identity inputs collected by the adapter/runtime;
 - optional first HTTP request for forward proxy traffic;
 - optional local service route;
 - policy generation or DNS mapping generation when relevant.
@@ -46,7 +46,7 @@ It should carry:
 - whether the policy is user-authored, provider-derived, or local-service
   internal;
 - deterministic matched endpoint identifier and endpoint metadata;
-- process identity used for evaluation;
+- process identity availability and any identity fields used for evaluation;
 - destination and allowed IP constraints;
 - TLS behavior;
 - protocol enforcement;
@@ -94,7 +94,7 @@ enum EgressTransport {
 struct EgressIntent {
     transport: EgressTransport,
     destination: RequestedDestination,
-    process: ProcessIdentity,
+    process: ProcessIdentityEvidence,
     first_request: Option<ParsedHttpRequest>,
     local_route: Option<LocalRoute>,
     generation: Option<PolicyGeneration>,
@@ -104,8 +104,25 @@ struct EgressDecision {
     outcome: PolicyOutcome,
     matched_policy: Option<MatchedPolicy>,
     endpoint: Option<MatchedEndpoint>,
+    process: EvaluatedProcessIdentity,
     request_processing: RequestProcessingPlan,
     log_context: EgressLogContext,
+}
+
+enum ProcessIdentityEvidence {
+    Available(ProcessIdentity),
+    Unavailable(ProcessIdentityUnavailableReason),
+}
+
+enum ProcessIdentityUnavailableReason {
+    RuntimeMode,
+    UnsupportedAdapter,
+    LookupFailed,
+}
+
+struct EvaluatedProcessIdentity {
+    evidence: ProcessIdentityEvidence,
+    fields_used: Vec<ProcessIdentityField>,
 }
 
 struct MatchedPolicy {
@@ -212,6 +229,27 @@ struct RelayContext {
 `UpstreamConnector` is the relay-owned dial boundary. It encapsulates the
 validated destination and lets relays/processors open an upstream connection
 only after protocol policy allows it.
+
+## Process Identity Availability
+
+Process identity is evidence, not an always-present input. Embedded supervisor
+mode can usually populate binary, PID, ancestry, command-line path, and binary
+hash data. Network-only, standalone binary, or sidecar proxy modes may
+intentionally have no local process metadata. That should be represented as
+`ProcessIdentityEvidence::Unavailable(RuntimeMode)`, not as an empty string
+that accidentally matches policy.
+
+Authorization should evaluate only identity dimensions that are available. If
+no identity is available, binary/path scoped policy should either be skipped as
+non-matching or rejected at policy/capability validation time, depending on the
+runtime mode contract. The important invariant is that missing identity must
+not produce a synthetic binary, broaden a binary-scoped allow rule, or cause
+the relay to query process metadata later. During `EgressDecision` hydration,
+absent process evidence should be carried forward as unavailable identity and
+process-derived fields should be omitted from the hydrated decision. The
+decision should record identity availability and fields used so OCSF logs and
+deny responses can distinguish "policy denied this binary" from "this runtime
+did not provide process identity."
 
 ## Current Owners And Proposed Cleanup
 
