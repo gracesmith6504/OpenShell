@@ -5,10 +5,16 @@ title: "Support Matrix"
 description: "Review OpenShell compatibility across host platforms, Kubernetes environments, and SDKs."
 position: 5
 ---
+OpenShell can run sandboxes on a local macOS, Linux, or Windows machine or as
+a distributed deployment on Kubernetes. The OpenShell CLI, TUI, and SDKs can
+manage a local gateway or connect to a remote gateway. This matrix lists the
+supported platforms, runtimes, and client toolchains.
+
 ## Platforms
 
-Install and run OpenShell on macOS, Linux, or Windows using a standard package
-installer. Refer to [Installation](/about/installation) for setup instructions.
+OpenShell can be installed and run on macOS, Linux, or Windows using standard
+package installers. The [Installation guide](/about/installation) provides
+setup instructions.
 
 | Platform                | Installation methods | Versions                                     |
 | ----------------------- | -------------------- | -------------------------------------------- |
@@ -16,20 +22,18 @@ installer. Refer to [Installation](/about/installation) for setup instructions.
 | Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | Linux kernel 5.13 or later                   |
 | Windows (x86_64, arm64) | MSI, WinGet          | Windows minimum version: TBD; MSVC toolchain |
 
-## Client
-
 The OpenShell client includes the CLI and TUI. Client binaries are built with
-musl and are supported on macOS, Linux, and Windows. You can download and run
-the client without running a local gateway.
+musl and are supported on macOS, Linux, and Windows. The client can be
+downloaded and run without a local gateway or package manager.
 
 ## Compute Drivers
 
-| Driver     | Supported hosts       | Minimum version | Requirements                                                                          |
-| ---------- | --------------------- | --------------- | ------------------------------------------------------------------------------------- |
-| Docker     | macOS, Linux, Windows | 28.0.4 or later | Docker Engine or Docker Desktop.                                                      |
-| Podman     | macOS, Linux, Windows | 5.x             | Podman socket, rootless networking, and cgroups v2.                                   |
-| MicroVM    | macOS, Linux          | macOS 13.3 or later; Linux kernel 5.13 or later | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux. |
-| Kubernetes | Kubernetes clusters   | 1.29 or later   | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
+| Driver     | Supported hosts       | Minimum version                                 | Requirements                                                                          |
+| ---------- | --------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Docker     | macOS, Linux, Windows | 28.0.4 or later                                 | Docker Engine or Docker Desktop.                                                      |
+| Podman     | macOS, Linux, Windows | 5.x                                             | Podman socket, rootless networking, and cgroups v2.                                   |
+| MicroVM    | macOS, Linux          | macOS 13.3 or later; Linux kernel 5.13 or later | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
+| Kubernetes | Kubernetes clusters   | 1.29 or later                                   | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
 ## Supervisor Kernel Requirements
 
@@ -47,7 +51,7 @@ the host kernel.
 
 ## Kubernetes
 
-Run OpenShell on Kubernetes as a distributed, multi-tenant application.
+OpenShell runs on Kubernetes as a distributed, multi-tenant application.
 
 | Component                         | Supported version               | Notes                                                 |
 | --------------------------------- | ------------------------------- | ----------------------------------------------------- |
@@ -55,9 +59,9 @@ Run OpenShell on Kubernetes as a distributed, multi-tenant application.
 | Helm                              | 3.x                             | Required to install and upgrade the OpenShell chart.  |
 | Agent Sandbox controller and CRDs | Compatible release; version TBD | Required before installing the OpenShell chart.       |
 
-Install the Agent Sandbox controller and its `Sandbox` CRDs before deploying
-the OpenShell Helm chart. Refer to [Kubernetes setup](/kubernetes/setup) for
-installation instructions.
+Kubernetes deployments require the Agent Sandbox controller and its `Sandbox`
+CRDs before the OpenShell Helm chart is installed. The
+[Kubernetes setup guide](/kubernetes/setup) provides installation instructions.
 
 ### Distributions
 
@@ -68,7 +72,7 @@ the required overrides.
 
 ## SDKs
 
-Use the supported SDKs to connect to local or remote OpenShell deployments.
+The supported SDKs connect to local or remote OpenShell deployments.
 
 | SDK        | Minimum version |
 | ---------- | --------------- |
