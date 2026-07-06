@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Typed, comment-preserving updates to the gateway TOML configuration.
+//! CLI handlers for inspecting and updating the gateway TOML configuration.
 
 use std::fs;
 use std::io::Write;

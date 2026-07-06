@@ -27,7 +27,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
-mod config_edit;
+mod config_command;
 pub mod config_file;
 mod defaults;
 mod grpc;
@@ -840,8 +840,8 @@ fn configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
         [] => {
-            let detected = openshell_core::config::detect_drivers();
-            let Some(driver) = detected.first().copied() else {
+            let detection = openshell_core::config::detect_drivers();
+            let Some(driver) = detection.selected else {
                 return Err(Error::config(
                     "no compute driver configured and auto-detection found no suitable driver; \
                     install and start Docker or Podman, or install the VM driver and select it \
@@ -855,7 +855,7 @@ fn configured_compute_driver(
                 ));
             }
 
-            log_auto_detected_driver(config, driver, &detected);
+            log_auto_detected_driver(config, driver, &detection.available);
             Ok(ConfiguredComputeDriver::Builtin(driver))
         }
         [driver] => resolve_configured_compute_driver(driver, driver_startup),

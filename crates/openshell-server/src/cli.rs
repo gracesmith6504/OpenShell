@@ -40,7 +40,7 @@ enum Commands {
     /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
     GenerateCerts(certgen::CertgenArgs),
     /// Inspect or update the gateway TOML configuration.
-    Config(crate::config_edit::ConfigArgs),
+    Config(crate::config_command::ConfigArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -230,7 +230,7 @@ pub async fn run_cli() -> Result<()> {
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
-        Some(Commands::Config(args)) => crate::config_edit::run(args, cli.run.config),
+        Some(Commands::Config(args)) => crate::config_command::run(args, cli.run.config),
         None => Box::pin(run_from_args(cli.run, matches)).await,
     }
 }
@@ -1105,7 +1105,7 @@ mod tests {
             panic!("expected config subcommand");
         };
 
-        crate::config_edit::run(args, run.config).unwrap();
+        crate::config_command::run(args, run.config).unwrap();
 
         let loaded = crate::config_file::load(&path).unwrap();
         assert_eq!(

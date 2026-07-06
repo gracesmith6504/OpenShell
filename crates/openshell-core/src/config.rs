@@ -113,16 +113,23 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
+/// Result of automatic compute-driver detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverDetection {
+    /// Driver selected according to automatic selection priority.
+    pub selected: Option<ComputeDriverKind>,
+    /// Every available driver in automatic selection priority order.
+    pub available: Vec<ComputeDriverKind>,
+}
+
 /// Detect available compute drivers based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
 /// VM is never auto-detected (requires explicit `--drivers vm`).
 ///
-/// Returns every available driver in selection priority order.
-///
 /// VM is excluded because it requires explicit operator selection.
 #[must_use]
-pub fn detect_drivers() -> Vec<ComputeDriverKind> {
+pub fn detect_drivers() -> DriverDetection {
     let mut drivers = Vec::new();
 
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
@@ -140,13 +147,16 @@ pub fn detect_drivers() -> Vec<ComputeDriverKind> {
         drivers.push(ComputeDriverKind::Docker);
     }
 
-    drivers
+    DriverDetection {
+        selected: drivers.first().copied(),
+        available: drivers,
+    }
 }
 
-/// Returns the first available driver in automatic selection priority order.
+/// Returns the selected driver in automatic selection priority order.
 #[must_use]
 pub fn detect_driver() -> Option<ComputeDriverKind> {
-    detect_drivers().into_iter().next()
+    detect_drivers().selected
 }
 
 /// Check if a binary is available on the system PATH.
@@ -800,8 +810,8 @@ mod tests {
     use super::is_reachable_unix_socket;
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        detect_drivers, docker_host_unix_socket_path, is_unix_socket,
+        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -1063,8 +1073,13 @@ mod tests {
             std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
         }
 
-        let result = detect_driver();
-        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
+        let detection = detect_drivers();
+        assert_eq!(detection.selected, Some(ComputeDriverKind::Kubernetes));
+        assert_eq!(
+            detection.available.first().copied(),
+            Some(ComputeDriverKind::Kubernetes)
+        );
+        assert_eq!(detect_driver(), detection.selected);
 
         // Restore the original env var
         unsafe {
