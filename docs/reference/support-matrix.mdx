@@ -41,13 +41,13 @@ These requirements apply to the Linux environment running the supervisor. On
 macOS and Windows, they apply to the container or virtual machine kernel, not
 the host kernel.
 
-| Kernel capability                      | Requirement | Minimum             | Behavior when unavailable                                                      |
-| -------------------------------------- | ----------- | ------------------- | ------------------------------------------------------------------------------ |
-| seccomp BPF                            | Required    | Linux 3.17 or later | Supervisor security initialization fails.                                      |
-| Network namespaces, veth, and nftables | Required    | Linux 3.13 or later | Network policy enforcement cannot start.                                       |
-| Landlock LSM                           | Recommended | Linux 5.13 or later | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
-| cgroups v2 PID controller              | Recommended | Linux 4.5 or later  | The compute driver or container runtime must provide PID limits.               |
-| User namespaces                        | Optional    | Linux 5.12 or later | Stronger Kubernetes host isolation is unavailable.                             |
+| Kernel capability                      | Requirement | Minimum | Behavior when unavailable                                                      |
+| -------------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------ |
+| seccomp BPF                            | Required    | 3.17    | Supervisor security initialization fails.                                      |
+| Network namespaces, veth, and nftables | Required    | 3.13    | Network policy enforcement cannot start.                                       |
+| Landlock LSM                           | Recommended | 5.13    | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
+| cgroups v2 PID controller              | Recommended | 4.5     | The compute driver or container runtime must provide PID limits.               |
+| User namespaces                        | Optional    | 5.12    | Stronger Kubernetes host isolation is unavailable.                             |
 
 ## Kubernetes
 
