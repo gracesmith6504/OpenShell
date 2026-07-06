@@ -67,6 +67,8 @@ Use a protocol enforcement value derived from endpoint policy:
 | omitted / `tcp` | None | L4 authorization plus byte relay, with optional HTTP sniff for credential injection |
 | `rest` | HTTP | HTTP request parser with REST rules, plus opt-in request-body and WebSocket text-frame credential rewrite |
 | `graphql` | HTTP | HTTP request parser with GraphQL-over-HTTP rules |
+| `json-rpc` | HTTP | HTTP request parser plus bounded JSON-RPC-over-HTTP method inspection |
+| `mcp` | HTTP | HTTP request parser plus bounded MCP Streamable HTTP method/tool inspection |
 | `websocket` | HTTP | HTTP upgrade policy followed by WebSocket frame policy or GraphQL-over-WebSocket policy |
 | future `redis`, `postgres`, `mysql`, ... | Protocol processor | Protocol-specific processor owns framing, middleware hooks, and the message loop |
 
@@ -138,6 +140,8 @@ enum ProtocolEnforcement {
 enum HttpL7Protocol {
     Rest,
     Graphql,
+    JsonRpc,
+    Mcp,
     Websocket,
 }
 
@@ -150,6 +154,8 @@ struct HttpL7Config {
     request_body_credential_rewrite: bool,
     websocket_graphql_policy: bool,
     graphql_max_body_bytes: usize,
+    json_rpc_max_body_bytes: usize,
+    mcp_strict_tool_names: bool,
 }
 
 struct CredentialInjectionPlan {
@@ -215,7 +221,7 @@ only after protocol policy allows it.
 | `openshell-supervisor-network::run` | Networking startup and handles | Become the stable runtime API for embedded and future standalone modes |
 | `openshell-supervisor-network::proxy` | CONNECT, forward HTTP, local route dispatch, destination validation, denial rendering | Split into adapters, authorization, destination, relay selection, and adapter response rendering |
 | `openshell-supervisor-network::opa` | Policy engine and Rego queries | Return deterministic `EgressDecision` data instead of separate policy and endpoint lookups |
-| `openshell-supervisor-network::l7` | REST, GraphQL, WebSocket, inference helpers, TLS, token grants | Keep as protocol/relay implementation behind shared relay boundaries |
+| `openshell-supervisor-network::l7` | REST, GraphQL, JSON-RPC, MCP, WebSocket, inference helpers, TLS, token grants | Keep as protocol/relay implementation behind shared relay boundaries |
 | `openshell-supervisor-network::policy_local` | `policy.local` state and routes | Model as a local adapter with explicit limits and proposal/wait behavior |
 | `openshell-supervisor-middleware` | Middleware registry, built-ins, service contract, and chain execution | Treat as a relay hook dependency selected by `EgressDecision`, not as adapter-specific policy logic |
 | `openshell-supervisor-process::netns` | nftables bypass rules and namespace helpers | Remain owner of bypass enforcement; coordinate future capture rules with network proxy mappings |
@@ -364,6 +370,10 @@ Protocol processors operate on streams owned by the relay.
 - HTTP parsing converts bytes into request metadata, evaluates request policy,
   runs the `HTTP_REQUEST / PRE_CREDENTIALS` middleware hook when configured,
   and loops for keep-alive or pipelined requests.
+- JSON-RPC and MCP processing are HTTP L7 processors: they parse bounded
+  JSON-RPC-over-HTTP request bodies after HTTP parsing and before upstream
+  forwarding. Generic JSON-RPC policy matches methods; MCP policy can also
+  match `tools/call` tool names.
 - WebSocket parsing starts only after an allowed HTTP upgrade. It validates the
   handshake/frame stream and owns client-to-server text-frame inspection when
   credential rewrite, transport message policy, GraphQL-over-WebSocket policy,

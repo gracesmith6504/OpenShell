@@ -23,6 +23,8 @@ direction-focused.
   `fail_closed`, and body-cap behavior.
 - Add tests for REST request-body credential rewrite, WebSocket text-frame
   credential rewrite, WebSocket GraphQL policy, and compression handling.
+- Add tests for JSON-RPC method policy, batch behavior, response-frame denial,
+  and MCP method/tool policy.
 - Add tests for `policy.local` proposal wait behavior and `inference.local`
   buffered/streaming route limits.
 - Add tests for metadata loopback startup/failure behavior when provider
@@ -65,8 +67,8 @@ direction-focused.
 ## Phase 4 - HTTP, WebSocket, Middleware, And Credential Relay Consolidation
 
 - Centralize HTTP request parsing, REST policy, GraphQL policy, WebSocket
-  upgrade policy, supervisor middleware, credential resolution, redaction,
-  request rewrite, upstream dial, and response relay.
+  upgrade policy, JSON-RPC/MCP policy, supervisor middleware, credential
+  resolution, redaction, request rewrite, upstream dial, and response relay.
 - Evaluate every HTTP request before upstream write.
 - Ensure denied HTTP requests do not create upstream TCP sessions.
 - Run `HTTP_REQUEST / PRE_CREDENTIALS` middleware after request allow and
@@ -86,6 +88,9 @@ direction-focused.
   opt-in client-to-server text-frame credential rewrite, WebSocket transport
   message policy, GraphQL-over-WebSocket policy, and raw passthrough for other
   upgraded protocols.
+- Preserve JSON-RPC and MCP handling behind the shared HTTP relay, including
+  bounded body inspection, JSON-RPC batch evaluation, MCP `tools/call` tool
+  selectors, and audit-safe logging that omits params and tool arguments.
 
 ## Phase 5 - Shared TLS Termination
 
@@ -176,6 +181,8 @@ direction-focused.
 - Integration-test WebSocket text-frame credential rewrite, raw upgraded
   passthrough, WebSocket message policy, GraphQL-over-WebSocket policy, and
   safe compression negotiation.
+- Integration-test JSON-RPC method allow/deny, batch denial, response-frame
+  handling, MCP method profile behavior, and MCP tool selector enforcement.
 - Integration-test TLS termination before HTTP/TCP relay split.
 - Integration-test `protocol: tcp` byte-copy behavior.
 - Add protocol processor harness tests before adding Redis, Postgres, or

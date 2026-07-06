@@ -10,6 +10,8 @@ links:
   - https://github.com/NVIDIA/OpenShell/pull/1511
   - https://github.com/NVIDIA/OpenShell/pull/1738
   - https://github.com/NVIDIA/OpenShell/pull/2027
+  - https://github.com/NVIDIA/OpenShell/pull/1865
+  - https://github.com/NVIDIA/OpenShell/pull/1938
 ---
 
 # RFC 0005 - Sandbox Proxy Egress Adapter Model
@@ -44,10 +46,10 @@ Supporting detail lives in:
 
 The sandbox proxy supports several connection surfaces: explicit CONNECT,
 forward HTTP, local inference and policy APIs, metadata loopback, TLS
-termination, REST and GraphQL inspection, WebSocket inspection, credential
-injection, supervisor middleware, and nftables-backed bypass detection. These
-features are valuable, but changes to policy and enforcement still tend to
-touch multiple entry paths.
+termination, REST, GraphQL, JSON-RPC, MCP, and WebSocket inspection,
+credential injection, supervisor middleware, and nftables-backed bypass
+detection. These features are valuable, but changes to policy and enforcement
+still tend to touch multiple entry paths.
 
 The risk is asymmetric enforcement. A security fix can be added to CONNECT and
 missed in forward HTTP; endpoint metadata can be selected differently from the
@@ -184,7 +186,7 @@ flowchart TD
 
     FirstReq -- Yes --> ForwardMode{"decision.endpoint.enforcement"}
     ForwardMode -- "None" --> HttpCred["HTTP relay<br/>credential injection only"]
-    ForwardMode -- "Http" --> HttpL7["HTTP relay<br/>REST/GraphQL/WebSocket policy"]
+    ForwardMode -- "Http" --> HttpL7["HTTP relay<br/>REST/GraphQL/JSON-RPC/MCP/WebSocket policy"]
     ForwardMode -- "ProtocolProcessor" --> BadForward["Deny: HTTP request for native protocol endpoint"]
 
     FirstReq -- No --> TlsPolicy{"TLS handling skipped?"}
@@ -235,6 +237,9 @@ Relay rules:
 
 - HTTP credential injection happens in both HTTP modes: L4-only HTTP and
   HTTP-inspected.
+- HTTP-inspected endpoints include `rest`, `graphql`, `json-rpc`, `mcp`, and
+  `websocket`. JSON-RPC and MCP are HTTP L7 protocols, not native TCP protocol
+  processors.
 - Supervisor middleware is a typed relay hook. V1 middleware runs on parsed
   HTTP requests at `HTTP_REQUEST / PRE_CREDENTIALS`, after network and request
   policy admit the request and before OpenShell injects credentials.
@@ -250,7 +255,9 @@ Relay rules:
   introduced reserved placeholders before credential injection.
 - Static credential rewrite covers request target, query, headers, opt-in REST
   request bodies, and opt-in client-to-server WebSocket text frames.
-- HTTP L7 policy is evaluated before upstream write for each request.
+- HTTP L7 policy is evaluated before upstream write for each request. JSON-RPC
+  and MCP evaluation parse bounded JSON-RPC-over-HTTP bodies; MCP adds
+  tool-aware selectors for `tools/call`.
 - WebSocket upgrade policy is evaluated as HTTP first. After an allowed `101`
   upgrade, the WebSocket relay owns frame parsing when text-frame credential
   rewrite, WebSocket transport policy, GraphQL-over-WebSocket policy, or safe
@@ -352,8 +359,8 @@ The intended order is:
 3. Move destination validation and endpoint metadata materialization behind the
    shared decision and connector boundary.
 4. Consolidate forward HTTP, CONNECT HTTP inspection, supervisor middleware,
-   credential injection, request-body rewrite, and WebSocket handling behind
-   shared HTTP/WebSocket relay code.
+   credential injection, request-body rewrite, JSON-RPC/MCP inspection, and
+   WebSocket handling behind shared HTTP/WebSocket relay code.
 5. Move TLS detection and termination ahead of the HTTP/TCP relay split.
 6. Add the TCP relay/protocol processor boundary, then policy DNS and native
    TCP capture.
@@ -412,9 +419,9 @@ packet-enforcement substrate. Transparent TCP should extend that nftables
 model rather than creating a second firewall path.
 
 The existing L7 relay is the behavioral prior art for this RFC. It already
-proves per-request HTTP evaluation, GraphQL parsing, WebSocket frame handling,
-request-body rewrite, and token-grant injection can live behind relay
-boundaries.
+proves per-request HTTP evaluation, GraphQL parsing, JSON-RPC/MCP body
+inspection, WebSocket frame handling, request-body rewrite, and token-grant
+injection can live behind relay boundaries.
 
 RFC 0009 supervisor middleware is the extension prior art. It defines
 `HTTP_REQUEST / PRE_CREDENTIALS` as a supervisor-owned hook that can inspect,

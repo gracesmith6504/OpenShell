@@ -56,7 +56,8 @@ The networking surface currently includes:
 - Static provider credential injection and redaction.
 - Endpoint-bound dynamic token grant injection.
 - Opt-in REST request-body credential rewrite.
-- L7 REST, GraphQL, WebSocket, and GraphQL-over-WebSocket enforcement.
+- L7 REST, GraphQL, JSON-RPC, MCP, WebSocket, and
+  GraphQL-over-WebSocket enforcement.
 
 The issue is not that these features exist. The issue is that entry mechanisms,
 policy evaluation, endpoint metadata lookup, credential injection, and byte
@@ -76,7 +77,7 @@ flowchart TD
     Config -- Yes --> Tunnel
     Tunnel --> Inspect["Inspect tunneled bytes when possible"]
     Inspect --> Relay["HTTP/WebSocket/TCP relay selection"]
-    Relay --> Inject["Static credentials and token grants if configured"]
+    Relay --> Inject["Middleware, static credentials, and token grants if configured"]
     Inject --> Upstream["Open upstream when relay policy allows"]
 ```
 
@@ -93,7 +94,7 @@ flowchart TD
     L4 --> Allowed{"Allowed?"}
     Allowed -- No --> Deny["HTTP denial"]
     Allowed -- Yes --> L7{"Matching L7 endpoint?"}
-    L7 -- Yes --> Eval["Evaluate REST/GraphQL/WebSocket policy"]
+    L7 -- Yes --> Eval["Evaluate REST/GraphQL/JSON-RPC/MCP/WebSocket policy"]
     Eval --> Guard["Reject unsupported h2c upgrade when inspected"]
     Guard --> Rewrite["Rewrite to origin-form + configured credentials"]
     L7 -- No --> Rewrite
@@ -237,6 +238,8 @@ The refactor should preserve:
 - WebSocket text-frame credential rewrite.
 - REST endpoint method/path policy.
 - GraphQL-over-HTTP policy.
+- JSON-RPC-over-HTTP method policy.
+- MCP Streamable HTTP method and tool policy.
 - WebSocket transport and GraphQL-over-WebSocket policy.
 - h2c rejection on inspected HTTP routes.
 - Inference routing through `inference.local`, including embeddings.
