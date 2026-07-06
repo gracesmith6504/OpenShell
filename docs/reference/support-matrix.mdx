@@ -85,7 +85,7 @@ implementation details.
 | Stable | Minor and patch releases are backward compatible within an API major version. Breaking changes require a new versioned Protobuf package and API major version. The previous stable API remains supported for at least 12 months or two minor releases after its replacement, whichever is longer. |
 
 During the beta milestone, the beta policy applies even when a Protobuf package
-uses a `v1` suffix. Within a supported API major version, existing clients must
+uses a `v1` suffix. Within a supported API major version, existing clients
 continue to work with newer servers. New clients may require capabilities that
 are not available from older servers.
 
@@ -94,14 +94,14 @@ are not available from older servers.
 | Change | Policy |
 | --- | --- |
 | Additive | New optional fields, messages, methods, and enum values may be added when existing requests and responses retain their meaning and defaults. |
-| Deprecating | Keep the existing element functional, mark it deprecated in the schema and documentation, and identify its replacement and planned removal release. |
-| Breaking | Removing or renaming an API element, reusing or renumbering a field, changing a field type or cardinality, making an existing input required, or changing documented semantics requires the beta process or a new stable API major version. |
+| Deprecating | The existing element remains functional while the schema and documentation identify it as deprecated, name its replacement, and state its planned removal release. |
+| Breaking | Removing or renaming an API element, reusing or renumbering a field, changing a field type or cardinality, making an existing input required, or changing documented semantics follows the beta process or ships in a new stable API major version. |
 
-Removed Protobuf field and enum numbers and names must be reserved and never
-reused. API changes must pass automated source, wire, and JSON compatibility
-checks against the default branch. Release validation must exercise an older
-supported SDK against the new server and the current SDK against every server
-version still in the support window.
+Removed Protobuf field and enum numbers and names remain reserved and are never
+reused. CI compares API changes with the default branch for source, wire, and
+JSON compatibility. Release validation exercises older supported SDKs against
+the new server and the current SDKs against every server version still in the
+support window.
 
 This policy draws from the
 [Kubernetes API deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/),
