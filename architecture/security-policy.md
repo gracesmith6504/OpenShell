@@ -96,6 +96,32 @@ before the child process starts.
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.
 
+## Managed Maximum
+
+A gateway can own one optional managed maximum policy. The maximum is a ceiling,
+not an active sandbox policy: each sandbox starts with a narrower base policy,
+and the gateway proves the fully composed base and provider-derived policy before
+creation or any authority-changing update. With no maximum configured, policy
+creation, updates, providers, and proposals keep their existing unmanaged behavior.
+
+The maximum extends the normal policy YAML with an ID, version, allowed/default
+`ask` or `auto` modes, and optional `review.required` annotations. The same
+admission operation protects sandbox creation, provider attachment, direct policy
+updates, and proposal merges. The initial implementation checks filesystem paths
+plus L4 and REST network authority. Explicit denies take precedence; other
+protocols and unsupported authority fields fail closed. Providers without a
+resolvable policy profile also fail closed because their credential-bearing
+reach cannot be included in the proof. Managed maximums initially require
+single-replica SQLite storage; PostgreSQL/HA needs database-backed coordination
+before it can preserve the proof-to-commit boundary across gateway replicas.
+
+The sandbox's selected permission mode is fixed at creation. `ask` holds new
+agent-proposed authority for review. `auto` applies only the requested delta that
+fits the maximum's auto-eligible region; review-marked authority remains pending.
+Authenticated direct edits are approval of that exact edit but remain bounded.
+Every merge recomputes the candidate from live policy and provider state before
+persistence, so a stored proposal or approval is evidence rather than authority.
+
 ## Policy Advisor
 
 The policy advisor pipeline turns observed denials into draft policy
@@ -123,6 +149,11 @@ through the proposal loop instead of treating the denial as terminal.
    never `safe`. The opt-in gate preserves OpenShell's default-deny
    posture: with no setting at either scope, every proposal lands in
    `pending` for human review, even when the prover sees no findings.
+   For a sandbox governed by a managed maximum, its immutable `ask` or `auto`
+   permission mode replaces this unmanaged approval gate. Outside or unsupported
+   proposals are rejected before persistence, review-marked proposals stay
+   pending, and eligible `auto` proposals are revalidated against live state at
+   merge time.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This

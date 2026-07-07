@@ -87,6 +87,22 @@ Only `manual` and `auto` are accepted; typos like `autom` are rejected at config
 
 **Audit trail.** Every auto-approval emits a `CONFIG:APPROVED` event with `auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and `resolved_from=<gateway|sandbox|default>` so operators can reconstruct why a given approval ran without human review.
 
+### Managed Permission Modes
+
+When the gateway has a [managed maximum policy](/sandboxes/policies#managed-maximum-policies),
+`--permission-mode ask|auto` selects the sandbox's immutable managed mode. Omit the flag to use the
+maximum's default. This mode replaces `proposal_approval_mode` for that sandbox:
+
+- `ask` keeps every in-boundary authority expansion pending.
+- `auto` immediately applies only expansions inside the maximum's auto-eligible region.
+- Authority marked `review.required` stays pending in either mode.
+- Outside, explicitly denied, or unsupported proposals are returned in `rejection_reasons` and do
+  not enter the draft queue.
+
+OpenShell reruns containment against the live sandbox policy and provider state immediately before
+an auto or human-approved proposal is merged. The stored proposal and earlier decision explain what
+happened; they do not authorize a stale candidate.
+
 ## How It Works
 
 When policy advisor is enabled, the sandbox supervisor turns on three agent-facing surfaces:
@@ -102,7 +118,7 @@ The loop has seven steps:
 2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
-5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
+5. The gateway runs admission against the proposed delta. Unmanaged sandboxes store accepted proposals as draft chunks and use the security-finding prover below. Managed sandboxes first reject proposals outside their configured maximum.
 6. Under `auto` mode, proposals with an empty prover delta are approved immediately and skipped past human review. Under `manual` mode (the default), every proposal — and under `auto` mode, every proposal with a prover finding — lands in the draft inbox for a developer to approve or reject.
 7. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
 
