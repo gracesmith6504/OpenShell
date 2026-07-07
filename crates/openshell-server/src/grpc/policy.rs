@@ -87,11 +87,17 @@ const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 /// Reserved settings key used to store global policy payload.
-const POLICY_SETTING_KEY: &str = "policy";
+pub(super) const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+#[derive(Clone, Copy)]
+struct ManagedMergeAdmission<'a> {
+    state: &'a ServerState,
+    source: crate::managed_policy::AdmissionSource,
+}
 
 fn emit_sandbox_policy_update_success() {
     openshell_core::telemetry::emit_lifecycle(
@@ -910,7 +916,13 @@ async fn auto_approve_chunk(
         return Ok(());
     }
 
-    let (version, hash) = merge_chunk_into_policy(state.store.as_ref(), sandbox_id, &chunk).await?;
+    let (version, hash) = merge_chunk_into_policy_managed(
+        state,
+        sandbox_id,
+        &chunk,
+        crate::managed_policy::AdmissionSource::AgentProposal,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -962,21 +974,7 @@ async fn current_effective_policy_for_sandbox(
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    let mut policy = if let Some(record) = state
-        .store
-        .get_latest_policy(sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
-    {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
-    } else {
-        sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.policy.clone())
-            .unwrap_or_default()
-    };
+    let mut policy = current_base_policy_for_sandbox(state, sandbox, sandbox_id).await?;
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
@@ -1003,6 +1001,28 @@ async fn current_effective_policy_for_sandbox(
     }
 
     Ok(policy)
+}
+
+async fn current_base_policy_for_sandbox(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    if let Some(record) = state
+        .store
+        .get_latest_policy(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+    {
+        let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
+        return Ok(policy);
+    }
+    Ok(sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.clone())
+        .unwrap_or_default())
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1319,9 +1339,24 @@ async fn hash_provider_profile_revision(
     Ok(())
 }
 
-async fn profile_provider_policy_layers(
+pub(super) async fn profile_provider_policy_layers(
     store: &Store,
     provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    provider_policy_layers(store, provider_names, false).await
+}
+
+pub(super) async fn managed_profile_provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    provider_policy_layers(store, provider_names, true).await
+}
+
+async fn provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+    require_resolvable_profile: bool,
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
 
@@ -1335,6 +1370,9 @@ async fn profile_provider_policy_layers(
         let provider_type = provider.r#type.trim();
         let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
             let Some(profile) = get_default_profile(canonical_type) else {
+                if require_resolvable_profile {
+                    return Err(unmodeled_managed_provider(name, provider_type));
+                }
                 warn!(
                     provider_name = %name,
                     provider_type,
@@ -1347,6 +1385,9 @@ async fn profile_provider_policy_layers(
             let Some(profile) =
                 super::provider::get_provider_type_profile(store, provider_type).await?
             else {
+                if require_resolvable_profile {
+                    return Err(unmodeled_managed_provider(name, provider_type));
+                }
                 warn!(
                     provider_name = %name,
                     provider_type,
@@ -1365,6 +1406,12 @@ async fn profile_provider_policy_layers(
     }
 
     Ok(layers)
+}
+
+fn unmodeled_managed_provider(provider_name: &str, provider_type: &str) -> Status {
+    Status::failed_precondition(format!(
+        "provider '{provider_name}' type '{provider_type}' has no resolvable policy profile; managed maximum admission cannot prove its credential-bearing reach"
+    ))
 }
 
 fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
@@ -1491,6 +1538,16 @@ async fn handle_update_config_inner(
 
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
+
+        if has_policy
+            && super::managed_policy::load_managed_policy_config(state)
+                .await?
+                .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "global policy override cannot coexist with a managed maximum policy",
+            ));
+        }
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -1753,6 +1810,10 @@ async fn handle_update_config_inner(
             &sandbox_id,
             spec.policy.as_ref(),
             &merge_ops,
+            Some(ManagedMergeAdmission {
+                state,
+                source: crate::managed_policy::AdmissionSource::DirectAuthenticated,
+            }),
         )
         .await?;
 
@@ -1809,6 +1870,39 @@ async fn handle_update_config_inner(
             "policy is managed globally; delete global policy before sandbox policy update",
         ));
     }
+    let requested_policy_backfill = sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.policy.is_none());
+
+    // Provider attachment changes the composed authority evaluated below.
+    // Hold the shared guard through proof and persistence so the candidate
+    // cannot change between those steps.
+    let _sandbox_sync_guard = if super::managed_policy::load_managed_policy_config(state)
+        .await?
+        .is_some()
+    {
+        Some(state.compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if requested_policy_backfill && req.expected_resource_version != 0 {
+        let current_resource_version = sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        if current_resource_version != req.expected_resource_version {
+            return Err(Status::aborted(format!(
+                "backfill spec.policy was modified concurrently (current resource_version: {current_resource_version})"
+            )));
+        }
+    }
 
     let spec = sandbox
         .spec
@@ -1830,9 +1924,44 @@ async fn handle_update_config_inner(
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
+    }
+
+    let latest = state
+        .store
+        .get_latest_policy(&sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+    let current_policy = if let Some(record) = latest.as_ref() {
+        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
     } else {
-        // Backfill spec.policy using CAS (first-time policy discovery)
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        spec.policy.clone().unwrap_or_default()
+    };
+    let source = if sandbox_caller {
+        crate::managed_policy::AdmissionSource::AgentProposal
+    } else {
+        crate::managed_policy::AdmissionSource::DirectAuthenticated
+    };
+    let decision = super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: super::managed_policy::permission_mode_for_sandbox(&sandbox)?,
+            source,
+            sandbox_id: &sandbox_id,
+            sandbox_name: sandbox.object_name(),
+            current: Some((&current_policy, &spec.providers)),
+            candidate: (&new_policy, &spec.providers),
+            requested_delta: (&new_policy, &spec.providers),
+        },
+    )
+    .await?;
+    super::managed_policy::require_applied(decision)?;
+
+    if spec.policy.is_none() {
+        // First-time policy discovery is an authority commit point too. Do
+        // not persist the backfill until managed admission has accepted the
+        // fully composed candidate.
         let sandbox_id = sandbox.object_id().to_string();
         let new_policy_clone = new_policy.clone();
         state
@@ -1855,12 +1984,6 @@ async fn handle_update_config_inner(
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
         );
     }
-
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
@@ -2235,6 +2358,7 @@ pub(super) async fn handle_submit_policy_analysis(
     // case for the common single-chunk submission shape. If real workloads
     // surface a problem with batches that interact across chunks, the right
     // fix is to recompute baseline after each successful auto-approve.
+    let current_base_policy = current_base_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
     let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
 
     // Auto-approval is an opt-in behavior, sourced from the settings model
@@ -2296,6 +2420,54 @@ pub(super) async fn handle_submit_policy_analysis(
             continue;
         }
 
+        let proposal_operations = [PolicyMergeOp::AddRule {
+            rule_name: chunk.rule_name.clone(),
+            rule: chunk.proposed_rule.clone().expect("checked above"),
+        }];
+        let candidate = match merge_policy(current_base_policy.clone(), &proposal_operations) {
+            Ok(merged) => merged.policy,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!("chunk '{}': {error}", chunk.rule_name));
+                continue;
+            }
+        };
+        let (managed_auto_approve, managed_validation) = match decide_managed_merge(
+            state,
+            &sandbox,
+            &current_base_policy,
+            &candidate,
+            &proposal_operations,
+            crate::managed_policy::AdmissionSource::AgentProposal,
+        )
+        .await?
+        {
+            crate::managed_policy::AdmissionDecision::Unmanaged => (None, None),
+            crate::managed_policy::AdmissionDecision::Apply => (
+                Some(true),
+                Some("managed: apply: requested authority is auto-eligible".to_owned()),
+            ),
+            decision @ crate::managed_policy::AdmissionDecision::Ask { .. } => {
+                let status = super::managed_policy::require_applied(decision)
+                    .expect_err("managed ask must produce an approval-required status");
+                (
+                    Some(false),
+                    Some(format!("managed: ask: {}", status.message())),
+                )
+            }
+            decision @ crate::managed_policy::AdmissionDecision::Reject { .. } => {
+                rejected += 1;
+                let status = super::managed_policy::require_applied(decision)
+                    .expect_err("managed reject must produce an error");
+                rejection_reasons.push(format!(
+                    "chunk '{}': {}",
+                    chunk.rule_name,
+                    status.message()
+                ));
+                continue;
+            }
+        };
+
         let now_ms = current_time_ms();
         let proposed_rule_bytes = chunk
             .proposed_rule
@@ -2322,6 +2494,10 @@ pub(super) async fn handle_submit_policy_analysis(
             &chunk.rule_name,
             chunk.proposed_rule.as_ref().expect("checked above"),
             &credential_set,
+        );
+        let validation_result = managed_validation.map_or_else(
+            || validation_result.clone(),
+            |managed| format!("{managed}; security review: {validation_result}"),
         );
 
         let record = DraftChunkRecord {
@@ -2417,15 +2593,21 @@ pub(super) async fn handle_submit_policy_analysis(
         // literal here is the canonical empty-delta verdict; any other
         // string means findings or infrastructure error, both of which
         // require human attention.
-        if auto_approve_enabled
-            && validation_result == "prover: no new findings"
+        let should_auto_approve = managed_auto_approve
+            .unwrap_or(auto_approve_enabled && validation_result == "prover: no new findings");
+        let approval_source = if managed_auto_approve.is_some() {
+            "managed-maximum"
+        } else {
+            resolved_from
+        };
+        if should_auto_approve
             && let Err(err) = auto_approve_chunk(
                 state,
                 &sandbox_id,
                 sandbox.object_name(),
                 &effective_id,
                 &req.analysis_mode,
-                resolved_from,
+                approval_source,
             )
             .await
         {
@@ -2576,8 +2758,13 @@ async fn handle_approve_draft_chunk_inner(
         "ApproveDraftChunk: merging rule into active policy"
     );
 
-    let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
+    let (version, hash) = merge_chunk_into_policy_managed(
+        state,
+        &sandbox_id,
+        &chunk,
+        crate::managed_policy::AdmissionSource::DirectAuthenticated,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -2788,8 +2975,13 @@ async fn handle_approve_all_draft_chunks_inner(
             "ApproveAllDraftChunks: merging chunk"
         );
 
-        let (version, hash) =
-            merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, chunk).await?;
+        let (version, hash) = merge_chunk_into_policy_managed(
+            state,
+            &sandbox_id,
+            chunk,
+            crate::managed_policy::AdmissionSource::DirectAuthenticated,
+        )
+        .await?;
         last_version = version;
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
@@ -3502,12 +3694,72 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     }
 }
 
+fn requested_delta_for_operations(
+    operations: &[PolicyMergeOp],
+    candidate: &ProtoSandboxPolicy,
+) -> ProtoSandboxPolicy {
+    merge_policy(ProtoSandboxPolicy::default(), operations)
+        .map_or_else(|_| candidate.clone(), |merged| merged.policy)
+}
+
+async fn decide_managed_merge(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    current_policy: &ProtoSandboxPolicy,
+    candidate: &ProtoSandboxPolicy,
+    operations: &[PolicyMergeOp],
+    source: crate::managed_policy::AdmissionSource,
+) -> Result<crate::managed_policy::AdmissionDecision, Status> {
+    let providers = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+    let requested_delta = if source == crate::managed_policy::AdmissionSource::AgentProposal {
+        requested_delta_for_operations(operations, candidate)
+    } else {
+        candidate.clone()
+    };
+    super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: super::managed_policy::permission_mode_for_sandbox(sandbox)?,
+            source,
+            sandbox_id: sandbox.object_id(),
+            sandbox_name: sandbox.object_name(),
+            current: Some((current_policy, providers)),
+            candidate: (candidate, providers),
+            requested_delta: (&requested_delta, providers),
+        },
+    )
+    .await
+}
+
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
+    managed_admission: Option<ManagedMergeAdmission<'_>>,
 ) -> Result<(i64, String), Status> {
+    let managed_admission = match managed_admission {
+        Some(admission)
+            if super::managed_policy::load_managed_policy_config(admission.state)
+                .await?
+                .is_some() =>
+        {
+            Some(admission)
+        }
+        _ => None,
+    };
+    // Provider attachment and policy persistence both change effective
+    // authority. Serialize them so the candidate proven below is the one
+    // that is committed.
+    let _sandbox_sync_guard = match managed_admission {
+        Some(admission) => Some(admission.state.compute.sandbox_sync_guard().await),
+        None => None,
+    };
+
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
@@ -3521,7 +3773,8 @@ async fn apply_merge_operations_with_retry(
             baseline_policy.cloned().unwrap_or_default()
         };
 
-        let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
+        let merged =
+            merge_policy(current_policy.clone(), operations).map_err(map_policy_merge_error)?;
         let new_policy = merged.policy;
         let hash = deterministic_policy_hash(&new_policy);
 
@@ -3529,6 +3782,26 @@ async fn apply_merge_operations_with_retry(
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
         validate_policy_safety(&new_policy)?;
+
+        if let Some(admission) = managed_admission {
+            let sandbox = admission
+                .state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let decision = decide_managed_merge(
+                admission.state,
+                &sandbox,
+                &current_policy,
+                &new_policy,
+                operations,
+                admission.source,
+            )
+            .await?;
+            super::managed_policy::require_applied(decision)?;
+        }
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
@@ -3589,7 +3862,31 @@ async fn apply_merge_operations_with_retry(
     )))
 }
 
-pub(super) async fn merge_chunk_into_policy(
+pub(super) async fn merge_chunk_into_policy_managed(
+    state: &ServerState,
+    sandbox_id: &str,
+    chunk: &DraftChunkRecord,
+    source: crate::managed_policy::AdmissionSource,
+) -> Result<(i64, String), Status> {
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+    let operations = [PolicyMergeOp::AddRule {
+        rule_name: chunk.rule_name.clone(),
+        rule,
+    }];
+    validate_merge_operations_for_server(&operations)?;
+    apply_merge_operations_with_retry(
+        state.store.as_ref(),
+        sandbox_id,
+        None,
+        &operations,
+        Some(ManagedMergeAdmission { state, source }),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn merge_chunk_into_policy(
     store: &Store,
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
@@ -3601,7 +3898,7 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
-    apply_merge_operations_with_retry(store, sandbox_id, None, &operations).await
+    apply_merge_operations_with_retry(store, sandbox_id, None, &operations, None).await
 }
 
 async fn remove_chunk_from_policy(
@@ -3617,6 +3914,10 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
+        Some(ManagedMergeAdmission {
+            state,
+            source: crate::managed_policy::AdmissionSource::DirectAuthenticated,
+        }),
     )
     .await
 }
@@ -3930,6 +4231,176 @@ mod tests {
                 },
             }));
         request
+    }
+
+    async fn configure_test_managed_maximum(state: &Arc<ServerState>) {
+        crate::grpc::managed_policy::handle_set_managed_maximum_policy(
+            state,
+            Request::new(openshell_core::proto::SetManagedMaximumPolicyRequest {
+                policy_yaml: br#"version: 1
+metadata:
+  policy_id: proposal-test
+  version: 1
+  allowed_modes: [ask, auto]
+  default_mode: auto
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /repos/** }
+          - allow:
+              method: POST
+              path: /repos/**
+              review: { required: true, reason: write }
+        deny_rules:
+          - { method: DELETE, path: "**" }
+    binaries:
+      - path: /usr/bin/gh
+"#
+                .to_vec(),
+            }),
+        )
+        .await
+        .expect("managed maximum should configure");
+    }
+
+    async fn put_managed_test_sandbox(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) {
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.to_owned(),
+                    name: sandbox_name.to_owned(),
+                    labels: HashMap::from([(
+                        crate::grpc::managed_policy::MANAGED_PERMISSION_MODE_LABEL.to_owned(),
+                        "auto".to_owned(),
+                    )]),
+                    ..Default::default()
+                }),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .expect("sandbox should persist");
+    }
+
+    fn managed_rest_chunk(method: &str) -> PolicyChunk {
+        PolicyChunk {
+            rule_name: format!("github_{}", method.to_ascii_lowercase()),
+            proposed_rule: Some(NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_owned(),
+                    port: 443,
+                    protocol: "rest".to_owned(),
+                    enforcement: "enforce".to_owned(),
+                    rules: vec![L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: method.to_owned(),
+                            path: "/repos/acme/project".to_owned(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/gh".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            rationale: "managed proposal test".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_auto_proposals_apply_read_ask_for_reviewed_write_and_reject_delete() {
+        let state = test_server_state().await;
+        configure_test_managed_maximum(&state).await;
+        put_managed_test_sandbox(&state, "managed-auto-id", "managed-auto").await;
+
+        let read = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("GET")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("read proposal should succeed")
+        .into_inner();
+        assert_eq!(read.accepted_chunks, 1);
+        assert_eq!(read.rejected_chunks, 0);
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: "managed-auto".to_owned(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks[0].status, "approved");
+
+        let write = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("POST")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("reviewed write should enter the queue")
+        .into_inner();
+        assert_eq!(write.accepted_chunks, 1);
+        let write_id = &write.accepted_chunk_ids[0];
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: "managed-auto".to_owned(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let reviewed_write = draft
+            .chunks
+            .iter()
+            .find(|chunk| &chunk.id == write_id)
+            .unwrap();
+        assert_eq!(reviewed_write.status, "pending");
+        assert!(reviewed_write.validation_result.contains("managed: ask"));
+
+        let denied = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("DELETE")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("denied proposal should return a structured rejection")
+        .into_inner();
+        assert_eq!(denied.accepted_chunks, 0);
+        assert_eq!(denied.rejected_chunks, 1);
+        assert!(denied.rejection_reasons[0].contains("managed maximum proposal-test@1"));
     }
 
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
@@ -4453,6 +4924,24 @@ mod tests {
             .unwrap();
 
         assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_provider_policy_layers_reject_unknown_provider_types() {
+        let store = test_store().await;
+        store
+            .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+
+        let error =
+            managed_profile_provider_policy_layers(&store, &["custom-provider".to_string()])
+                .await
+                .expect_err("managed composition must reject unmodeled provider authority");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("no resolvable policy profile"));
+        assert!(!error.message().contains("ghp-test"));
     }
 
     #[tokio::test]
@@ -8740,8 +9229,8 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow),
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow, None),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny, None),
         );
 
         let mut versions = vec![left.unwrap().0, right.unwrap().0];

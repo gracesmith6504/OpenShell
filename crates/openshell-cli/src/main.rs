@@ -1289,6 +1289,13 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
+        /// Managed permission mode for this sandbox.
+        ///
+        /// When a managed maximum is configured, omit this flag to use the
+        /// gateway default or choose `ask` or `auto` explicitly.
+        #[arg(long, value_parser = ["ask", "auto"])]
+        permission_mode: Option<String>,
+
         /// Forward a local port to the sandbox before the initial command or shell starts.
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
@@ -1606,6 +1613,10 @@ enum DraftCommands {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
+    /// Manage the gateway-owned maximum authority boundary.
+    #[command(subcommand)]
+    Maximum(MaximumPolicyCommands),
+
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
@@ -1760,6 +1771,37 @@ enum PolicyCommands {
         /// One-line-per-finding output (for demos and CI).
         #[arg(long)]
         compact: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MaximumPolicyCommands {
+    /// Set or replace the managed maximum policy.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Set {
+        /// Path to the managed maximum policy YAML file.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Show the configured managed maximum policy.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Include the complete YAML policy document.
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// Delete the managed maximum policy.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2317,6 +2359,17 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
             match policy_cmd {
+                PolicyCommands::Maximum(command) => match command {
+                    MaximumPolicyCommands::Set { policy, yes } => {
+                        run::managed_maximum_set(&ctx.endpoint, &policy, yes, &tls).await?;
+                    }
+                    MaximumPolicyCommands::Get { full } => {
+                        run::managed_maximum_get(&ctx.endpoint, full, &tls).await?;
+                    }
+                    MaximumPolicyCommands::Delete { yes } => {
+                        run::managed_maximum_delete(&ctx.endpoint, yes, &tls).await?;
+                    }
+                },
                 PolicyCommands::Set {
                     name,
                     policy,
@@ -2610,6 +2663,7 @@ async fn main() -> Result<()> {
                     driver_config_json,
                     providers,
                     policy,
+                    permission_mode,
                     forward,
                     tty,
                     no_tty,
@@ -2697,6 +2751,7 @@ async fn main() -> Result<()> {
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
+                            permission_mode: permission_mode.as_deref(),
                             forward,
                             command: &command,
                             tty_override,
@@ -4538,6 +4593,47 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_permission_mode_is_optional_and_accepts_managed_modes() {
+        let default = Cli::try_parse_from(["openshell", "sandbox", "create"])
+            .expect("sandbox create should parse");
+        assert!(matches!(
+            default.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create {
+                    permission_mode: None,
+                    ..
+                }),
+            })
+        ));
+
+        for mode in ["ask", "auto"] {
+            let cli =
+                Cli::try_parse_from(["openshell", "sandbox", "create", "--permission-mode", mode])
+                    .expect("managed permission mode should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Sandbox {
+                    command: Some(SandboxCommands::Create {
+                        permission_mode: Some(ref parsed),
+                        ..
+                    }),
+                }) if parsed == mode
+            ));
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "openshell",
+                "sandbox",
+                "create",
+                "--permission-mode",
+                "manual",
+            ])
+            .is_err()
+        );
     }
 
     /// `--approval-mode <bogus>` is rejected by clap's value parser, so the

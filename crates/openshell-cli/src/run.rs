@@ -36,24 +36,25 @@ use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
-    DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
-    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
-    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
-    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
-    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
-    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
-    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    CreateSandboxRequest, CreateSshSessionRequest, DeleteManagedMaximumPolicyRequest,
+    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
+    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
+    ExposeServiceRequest, GetClusterInferenceRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetManagedMaximumPolicyRequest,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, HealthRequest,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetClusterInferenceRequest, SetManagedMaximumPolicyRequest, SettingScope, SettingValue,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -502,15 +503,22 @@ fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
 }
 
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
-    let lines = [
+    let mut lines = vec![
         String::new(),
         format!(
             "{} {}",
             "Created sandbox:".cyan().bold(),
             sandbox.object_name().bold()
         ),
-        String::new(),
     ];
+    if let Some(mode) = sandbox.metadata.as_ref().and_then(|metadata| {
+        metadata
+            .labels
+            .get(openshell_core::driver_utils::LABEL_PERMISSION_MODE)
+    }) {
+        lines.push(format!("{} {mode} (managed)", "Permission mode:".dimmed()));
+    }
+    lines.push(String::new());
     match display {
         Some(d) => {
             for line in lines {
@@ -1782,6 +1790,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub permission_mode: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
@@ -1805,6 +1814,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            permission_mode: None,
             forward: None,
             command: &[],
             tty_override: None,
@@ -1835,6 +1845,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        permission_mode,
         forward,
         command,
         tty_override,
@@ -1928,6 +1939,7 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
+        permission_mode: permission_mode.unwrap_or_default().to_string(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -6597,6 +6609,112 @@ pub async fn gateway_setting_delete(
         println!("{} Global setting {} not found", "!".yellow(), key);
     }
     Ok(())
+}
+
+pub async fn managed_maximum_set(
+    server: &str,
+    policy_path: &str,
+    yes: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    confirm_managed_maximum_change("set", yes)?;
+    let policy_yaml = std::fs::read(policy_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read managed maximum policy '{policy_path}'"))?;
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .set_managed_maximum_policy(SetManagedMaximumPolicyRequest { policy_yaml })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    println!(
+        "{} Set managed maximum {}@{} (hash {}, revision {})",
+        "✓".green().bold(),
+        response.policy_id,
+        response.version,
+        short_hash(&response.policy_hash),
+        response.settings_revision
+    );
+    println!(
+        "  modes: {} (default: {})",
+        response.allowed_modes.join(", "),
+        response.default_mode
+    );
+    Ok(())
+}
+
+pub async fn managed_maximum_get(server: &str, full: bool, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_managed_maximum_policy(GetManagedMaximumPolicyRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if !response.configured {
+        println!("No managed maximum policy configured");
+        return Ok(());
+    }
+    println!("Policy:       {}@{}", response.policy_id, response.version);
+    println!("Hash:         {}", response.policy_hash);
+    println!("Modes:        {}", response.allowed_modes.join(", "));
+    println!("Default mode: {}", response.default_mode);
+    if !response.audit_label.is_empty() {
+        println!("Audit label:  {}", response.audit_label);
+    }
+    println!("Config rev:   {}", response.settings_revision);
+    if full {
+        println!("---");
+        let yaml = std::str::from_utf8(&response.policy_yaml)
+            .map_err(|_| miette!("gateway returned non-UTF-8 managed maximum policy"))?;
+        print!("{yaml}");
+        if !yaml.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+pub async fn managed_maximum_delete(server: &str, yes: bool, tls: &TlsOptions) -> Result<()> {
+    confirm_managed_maximum_change("delete", yes)?;
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_managed_maximum_policy(DeleteManagedMaximumPolicyRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if response.deleted {
+        println!(
+            "{} Deleted managed maximum policy (revision {})",
+            "✓".green().bold(),
+            response.settings_revision
+        );
+    } else {
+        println!("{} Managed maximum policy not found", "!".yellow());
+    }
+    Ok(())
+}
+
+fn confirm_managed_maximum_change(action: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(miette!(
+            "refusing to {action} managed maximum policy without confirmation; pass --yes"
+        ));
+    }
+    let proceed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "{action} the gateway managed maximum policy? Existing sandboxes must not be present"
+        ))
+        .default(false)
+        .interact()
+        .into_diagnostic()?;
+    if proceed {
+        Ok(())
+    } else {
+        Err(miette!("managed maximum policy change cancelled"))
+    }
 }
 
 pub async fn sandbox_setting_delete(
