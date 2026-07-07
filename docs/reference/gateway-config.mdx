@@ -43,21 +43,22 @@ The command prints one machine-readable value: `kubernetes`, `podman`,
 opt-in VM driver. The command only inspects the current environment; it does
 not read or update the gateway configuration.
 
-Use `openshell-gateway config set` for typed updates to driver selection and
-the listener address:
+Use `openshell-gateway config set` with one or more dotted `KEY=VALUE`
+assignments. The command applies every assignment atomically:
 
 ```shell
 openshell-gateway config set \
-  --compute-driver podman \
-  --bind-address 0.0.0.0:17670
+  'openshell.gateway.compute_drivers=["podman"]' \
+  openshell.gateway.bind_address=0.0.0.0:17670
 ```
 
 The command updates `$XDG_CONFIG_HOME/openshell/gateway.toml`, creating the
 file and parent directory when needed. Pass `--config <PATH>` or set
 `OPENSHELL_GATEWAY_CONFIG` to update another file. The command validates the
 result, replaces the file atomically, and preserves comments and unrelated
-settings. Use `--compute-driver auto` to remove only the `compute_drivers`
-setting.
+settings. TOML booleans, integers, arrays, and quoted strings retain their
+types. Other unquoted values are stored as strings. Set
+`openshell.gateway.compute_drivers=[]` to restore automatic driver selection.
 
 Restart the gateway service after updating a running installation. Gateway
 process flags and `OPENSHELL_*` runtime overrides still take precedence over

@@ -691,7 +691,7 @@ report_detected_compute_driver() {
   case "$_detected_driver" in
     podman)
       warn "Podman was auto-detected. If you use rootless Podman, configure the gateway to listen on the host bridge:"
-      info "openshell-gateway config set --bind-address 0.0.0.0:${LOCAL_GATEWAY_PORT}"
+      info "openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:${LOCAL_GATEWAY_PORT}"
       info "Restart the gateway service for changes to take effect."
       ;;
     kubernetes | docker | none)

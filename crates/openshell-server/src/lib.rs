@@ -845,7 +845,7 @@ fn configured_compute_driver(
                 return Err(Error::config(
                     "no compute driver configured and auto-detection found no suitable driver; \
                     install and start Docker or Podman, or install the VM driver and select it \
-                    with `openshell-gateway config set --compute-driver vm`",
+                    with `openshell-gateway config set 'openshell.gateway.compute_drivers=[\"vm\"]'`",
                 ));
             };
 
@@ -900,13 +900,13 @@ fn auto_detection_guidance(
     let mut guidance = Vec::new();
     if detected_count > 1 {
         guidance.push(
-            "Multiple compute drivers are available. Auto-detection is evaluated at every gateway start; pin the intended driver with `openshell-gateway config set --compute-driver <driver>`, then restart the gateway service"
+            "Multiple compute drivers are available. Auto-detection is evaluated at every gateway start; pin the intended driver with `openshell-gateway config set 'openshell.gateway.compute_drivers=[\"<driver>\"]'`, then restart the gateway service"
                 .to_string(),
         );
     }
     if selected == ComputeDriverKind::Podman && config.bind_address.ip().is_loopback() {
         guidance.push(format!(
-            "Podman was auto-selected while the gateway is bound to loopback. If you use rootless Podman, run `openshell-gateway config set --bind-address 0.0.0.0:{}`, then restart the gateway service",
+            "Podman was auto-selected while the gateway is bound to loopback. If you use rootless Podman, run `openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:{}`, then restart the gateway service",
             config.bind_address.port()
         ));
     }
@@ -1317,7 +1317,9 @@ mod tests {
         let guidance = auto_detection_guidance(&config, ComputeDriverKind::Docker, 2).join("\n");
 
         assert!(guidance.contains("Auto-detection is evaluated at every gateway start"));
-        assert!(guidance.contains("openshell-gateway config set --compute-driver <driver>"));
+        assert!(guidance.contains(
+            "openshell-gateway config set 'openshell.gateway.compute_drivers=[\"<driver>\"]'"
+        ));
         assert!(guidance.contains("restart the gateway service"));
     }
 
@@ -1327,7 +1329,11 @@ mod tests {
 
         let guidance = auto_detection_guidance(&config, ComputeDriverKind::Podman, 1).join("\n");
 
-        assert!(guidance.contains("openshell-gateway config set --bind-address 0.0.0.0:17670"));
+        assert!(
+            guidance.contains(
+                "openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:17670"
+            )
+        );
         assert!(guidance.contains("If you use rootless Podman"));
     }
 

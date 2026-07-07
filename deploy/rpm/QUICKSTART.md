@@ -60,7 +60,7 @@ Make the gateway reachable from rootless Podman containers before creating a
 sandbox:
 
 ```shell
-openshell-gateway config set --bind-address 0.0.0.0:17670
+openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:17670
 ```
 
 ### Network access

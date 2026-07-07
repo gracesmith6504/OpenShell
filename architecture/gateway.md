@@ -471,11 +471,12 @@ Driver implementation settings live in the TOML driver tables. See
 
 `openshell-gateway config detect-driver` exposes the gateway's automatic driver
 detection as a side-effect-free, machine-readable command.
-`openshell-gateway config set` provides typed, comment-preserving updates for
-operator-managed settings. It resolves the same explicit or XDG config path as
-gateway startup, validates the complete document, and replaces it atomically.
-Service environment overrides remain an operator escape hatch because they
-take precedence over later TOML edits.
+`openshell-gateway config set` accepts repeatable dotted `KEY=VALUE`
+assignments for typed, comment-preserving updates to operator-managed settings.
+It resolves the same explicit or XDG config path as gateway startup, validates
+the complete document, and replaces it atomically. Service environment
+overrides remain an operator escape hatch because they take precedence over
+later TOML edits.
 
 When selection remains automatic, the gateway probes available runtimes at
 every process start. Runtime-specific recovery guidance belongs to gateway and

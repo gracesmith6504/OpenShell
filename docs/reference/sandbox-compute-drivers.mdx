@@ -31,7 +31,7 @@ For Linux package-managed gateways, persist the selection without editing TOML
 directly:
 
 ```shell
-openshell-gateway config set --compute-driver docker
+openshell-gateway config set 'openshell.gateway.compute_drivers=["docker"]'
 systemctl --user restart openshell-gateway
 ```
 

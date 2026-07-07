@@ -5,13 +5,13 @@
 
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{Args, Subcommand};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tempfile::NamedTempFile;
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::{config_file, defaults};
 
@@ -25,25 +25,52 @@ pub struct ConfigArgs {
 enum ConfigCommand {
     /// Detect the compute driver available in the current environment.
     DetectDriver,
-    /// Update selected fields in the gateway TOML configuration.
+    /// Update fields in the gateway TOML configuration.
     Set(SetArgs),
 }
 
 #[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("setting")
-        .required(true)
-        .multiple(true)
-        .args(["compute_driver", "gateway_bind_address"])
-))]
 struct SetArgs {
-    /// Select one compute driver, or use `auto` to remove an existing pin.
-    #[arg(long, value_name = "DRIVER")]
-    compute_driver: Option<String>,
+    /// Dotted TOML key and value to set. May be repeated.
+    #[arg(required = true, value_name = "KEY=VALUE")]
+    assignments: Vec<Assignment>,
+}
 
-    /// Set the gateway listener socket address.
-    #[arg(long = "bind-address", value_name = "IP:PORT")]
-    gateway_bind_address: Option<SocketAddr>,
+#[derive(Clone, Debug)]
+struct Assignment {
+    key: Vec<String>,
+    value: Item,
+}
+
+impl FromStr for Assignment {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        let (raw_key, raw_value) = input.split_once('=').ok_or_else(|| {
+            format!("invalid assignment '{input}': expected a dotted KEY=VALUE argument")
+        })?;
+
+        let key = raw_key
+            .split('.')
+            .map(|component| {
+                if component.is_empty()
+                    || !component
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+                {
+                    return Err(format!(
+                        "invalid config key '{raw_key}': use dot-separated TOML bare keys"
+                    ));
+                }
+                Ok(component.to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            key,
+            value: parse_assignment_value(raw_value.trim()),
+        })
+    }
 }
 
 pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
@@ -92,26 +119,36 @@ fn set(path: &Path, settings: &SetArgs) -> Result<()> {
     if !openshell.contains_key("version") {
         openshell.insert("version", value(i64::from(config_file::SCHEMA_VERSION)));
     }
-    let gateway = ensure_table(openshell, "gateway")?;
 
-    if let Some(driver) = settings.compute_driver.as_deref() {
-        if driver.eq_ignore_ascii_case("auto") {
-            gateway.remove("compute_drivers");
-        } else {
-            let driver = openshell_core::config::normalize_compute_driver_name(driver)
-                .map_err(|err| miette::miette!("{err}"))?;
-            let mut drivers = Array::new();
-            drivers.push(driver);
-            gateway.insert("compute_drivers", value(drivers));
-        }
-    }
-    if let Some(bind_address) = settings.gateway_bind_address {
-        gateway.insert("bind_address", value(bind_address.to_string()));
+    for assignment in &settings.assignments {
+        apply_assignment(&mut document, assignment)?;
     }
 
     let rendered = document.to_string();
     config_file::parse(&rendered, path).map_err(|err| miette::miette!("{err}"))?;
     write_atomically(path, rendered.as_bytes())
+}
+
+fn parse_assignment_value(raw: &str) -> Item {
+    let source = format!("value = {raw}");
+    source
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|mut document| document.as_table_mut().remove("value"))
+        .unwrap_or_else(|| value(raw))
+}
+
+fn apply_assignment(document: &mut DocumentMut, assignment: &Assignment) -> Result<()> {
+    let (key, parents) = assignment
+        .key
+        .split_last()
+        .ok_or_else(|| miette::miette!("config assignment key must not be empty"))?;
+    let mut table = document.as_table_mut();
+    for parent in parents {
+        table = ensure_table(table, parent)?;
+    }
+    table.insert(key, assignment.value.clone());
+    Ok(())
 }
 
 fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table> {
@@ -170,10 +207,12 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn settings(driver: Option<&str>, bind_address: Option<&str>) -> SetArgs {
+    fn settings(assignments: &[&str]) -> SetArgs {
         SetArgs {
-            compute_driver: driver.map(str::to_string),
-            gateway_bind_address: bind_address.map(|value| value.parse().unwrap()),
+            assignments: assignments
+                .iter()
+                .map(|assignment| assignment.parse().unwrap())
+                .collect(),
         }
     }
 
@@ -195,7 +234,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("openshell/gateway.toml");
 
-        set(&path, &settings(Some("podman"), Some("0.0.0.0:17670"))).unwrap();
+        set(
+            &path,
+            &settings(&[
+                "openshell.gateway.compute_drivers=[\"podman\"]",
+                "openshell.gateway.bind_address=0.0.0.0:17670",
+            ]),
+        )
+        .unwrap();
 
         let loaded = config_file::load(&path).unwrap();
         assert_eq!(loaded.openshell.version, Some(config_file::SCHEMA_VERSION));
@@ -219,7 +265,11 @@ mod tests {
         )
         .unwrap();
 
-        set(&path, &settings(Some("podman"), None)).unwrap();
+        set(
+            &path,
+            &settings(&["openshell.gateway.compute_drivers=[\"podman\"]"]),
+        )
+        .unwrap();
 
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("# keep this comment"));
@@ -232,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_removes_driver_without_changing_bind_address() {
+    fn empty_driver_array_enables_auto_detection_without_changing_bind_address() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("gateway.toml");
         fs::write(
@@ -241,10 +291,10 @@ mod tests {
         )
         .unwrap();
 
-        set(&path, &settings(Some("auto"), None)).unwrap();
+        set(&path, &settings(&["openshell.gateway.compute_drivers=[]"])).unwrap();
 
         let loaded = config_file::load(&path).unwrap();
-        assert_eq!(loaded.openshell.gateway.compute_drivers, None);
+        assert_eq!(loaded.openshell.gateway.compute_drivers, Some(Vec::new()));
         assert_eq!(
             loaded.openshell.gateway.bind_address,
             Some("0.0.0.0:17670".parse().unwrap())
@@ -258,7 +308,11 @@ mod tests {
         let original = "[openshell\ninvalid";
         fs::write(&path, original).unwrap();
 
-        let error = set(&path, &settings(Some("docker"), None)).unwrap_err();
+        let error = set(
+            &path,
+            &settings(&["openshell.gateway.compute_drivers=[\"docker\"]"]),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("failed to parse gateway config"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -271,7 +325,11 @@ mod tests {
         let original = "[openshell]\nversion = 999\n";
         fs::write(&path, original).unwrap();
 
-        let error = set(&path, &settings(Some("docker"), None)).unwrap_err();
+        let error = set(
+            &path,
+            &settings(&["openshell.gateway.compute_drivers=[\"docker\"]"]),
+        )
+        .unwrap_err();
 
         assert!(
             error
@@ -282,15 +340,107 @@ mod tests {
     }
 
     #[test]
-    fn invalid_driver_name_is_not_written() {
+    fn unknown_key_is_not_written() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("gateway.toml");
         let original = "[openshell]\nversion = 1\n";
         fs::write(&path, original).unwrap();
 
-        let error = set(&path, &settings(Some("bad/name"), None)).unwrap_err();
+        let error = set(
+            &path,
+            &settings(&["openshell.gateway.unknown_setting=value"]),
+        )
+        .unwrap_err();
 
-        assert!(error.to_string().contains("invalid compute driver name"));
+        assert!(error.to_string().contains("unknown field"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn assignment_values_support_toml_types_and_unquoted_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gateway.toml");
+
+        set(
+            &path,
+            &settings(&[
+                "openshell.gateway.log_level=debug",
+                "openshell.gateway.grpc_rate_limit_requests=42",
+                "openshell.gateway.enable_loopback_service_http=false",
+                "openshell.gateway.server_sans=[\"gateway.example.com\", \"*.example.com\"]",
+                "openshell.drivers.vm.vcpus=4",
+            ]),
+        )
+        .unwrap();
+
+        let loaded = config_file::load(&path).unwrap();
+        let gateway = loaded.openshell.gateway;
+        assert_eq!(gateway.log_level.as_deref(), Some("debug"));
+        assert_eq!(gateway.grpc_rate_limit_requests, Some(42));
+        assert_eq!(gateway.enable_loopback_service_http, Some(false));
+        assert_eq!(
+            gateway.server_sans,
+            Some(vec![
+                "gateway.example.com".to_string(),
+                "*.example.com".to_string()
+            ])
+        );
+        assert_eq!(
+            loaded.openshell.drivers["vm"]
+                .get("vcpus")
+                .and_then(toml::Value::as_integer),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn later_assignment_to_the_same_key_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gateway.toml");
+
+        set(
+            &path,
+            &settings(&[
+                "openshell.gateway.log_level=info",
+                "openshell.gateway.log_level=debug",
+            ]),
+        )
+        .unwrap();
+
+        let loaded = config_file::load(&path).unwrap();
+        assert_eq!(loaded.openshell.gateway.log_level.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn assignment_requires_key_value_syntax_and_bare_dotted_keys() {
+        let missing_value = "openshell.gateway.log_level"
+            .parse::<Assignment>()
+            .unwrap_err();
+        assert!(missing_value.contains("KEY=VALUE"));
+
+        let invalid_key = "openshell.gateway.bad key=value"
+            .parse::<Assignment>()
+            .unwrap_err();
+        assert!(invalid_key.contains("dot-separated TOML bare keys"));
+    }
+
+    #[test]
+    fn repeated_assignments_are_atomic_when_validation_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gateway.toml");
+        let original = "[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\"\n";
+        fs::write(&path, original).unwrap();
+
+        let error = set(
+            &path,
+            &settings(&[
+                "openshell.gateway.log_level=debug",
+                "openshell.gateway.unknown_setting=value",
+            ]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }

@@ -209,7 +209,7 @@ assert_detected_driver_guidance \
   "If you use rootless Podman, configure the gateway to listen on the host bridge"
 
 if ! grep -Fq -- \
-  "openshell-gateway config set --bind-address 0.0.0.0:17670" \
+  "openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:17670" \
   "$err"; then
   echo "FAIL: podman detection: missing configuration command" >&2
   cat "$err" >&2 || true

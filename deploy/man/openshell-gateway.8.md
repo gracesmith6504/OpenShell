@@ -17,7 +17,7 @@ openshell-gateway - OpenShell gateway server daemon
 **openshell-gateway config detect-driver**
 
 **openshell-gateway config set** \[*--config PATH*\]
-\[*--compute-driver DRIVER*\] \[*--bind-address IP:PORT*\]
+*KEY=VALUE* \[*KEY=VALUE* ...\]
 
 # DESCRIPTION
 
@@ -125,13 +125,14 @@ gateway configuration, or change system state.
 **openshell-gateway config set** updates the gateway TOML file without
 discarding comments or unrelated settings. It creates the default XDG config
 file when needed, validates the complete result, and replaces the file
-atomically.
+atomically. Each argument uses a dotted TOML key. TOML booleans, integers,
+arrays, and quoted strings retain their types; other unquoted values are
+stored as strings. Multiple assignments are applied in one transaction.
 
-**--compute-driver** *DRIVER*
-:   Persist one compute driver. Use **auto** to remove the existing driver pin.
-
-**--bind-address** *IP:PORT*
-:   Persist the gateway listener socket address.
+*KEY=VALUE*
+:   Set a field by its dotted TOML path. Repeat to update multiple fields.
+    Set **openshell.gateway.compute_drivers=[]** to restore automatic driver
+    selection.
 
 **--config** *PATH*
 :   Update a specific gateway TOML file instead of the default XDG location.

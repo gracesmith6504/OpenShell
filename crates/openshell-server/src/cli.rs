@@ -1094,10 +1094,8 @@ mod tests {
             "set",
             "--config",
             &path_string,
-            "--compute-driver",
-            "podman",
-            "--bind-address",
-            "0.0.0.0:17670",
+            "openshell.gateway.compute_drivers=[\"podman\"]",
+            "openshell.gateway.bind_address=0.0.0.0:17670",
         ])
         .expect("config set should parse without runtime arguments");
         let Cli { command, run } = cli;
@@ -1127,6 +1125,19 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn config_set_rejects_non_assignment_arguments() {
+        let error = Cli::try_parse_from([
+            "openshell-gateway",
+            "config",
+            "set",
+            "openshell.gateway.log_level",
+        ])
+        .expect_err("config set arguments must use KEY=VALUE syntax");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

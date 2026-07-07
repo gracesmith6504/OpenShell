@@ -55,13 +55,13 @@ Use the gateway config command to select a driver or update the listener. For
 example, pin Docker:
 
 ```shell
-openshell-gateway config set --compute-driver docker
+openshell-gateway config set 'openshell.gateway.compute_drivers=["docker"]'
 systemctl --user restart openshell-gateway
 ```
 
-Pass `--bind-address IP:PORT` to update the listener. Use `--compute-driver
-auto` to remove an existing driver pin. The command preserves comments and
-unrelated settings. You can also edit
+Pass another dotted `KEY=VALUE` argument to update more fields atomically. Set
+`openshell.gateway.compute_drivers=[]` to restore automatic driver selection.
+The command preserves comments and unrelated settings. You can also edit
 `~/.config/openshell/gateway.toml` directly. The template at
 `/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
 and is not overwritten by RPM upgrades.
