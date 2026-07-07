@@ -1207,21 +1207,54 @@ async fn handle_tcp_connection(
                 }
             }
         } else {
-            {
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Fail)
-                    .severity(SeverityId::Low)
-                    .status(StatusId::Failure)
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .message(format!(
-                        "TLS detected but TLS state not configured for {host_lc}:{port}, falling back to raw tunnel"
-                    ))
-                    .build();
-                ocsf_emit!(event);
-            }
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                .await
-                .into_diagnostic()?;
+            // Fail-closed: TLS was detected but no TLS termination state is
+            // available. Inside the proxy handler this can only mean the
+            // ephemeral CA failed to generate or write at startup (run.rs) —
+            // the `mode != Proxy` case never starts this handler, and
+            // `tls: skip` is handled earlier. Raw-tunneling here would forward
+            // the client's TLS stream straight to the upstream, bypassing
+            // credential rewrite and leaking any `openshell:resolve:env:*`
+            // placeholder verbatim. Refuse the connection instead.
+            const DETAIL: &str = "TLS termination unavailable (CA initialization failed); \
+                 refusing to tunnel — credential rewrite would be bypassed";
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "tls")
+                .message(format!("CONNECT refused for {host_lc}:{port}: {DETAIL}"))
+                .status_detail(DETAIL)
+                .build();
+            ocsf_emit!(event);
+            emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
+            emit_denial(
+                &denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                DETAIL,
+                "connect-tls-termination-unavailable",
+            );
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    503,
+                    "Service Unavailable",
+                    "tls_termination_unavailable",
+                    DETAIL,
+                ),
+            )
+            .await?;
+            return Ok(());
         }
     } else if tunnel_protocol == TunnelProtocol::Http1 {
         // Plaintext HTTP detected.
@@ -7762,6 +7795,32 @@ network_policies:
         let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
         assert_eq!(body["error"], "upstream_unreachable");
         assert_eq!(body["detail"], "connection to api.example.com:443 failed");
+    }
+
+    /// Locks the fail-closed response the CONNECT handler sends when TLS is
+    /// detected but no termination state exists (ephemeral CA setup failed).
+    /// The proxy must refuse the connection with a 503 instead of raw-tunneling
+    /// the TLS stream, which would bypass credential rewrite and leak
+    /// placeholders verbatim.
+    #[test]
+    fn test_json_error_response_503_tls_termination_unavailable() {
+        let detail = "TLS termination unavailable (CA initialization failed); \
+             refusing to tunnel — credential rewrite would be bypassed";
+        let resp = build_json_error_response(
+            503,
+            "Service Unavailable",
+            "tls_termination_unavailable",
+            detail,
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(resp_str.contains("Connection: close\r\n"));
+
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "tls_termination_unavailable");
+        assert_eq!(body["detail"], detail);
     }
 
     #[test]
