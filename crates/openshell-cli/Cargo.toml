@@ -86,6 +86,7 @@ workspace = true
 
 [features]
 bundled-z3 = ["openshell-prover/bundled-z3"]
+conformance = []
 
 [dev-dependencies]
 futures = { workspace = true }

@@ -1558,6 +1558,299 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
 ///
 /// Checks Docker connectivity and reports the result. Returns exit code 0
 /// if all checks pass, 1 otherwise.
+// -----------------------------------------------------------------------
+// Conformance suite
+// -----------------------------------------------------------------------
+
+/// A single conformance scenario definition.
+#[cfg(feature = "conformance")]
+struct Scenario {
+    /// Short lowercase-hyphenated name, used in sandbox naming and filtering.
+    name: &'static str,
+    /// Human-readable description shown in `conformance list`.
+    description: &'static str,
+}
+
+#[cfg(feature = "conformance")]
+fn all_scenarios() -> &'static [Scenario] {
+    &[
+        Scenario {
+            name: "capabilities",
+            description: "GetCapabilities returns non-empty driver name, version, and default image",
+        },
+        Scenario {
+            name: "lifecycle",
+            description: "Create → running → stop → delete completes without error",
+        },
+        Scenario {
+            name: "not-found",
+            description: "Get/stop/delete for an unknown sandbox ID returns an appropriate error",
+        },
+        Scenario {
+            name: "idempotent-delete",
+            description: "Deleting an already-deleted sandbox does not error",
+        },
+        Scenario {
+            name: "validate",
+            description: "Invalid sandbox specs are rejected before creation",
+        },
+        Scenario {
+            name: "concurrent",
+            description: "Two sandboxes created simultaneously do not interfere",
+        },
+    ]
+}
+
+/// Outcome of a single conformance scenario.
+#[cfg(feature = "conformance")]
+#[derive(serde::Serialize)]
+struct ScenarioResult {
+    name: String,
+    passed: bool,
+    message: String,
+    duration_ms: u64,
+}
+
+#[cfg(feature = "conformance")]
+pub async fn conformance_run(
+    server: &str,
+    tls: &TlsOptions,
+    filter: Option<&str>,
+    timeout_secs: u64,
+    output: &str,
+) -> Result<()> {
+    use std::time::Instant;
+
+    let client = grpc_client(server, tls)
+        .await
+        .wrap_err("failed to connect to gateway")?;
+
+    // Stable run-id for sandbox naming: seconds since Unix epoch, truncated
+    // to 8 hex digits. Keeps names Kubernetes RFC 1123 safe and short enough
+    // to read in `sandbox list` output.
+    let run_id = format!(
+        "{:08x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32
+    );
+
+    let scenarios = all_scenarios()
+        .iter()
+        .filter(|s| filter.map_or(true, |f| s.name.contains(f)));
+
+    let mut results: Vec<ScenarioResult> = Vec::new();
+    let mut any_failed = false;
+
+    for scenario in scenarios {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(timeout_secs);
+        let mut client = client.clone();
+
+        let outcome =
+            tokio::time::timeout(timeout, run_scenario(scenario.name, &mut client, &run_id))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(miette::miette!("scenario timed out after {timeout_secs}s"))
+                });
+
+        let passed = outcome.is_ok();
+        if !passed {
+            any_failed = true;
+        }
+
+        results.push(ScenarioResult {
+            name: scenario.name.to_string(),
+            passed,
+            message: match &outcome {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("{e}"),
+            },
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+
+    if crate::output::print_output_collection(output, &results, |r| {
+        serde_json::json!({
+            "name": r.name,
+            "passed": r.passed,
+            "message": r.message,
+            "duration_ms": r.duration_ms,
+        })
+    })? {
+        // structured output already printed
+    } else {
+        for r in &results {
+            let status = if r.passed { "PASS" } else { "FAIL" };
+            println!(
+                "  [{status}] {} ({}ms) — {}",
+                r.name, r.duration_ms, r.message
+            );
+        }
+    }
+
+    if any_failed {
+        return Err(miette::miette!("one or more conformance scenarios failed"));
+    }
+    Ok(())
+}
+
+/// Dispatch a scenario by name.
+#[cfg(feature = "conformance")]
+async fn run_scenario(name: &str, client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
+    match name {
+        "lifecycle" => scenario_lifecycle(client, run_id).await,
+        _ => Err(miette::miette!("scenario '{name}' is not yet implemented")),
+    }
+}
+
+/// Scenario: create → ready → delete.
+///
+/// Creates a minimal sandbox, waits for it to reach the Ready phase, then
+/// deletes it. Verifies that the sandbox appears in the list between create
+/// and delete, and that delete reports it as deleted.
+#[cfg(feature = "conformance")]
+async fn scenario_lifecycle(client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
+    let sandbox_name = format!("conformance-lifecycle-{run_id}");
+
+    // ── 1. Create ────────────────────────────────────────────────────────
+    let response = client
+        .create_sandbox(CreateSandboxRequest {
+            name: sandbox_name.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: Default::default(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("create_sandbox failed")?;
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("create_sandbox response missing sandbox"))?;
+    let sandbox_id = sandbox.object_id().to_string();
+
+    // ── 2. Wait for Ready ────────────────────────────────────────────────
+    let mut stream = client
+        .watch_sandbox(WatchSandboxRequest {
+            id: sandbox_id.clone(),
+            follow_status: true,
+            follow_logs: false,
+            follow_events: false,
+            log_tail_lines: 0,
+            event_tail: 0,
+            stop_on_terminal: false,
+            log_since_ms: 0,
+            log_sources: vec![],
+            log_min_level: String::new(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("watch_sandbox failed")?
+        .into_inner();
+
+    let mut ready = false;
+    while let Some(item) = stream.next().await {
+        let evt = item
+            .into_diagnostic()
+            .wrap_err("watch_sandbox stream error")?;
+        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) = evt.payload
+        {
+            match SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown) {
+                SandboxPhase::Ready => {
+                    ready = true;
+                    break;
+                }
+                SandboxPhase::Error => {
+                    // Best-effort cleanup before returning the error.
+                    let _ = client
+                        .delete_sandbox(DeleteSandboxRequest {
+                            name: sandbox_name.clone(),
+                        })
+                        .await;
+                    return Err(miette::miette!(
+                        "sandbox entered Error phase before becoming Ready"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !ready {
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: sandbox_name.clone(),
+            })
+            .await;
+        return Err(miette::miette!(
+            "watch stream ended before sandbox reached Ready"
+        ));
+    }
+
+    // ── 3. Verify it appears in the list ────────────────────────────────
+    let list_response = client
+        .list_sandboxes(ListSandboxesRequest::default())
+        .await
+        .into_diagnostic()
+        .wrap_err("list_sandboxes failed")?;
+
+    let found = list_response
+        .into_inner()
+        .sandboxes
+        .iter()
+        .any(|s| s.object_name() == sandbox_name);
+
+    if !found {
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: sandbox_name.clone(),
+            })
+            .await;
+        return Err(miette::miette!(
+            "sandbox '{sandbox_name}' not found in list_sandboxes response after creation"
+        ));
+    }
+
+    // ── 4. Delete ────────────────────────────────────────────────────────
+    let del_response = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: sandbox_name.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("delete_sandbox failed")?;
+
+    if !del_response.into_inner().deleted {
+        return Err(miette::miette!(
+            "delete_sandbox reported sandbox '{sandbox_name}' was not deleted"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "conformance")]
+pub fn conformance_list(output: &str) -> Result<()> {
+    let scenarios = all_scenarios();
+
+    if crate::output::print_output_collection(output, scenarios, |s| {
+        serde_json::json!({
+            "name": s.name,
+            "description": s.description,
+        })
+    })? {
+        return Ok(());
+    }
+
+    println!("{} conformance scenarios:", scenarios.len());
+    for s in scenarios {
+        println!("  {:<20} {}", s.name, s.description);
+    }
+    Ok(())
+}
+
 pub fn doctor_check() -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();

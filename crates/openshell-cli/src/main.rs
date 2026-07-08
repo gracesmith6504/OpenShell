@@ -554,6 +554,27 @@ enum Commands {
         command: Option<DoctorCommands>,
     },
 
+    /// Validate that a gateway and its driver are functioning correctly.
+    ///
+    /// Runs a suite of conformance scenarios against the configured gateway
+    /// and reports pass/fail for each. Exits non-zero if any scenario fails.
+    ///
+    /// All sandboxes created by this command use the naming convention
+    /// `conformance-<scenario>-<run-id>` and are cleaned up on completion.
+    /// If the command is interrupted, any remaining sandboxes can be
+    /// identified by the `conformance-` prefix.
+    ///
+    /// Examples:
+    ///   openshell conformance run
+    ///   openshell conformance run --filter lifecycle
+    ///   openshell conformance run --timeout 120
+    #[cfg(feature = "conformance")]
+    #[command(hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Conformance {
+        #[command(subcommand)]
+        command: ConformanceCommands,
+    },
+
     // ===================================================================
     // ADDITIONAL COMMANDS
     // ===================================================================
@@ -1183,6 +1204,47 @@ enum InferenceCommands {
         /// When omitted, both routes are displayed.
         #[arg(long)]
         system: bool,
+    },
+}
+
+// -----------------------------------------------------------------------
+// Conformance commands
+// -----------------------------------------------------------------------
+
+#[cfg(feature = "conformance")]
+#[derive(Subcommand, Debug)]
+enum ConformanceCommands {
+    /// Run the conformance suite against the configured gateway.
+    ///
+    /// Connects to the gateway using the registered credentials and runs
+    /// each conformance scenario in sequence. Reports pass/fail per
+    /// scenario and exits non-zero if any scenario fails.
+    ///
+    /// Examples:
+    ///   openshell conformance run
+    ///   openshell conformance run --filter lifecycle
+    ///   openshell conformance run --timeout 120
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Run {
+        /// Only run scenarios whose name contains this substring.
+        #[arg(long, short = 'f')]
+        filter: Option<String>,
+
+        /// Seconds to wait for each scenario to complete.
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List available conformance scenarios without running them.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 }
 
@@ -2061,6 +2123,35 @@ async fn main() -> Result<()> {
                 run::gateway_list(&cli.gateway, output.as_str())?;
             }
         },
+
+        // -----------------------------------------------------------
+        // Conformance commands
+        // -----------------------------------------------------------
+        #[cfg(feature = "conformance")]
+        Some(Commands::Conformance { command }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            match command {
+                ConformanceCommands::Run {
+                    filter,
+                    timeout,
+                    output,
+                } => {
+                    run::conformance_run(
+                        &ctx.endpoint,
+                        &tls,
+                        filter.as_deref(),
+                        timeout,
+                        output.as_str(),
+                    )
+                    .await?;
+                }
+                ConformanceCommands::List { output } => {
+                    run::conformance_list(output.as_str())?;
+                }
+            }
+        }
 
         // -----------------------------------------------------------
         // Doctor (diagnostic) commands
