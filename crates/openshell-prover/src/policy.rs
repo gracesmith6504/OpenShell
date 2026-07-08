@@ -7,44 +7,11 @@
 //! types) because the prover needs fields like `access`, `protocol`, and
 //! individual L7 rules that the proto representation strips.
 
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::collections::BTreeMap;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-
-// ---------------------------------------------------------------------------
-// Policy intent
-// ---------------------------------------------------------------------------
-
-/// The inferred access intent for an endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyIntent {
-    L4Only,
-    ReadOnly,
-    ReadWrite,
-    Full,
-    Custom,
-}
-
-impl std::fmt::Display for PolicyIntent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::L4Only => write!(f, "l4_only"),
-            Self::ReadOnly => write!(f, "read_only"),
-            Self::ReadWrite => write!(f, "read_write"),
-            Self::Full => write!(f, "full"),
-            Self::Custom => write!(f, "custom"),
-        }
-    }
-}
-
-/// HTTP methods considered to be write operations.
-pub const WRITE_METHODS: &[&str] = &["POST", "PUT", "PATCH", "DELETE"];
-
-/// All standard HTTP methods.
-const ALL_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
 // ---------------------------------------------------------------------------
 // Serde types — mirrors the YAML schema
@@ -246,36 +213,6 @@ impl Endpoint {
         !self.protocol.is_empty()
     }
 
-    /// The inferred access intent.
-    pub fn intent(&self) -> PolicyIntent {
-        if self.protocol.is_empty() {
-            return PolicyIntent::L4Only;
-        }
-        match self.access.as_str() {
-            "read-only" => PolicyIntent::ReadOnly,
-            "read-write" => PolicyIntent::ReadWrite,
-            "full" => PolicyIntent::Full,
-            _ => {
-                if self.rules.is_empty() {
-                    return PolicyIntent::Custom;
-                }
-                let methods: HashSet<String> =
-                    self.rules.iter().map(|r| r.method.to_uppercase()).collect();
-                let read_only: HashSet<String> = ["GET", "HEAD", "OPTIONS"]
-                    .iter()
-                    .map(|s| (*s).to_owned())
-                    .collect();
-                if methods.is_subset(&read_only) {
-                    PolicyIntent::ReadOnly
-                } else if !methods.contains("DELETE") {
-                    PolicyIntent::ReadWrite
-                } else {
-                    PolicyIntent::Full
-                }
-            }
-        }
-    }
-
     /// The effective list of ports for this endpoint.
     pub fn effective_ports(&self) -> Vec<u16> {
         if !self.ports.is_empty() {
@@ -285,38 +222,6 @@ impl Endpoint {
             return vec![self.port];
         }
         vec![]
-    }
-
-    /// The set of HTTP methods this endpoint allows. Empty means all (L4-only).
-    pub fn allowed_methods(&self) -> HashSet<String> {
-        if self.protocol.is_empty() {
-            return HashSet::new(); // L4-only: all traffic passes
-        }
-        match self.access.as_str() {
-            "read-only" => ["GET", "HEAD", "OPTIONS"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            "read-write" => ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect(),
-            "full" => ALL_METHODS.iter().map(|s| (*s).to_owned()).collect(),
-            _ => {
-                if !self.rules.is_empty() {
-                    let mut methods = HashSet::new();
-                    for r in &self.rules {
-                        let m = r.method.to_uppercase();
-                        if m == "*" {
-                            return ALL_METHODS.iter().map(|s| (*s).to_owned()).collect();
-                        }
-                        methods.insert(m);
-                    }
-                    return methods;
-                }
-                HashSet::new()
-            }
-        }
     }
 }
 
@@ -343,23 +248,6 @@ pub struct FilesystemPolicy {
     pub read_only: Vec<String>,
     pub read_write: Vec<String>,
     pub extra_fields: Vec<String>,
-}
-
-impl FilesystemPolicy {
-    /// All readable paths (union of `read_only` and `read_write`), with workdir
-    /// added when `include_workdir` is true and not already present.
-    pub fn readable_paths(&self) -> Vec<String> {
-        let mut paths: Vec<String> = self
-            .read_only
-            .iter()
-            .chain(self.read_write.iter())
-            .cloned()
-            .collect();
-        if self.include_workdir && !paths.iter().any(|p| p == "/sandbox") {
-            paths.push("/sandbox".to_owned());
-        }
-        paths
-    }
 }
 
 /// The top-level policy model used by the prover.
@@ -395,57 +283,9 @@ impl Default for PolicyModel {
     }
 }
 
-impl PolicyModel {
-    /// All (`policy_name`, endpoint) pairs.
-    pub fn all_endpoints(&self) -> Vec<(&str, &Endpoint)> {
-        let mut result = Vec::new();
-        for (name, rule) in &self.network_policies {
-            for ep in &rule.endpoints {
-                result.push((name.as_str(), ep));
-            }
-        }
-        result
-    }
-
-    /// Deduplicated list of all binary paths across all policies.
-    pub fn all_binaries(&self) -> Vec<&Binary> {
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        for rule in self.network_policies.values() {
-            for b in &rule.binaries {
-                if seen.insert(&b.path) {
-                    result.push(b);
-                }
-            }
-        }
-        result
-    }
-
-    /// All (binary, `policy_name`, endpoint) triples.
-    pub fn binary_endpoint_pairs(&self) -> Vec<(&Binary, &str, &Endpoint)> {
-        let mut result = Vec::new();
-        for (name, rule) in &self.network_policies {
-            for b in &rule.binaries {
-                for ep in &rule.endpoints {
-                    result.push((b, name.as_str(), ep));
-                }
-            }
-        }
-        result
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
-
-/// Parse an `OpenShell` policy YAML file into a [`PolicyModel`].
-pub fn parse_policy(path: &Path) -> Result<PolicyModel> {
-    let contents = std::fs::read_to_string(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("reading policy file {}", path.display()))?;
-    parse_policy_str(&contents)
-}
 
 /// Parse a policy YAML string into a [`PolicyModel`].
 pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
