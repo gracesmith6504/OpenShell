@@ -104,9 +104,10 @@ included in decision logs.
 
 The initial managed containment surface supports filesystem paths plus L4 and REST network
 authority. Explicit deny rules take precedence. GraphQL, MCP, and endpoint behavior that the
-containment prover does not model fail closed in managed mode. Unmanaged gateways keep their
-existing behavior. An attached provider must have a resolvable policy profile so the gateway can
-include its credential-bearing reach in the proof.
+containment prover does not model fail closed in managed mode. On an unmanaged gateway, accepted
+agent proposals always wait for human review; there is no separate unmanaged automatic mode. An
+attached provider must have a resolvable policy profile so the gateway can include its
+credential-bearing reach in the proof.
 
 The maximum can be replaced or deleted only when no sandboxes exist, and it cannot coexist with a
 gateway-global policy override. This initial implementation requires single-replica SQLite storage;
