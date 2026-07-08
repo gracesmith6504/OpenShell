@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+/.git
+/target
+/.cache
+/.venv
+/.dagger/.venv
+/.dagger/sdk
+/architecture/plans
+/artifacts
+/deploy/docker/.build
+/e2e/rust/target
