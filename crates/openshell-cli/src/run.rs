@@ -1777,7 +1777,7 @@ async fn finalize_sandbox_create_session(
 /// Infrastructure parameters (`server`, `gateway_name`, `tls`) remain positional
 /// on the function signature, following the `provider_refresh_config(server, input, tls)`
 /// precedent. This struct captures sandbox-specific options.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
     pub from: Option<&'a str>,
@@ -1797,33 +1797,6 @@ pub struct SandboxCreateConfig<'a> {
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
     pub environment: HashMap<String, String>,
-    pub approval_mode: &'a str,
-}
-
-impl Default for SandboxCreateConfig<'_> {
-    fn default() -> Self {
-        Self {
-            name: None,
-            from: None,
-            uploads: &[],
-            keep: false,
-            gpu_requirements: None,
-            cpu: None,
-            memory: None,
-            driver_config_json: None,
-            editor: None,
-            providers: &[],
-            policy: None,
-            permission_mode: None,
-            forward: None,
-            command: &[],
-            tty_override: None,
-            auto_providers_override: None,
-            labels: HashMap::new(),
-            environment: HashMap::new(),
-            approval_mode: "manual",
-        }
-    }
 }
 
 /// Create a sandbox with default settings.
@@ -1852,7 +1825,6 @@ pub async fn sandbox_create(
         auto_providers_override,
         labels,
         environment,
-        approval_mode,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -1969,38 +1941,6 @@ pub async fn sandbox_create(
     // is expected to persist beyond the initial session.
     if persist && let Some(gateway) = effective_tls.gateway_name() {
         let _ = save_last_sandbox(gateway, &sandbox_name);
-    }
-
-    // Persist `--approval-mode` as a sandbox-scoped setting now that the
-    // sandbox exists. `manual` is the implicit default (no setting needed);
-    // any other value is written so it survives sandbox restarts and can be
-    // flipped later via `openshell settings set <name> proposal_approval_mode`.
-    // If the write fails the sandbox still runs in default `manual` — surface
-    // the recovery command so the user can retry.
-    if approval_mode != "manual" {
-        let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
-        match client
-            .update_config(UpdateConfigRequest {
-                name: sandbox_name.clone(),
-                policy: None,
-                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
-                setting_value: Some(setting),
-                delete_setting: false,
-                global: false,
-                merge_operations: vec![],
-                expected_resource_version: 0,
-            })
-            .await
-        {
-            Ok(_) => {}
-            Err(status) => {
-                eprintln!(
-                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
-                    "warning:".yellow().bold(),
-                    status.message(),
-                );
-            }
-        }
     }
 
     // Set up display — interactive terminals get a step-based checklist with
@@ -6231,10 +6171,6 @@ fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
 
     let value = match setting.kind {
         SettingValueKind::String => {
-            // Reject typos client-side so `openshell settings set ...
-            // proposal_approval_mode autom` errors immediately instead of
-            // round-tripping through the server. The server enforces the
-            // same check independently for non-CLI callers.
             setting
                 .validate_string_value(raw_value)
                 .map_err(|allowed| {

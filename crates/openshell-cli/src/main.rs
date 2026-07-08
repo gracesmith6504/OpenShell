@@ -1331,18 +1331,6 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
-        /// Approval mode for agent-authored policy proposals.
-        ///
-        /// `manual` (default): every proposal lands in the draft inbox for
-        /// human review, regardless of the prover verdict.
-        ///
-        /// `auto`: proposals whose prover delta is empty are approved
-        /// automatically; proposals with findings still require human
-        /// approval. Auto mode is an explicit opt-in — `OpenShell`'s
-        /// default-deny posture is preserved unless you choose otherwise.
-        #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
-        approval_mode: String,
-
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1747,30 +1735,6 @@ enum PolicyCommands {
         /// Skip the confirmation prompt for global policy delete.
         #[arg(long)]
         yes: bool,
-    },
-
-    /// Prove properties of a sandbox policy — or find counterexamples.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Prove {
-        /// Path to `OpenShell` sandbox policy YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        policy: String,
-
-        /// Path to credential descriptor YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        credentials: String,
-
-        /// Path to capability registry directory (default: bundled).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        registry: Option<String>,
-
-        /// Path to accepted risks YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        accepted_risks: Option<String>,
-
-        /// One-line-per-finding output (for demos and CI).
-        #[arg(long)]
-        compact: bool,
     },
 }
 
@@ -2331,28 +2295,6 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
-            command:
-                Some(PolicyCommands::Prove {
-                    policy,
-                    credentials,
-                    registry,
-                    accepted_risks,
-                    compact,
-                }),
-        }) => {
-            // Prove runs locally — no gateway needed.
-            let exit_code = openshell_prover::prove(
-                &policy,
-                &credentials,
-                registry.as_deref(),
-                accepted_risks.as_deref(),
-                compact,
-            )?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
-        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -2482,7 +2424,6 @@ async fn main() -> Result<()> {
                     }
                     run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
-                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 
@@ -2671,7 +2612,6 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
-                    approval_mode,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2758,7 +2698,6 @@ async fn main() -> Result<()> {
                             auto_providers_override,
                             labels: labels_map,
                             environment: env_map,
-                            approval_mode: &approval_mode,
                         },
                         &tls,
                     ))
@@ -4559,42 +4498,6 @@ mod tests {
         }
     }
 
-    /// `sandbox create` defaults `--approval-mode` to `"manual"`. The CLI
-    /// always sends an explicit value so the wire form is human-readable
-    /// (the gateway treats `""` as `"manual"` too, but the CLI's job is to
-    /// be unambiguous).
-    #[test]
-    fn sandbox_create_approval_mode_defaults_to_manual() {
-        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"])
-            .expect("sandbox create with no flags should parse");
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { approval_mode, .. }),
-                ..
-            }) => {
-                assert_eq!(approval_mode, "manual");
-            }
-            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
-        }
-    }
-
-    /// `--approval-mode auto` parses through.
-    #[test]
-    fn sandbox_create_approval_mode_accepts_auto() {
-        let cli =
-            Cli::try_parse_from(["openshell", "sandbox", "create", "--approval-mode", "auto"])
-                .expect("--approval-mode auto should parse");
-        match cli.command {
-            Some(Commands::Sandbox {
-                command: Some(SandboxCommands::Create { approval_mode, .. }),
-                ..
-            }) => {
-                assert_eq!(approval_mode, "auto");
-            }
-            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
-        }
-    }
-
     #[test]
     fn sandbox_create_permission_mode_is_optional_and_accepts_managed_modes() {
         let default = Cli::try_parse_from(["openshell", "sandbox", "create"])
@@ -4634,23 +4537,10 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    /// `--approval-mode <bogus>` is rejected by clap's value parser, so the
-    /// CLI can't smuggle through a future-mode value that the gateway
-    /// doesn't yet know about.
-    #[test]
-    fn sandbox_create_approval_mode_rejects_unknown_value() {
-        let result = Cli::try_parse_from([
-            "openshell",
-            "sandbox",
-            "create",
-            "--approval-mode",
-            "auto_on_low_risk",
-        ]);
         assert!(
-            result.is_err(),
-            "--approval-mode auto_on_low_risk should be rejected until added to the value parser"
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--approval-mode", "auto",])
+                .is_err(),
+            "the removed unmanaged approval mode must not remain in the CLI"
         );
     }
 

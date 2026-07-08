@@ -760,7 +760,7 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
+pub(super) fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
     let first = first.to_ascii_lowercase();
     let second = second.to_ascii_lowercase();
     if !first.contains('*') {

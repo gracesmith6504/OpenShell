@@ -338,10 +338,9 @@ message SandboxSpec {
   ResourceRequirements resource_requirements = 9;
   reserved 10;
   reserved "gpu_device";
-  // Field 11 was `proposal_approval_mode`. The approval mode is now a
-  // runtime setting (gateway or sandbox scope) read via UpdateConfig /
-  // GetSandboxConfig, so it can be flipped on a running sandbox and
-  // managed fleet-wide.
+  // Field 11 was the legacy unmanaged proposal approval mode. Automatic
+  // proposal application now requires a gateway-managed maximum policy and
+  // the sandbox's immutable managed permission mode.
   reserved 11;
   reserved "proposal_approval_mode";
 }
@@ -1896,8 +1895,8 @@ message DraftChunkPayload {
   string binary = 9;
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
-  // Gateway prover verdict for this chunk; empty until prover runs.
-  // Mirrors PolicyChunk.validation_result.
+  // Managed-admission context or a non-gating gateway advisory. Empty when
+  // neither applies. Mirrors PolicyChunk.validation_result.
   string validation_result = 11;
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
@@ -1936,7 +1935,7 @@ message StoredDraftChunk {
   int32 hit_count = 15;
   int64 first_seen_ms = 16;
   int64 last_seen_ms = 17;
-  // Gateway prover verdict; empty until the prover runs. See PolicyChunk.
+  // Managed-admission context or a non-gating gateway advisory. See PolicyChunk.
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
