@@ -176,11 +176,15 @@ openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKE
 AWS STS refresh requires `providers_v2_enabled=true`. The gateway calls
 `sts:AssumeRole` and writes three short-lived credentials (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) to the provider record atomically.
+The `aws` and `aws-s3` profiles declare `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` as `additional_outputs` of the `AWS_ACCESS_KEY_ID` refresh,
+so all three credentials are gateway-minted. Create the provider with
+`--runtime-credentials` — no placeholder credential is needed.
 
 ```shell
 openshell settings set --global --key providers_v2_enabled --value true --yes
 
-openshell provider create --name my-aws --type aws-s3
+openshell provider create --name my-aws --type aws-s3 --runtime-credentials
 
 openshell provider refresh configure my-aws \
   --credential-key AWS_ACCESS_KEY_ID \

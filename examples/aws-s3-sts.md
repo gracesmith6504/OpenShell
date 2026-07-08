@@ -132,9 +132,9 @@ export OPENSHELL_BASE_URL=http://localhost:18080
 # Enable provider v2 (required for STS)
 openshell settings set --global --key providers_v2_enabled --value true --yes
 
-# Create the provider with the aws-s3 profile
-openshell provider create --name s3-test --type aws-s3 \
-  --credential AWS_ACCESS_KEY_ID=placeholder
+# Create the provider with the aws-s3 profile. All three credentials are
+# gateway-minted via STS, so no static credential is needed.
+openshell provider create --name s3-test --type aws-s3 --runtime-credentials
 
 # Configure STS refresh
 openshell provider refresh configure s3-test \

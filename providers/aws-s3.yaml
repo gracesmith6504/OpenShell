@@ -14,6 +14,14 @@ credentials:
       strategy: aws_sts_assume_role
       refresh_before_seconds: 300
       max_lifetime_seconds: 3600
+      # One AssumeRole call mints all three AWS credentials. The refresh is
+      # attached to access_key_id (primary); these outputs co-manage the
+      # secret key and session token on their sibling credentials.
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
       material:
         - name: role_arn
           description: ARN of the IAM role to assume

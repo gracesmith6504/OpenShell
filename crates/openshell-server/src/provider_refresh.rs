@@ -176,6 +176,10 @@ pub struct NewRefreshStateConfig {
     pub scopes: Vec<String>,
     pub refresh_before_seconds: i64,
     pub max_lifetime_seconds: i64,
+    /// Resolved semantic output id -> concrete env key for credentials this
+    /// refresh co-mints beyond its primary. Pinned from the profile's
+    /// `additional_outputs` at configure time.
+    pub additional_output_keys: HashMap<String, String>,
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -216,6 +220,7 @@ pub fn new_refresh_state(
         scopes: config.scopes,
         refresh_before_seconds: config.refresh_before_seconds,
         max_lifetime_seconds: config.max_lifetime_seconds,
+        additional_output_keys: config.additional_output_keys,
     })
 }
 
@@ -285,15 +290,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
     }
 }
 
-pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
-    matches!(
-        strategy,
-        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-            | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
-    )
-}
+pub use openshell_providers::is_gateway_mintable_strategy;
 
 pub async fn refresh_provider_credential(
     store: &Store,
@@ -651,9 +648,27 @@ async fn mint_aws_sts_assume_role(
     let max_expires = now_ms + max_lifetime_i64 * 1000;
     let expires_at_ms = expires_at_ms.min(max_expires);
 
+    // Map STS response fields to the env keys the profile bound to each
+    // semantic output. Fall back to the standard AWS names when the state has
+    // no resolved mapping (older refresh states configured before
+    // additional_outputs existed). Profile validation guarantees these resolve
+    // to the standard names the SigV4 signer expects.
+    let output_values = [
+        (
+            "secret_access_key",
+            secret_access_key,
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        ("session_token", session_token, "AWS_SESSION_TOKEN"),
+    ];
     let mut additional = HashMap::new();
-    additional.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_access_key);
-    additional.insert("AWS_SESSION_TOKEN".to_string(), session_token);
+    for (output_id, value, default_key) in output_values {
+        let env_key = state
+            .additional_output_keys
+            .get(output_id)
+            .map_or(default_key, String::as_str);
+        additional.insert(env_key.to_string(), value);
+    }
 
     Ok(MintedCredential {
         access_token: access_key_id,
@@ -974,6 +989,7 @@ mod tests {
             &provider,
             "MS_GRAPH_ACCESS_TOKEN",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
                 material: HashMap::from([
                     ("client_id".to_string(), "client-id".to_string()),
@@ -1057,6 +1073,7 @@ mod tests {
             &provider_b,
             "MS_GRAPH_ACCESS_TOKEN",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
                 material: HashMap::from([
                     ("client_id".to_string(), "client-id".to_string()),
@@ -1125,6 +1142,7 @@ mod tests {
             &provider,
             "MS_GRAPH_ACCESS_TOKEN",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
                 material: HashMap::from([
                     ("client_id".to_string(), "client-id".to_string()),
@@ -1204,6 +1222,7 @@ mod tests {
             &provider,
             "GOOGLE_DRIVE_ACCESS_TOKEN",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt,
                 material: HashMap::from([
                     (
@@ -1250,6 +1269,7 @@ mod tests {
             &provider,
             "MS_GRAPH_ACCESS_TOKEN",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::External,
                 material: HashMap::new(),
                 secret_material_keys: Vec::new(),
@@ -1328,6 +1348,7 @@ mod tests {
             &prov,
             "AWS_ACCESS_KEY_ID",
             NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
                 material: HashMap::from([
                     (
@@ -1376,6 +1397,88 @@ mod tests {
             stored.credentials.get("AWS_SESSION_TOKEN"),
             Some(&"MockSessionTokenXYZ".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn aws_sts_mint_writes_to_resolved_additional_output_keys() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=AssumeRole"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <Credentials>
+      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
+      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
+      <SessionToken>MockSessionTokenXYZ</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+</AssumeRoleResponse>"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("aws-sts-custom", "aws");
+        store.put_message(&prov).await.unwrap();
+
+        // The minter honors the resolved output->env-key map from state, not
+        // hardcoded AWS names.
+        let state = new_refresh_state(
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::from([
+                    ("secret_access_key".to_string(), "CUSTOM_SECRET".to_string()),
+                    ("session_token".to_string(), "CUSTOM_SESSION".to_string()),
+                ]),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
+                    ),
+                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
+                    (
+                        "aws_secret_access_key".to_string(),
+                        "TestSecretKey".to_string(),
+                    ),
+                    ("sts_endpoint_url".to_string(), mock_server.uri()),
+                ]),
+                secret_material_keys: vec!["aws_secret_access_key".to_string()],
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        refresh_provider_credential(&store, "aws-sts-custom", "AWS_ACCESS_KEY_ID")
+            .await
+            .unwrap();
+
+        let stored = store
+            .get_message_by_name::<Provider>("aws-sts-custom")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            Some(&"ASIAMOCKKEY".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("CUSTOM_SECRET"),
+            Some(&"MockSecretAccessKey123".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("CUSTOM_SESSION"),
+            Some(&"MockSessionTokenXYZ".to_string())
+        );
+        assert!(!stored.credentials.contains_key("AWS_SECRET_ACCESS_KEY"));
     }
 
     #[tokio::test]

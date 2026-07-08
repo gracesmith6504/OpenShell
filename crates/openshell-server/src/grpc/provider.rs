@@ -1066,13 +1066,18 @@ async fn active_provider_environment_keys(
 ) -> Result<Vec<String>, Status> {
     let mut keys = active_provider_credential_keys(provider, now_ms);
     if !provider.object_id().is_empty() {
-        keys.extend(
+        for state in
             crate::provider_refresh::list_refresh_states_for_provider(store, provider.object_id())
                 .await?
-                .into_iter()
-                .map(|state| state.credential_key)
-                .filter(|key| is_valid_env_key(key)),
-        );
+        {
+            // The primary key plus every co-minted output key this refresh owns,
+            // so a configured-but-not-yet-minted refresh reserves all of them.
+            keys.extend(
+                std::iter::once(state.credential_key)
+                    .chain(state.additional_output_keys.into_values())
+                    .filter(|key| is_valid_env_key(key)),
+            );
+        }
     }
     keys.sort();
     keys.dedup();
@@ -1510,6 +1515,21 @@ async fn provider_refresh_defaults(
                     .any(|env_var| env_var == credential_key)
         })
         .and_then(|credential| credential.refresh.clone()))
+}
+
+/// Resolve the env keys a refresh co-mints (beyond its primary credential) from
+/// the provider's profile `additional_outputs`. Returns semantic output id ->
+/// env key. Empty when the provider type has no profile or the credential
+/// declares no additional outputs.
+async fn resolved_additional_output_keys(
+    store: &Store,
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<std::collections::HashMap<String, String>, Status> {
+    let Some(profile) = get_provider_type_profile(store, &provider.r#type).await? else {
+        return Ok(std::collections::HashMap::new());
+    };
+    Ok(profile.resolved_additional_output_keys(credential_key))
 }
 
 fn validate_refresh_material(
@@ -2076,15 +2096,19 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
     )
     .await?;
-    if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
-        for additional_key in ["AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"] {
-            validate_provider_credential_key_available_for_attached_sandboxes(
-                state.store.as_ref(),
-                &provider,
-                additional_key,
-            )
-            .await?;
-        }
+    // Reserve every env key this refresh will co-mint (resolved from the
+    // profile's additional_outputs), not just the primary, so a
+    // configured-but-not-yet-minted refresh can't collide with another provider
+    // that later claims one of the derived keys.
+    let additional_output_keys =
+        resolved_additional_output_keys(state.store.as_ref(), &provider, credential_key).await?;
+    for additional_key in additional_output_keys.values() {
+        validate_provider_credential_key_available_for_attached_sandboxes(
+            state.store.as_ref(),
+            &provider,
+            additional_key,
+        )
+        .await?;
     }
     let refresh_defaults =
         provider_refresh_defaults(state.store.as_ref(), &provider, credential_key).await?;
@@ -2152,6 +2176,7 @@ pub(super) async fn handle_configure_provider_refresh(
             scopes,
             refresh_before_seconds,
             max_lifetime_seconds,
+            additional_output_keys,
         },
     )?;
     if let Some(existing) = existing_refresh_state {
@@ -3061,6 +3086,7 @@ mod tests {
                 scopes: Vec::new(),
                 refresh_before_seconds: 300,
                 max_lifetime_seconds: 3600,
+                additional_outputs: Vec::new(),
                 material: vec![
                     ProviderCredentialRefreshMaterial {
                         name: "client_id".to_string(),
@@ -4390,6 +4416,7 @@ mod tests {
             &provider,
             "API_TOKEN",
             crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::External,
                 material: HashMap::from([(
                     "endpoint".to_string(),
@@ -4599,6 +4626,7 @@ mod tests {
                                 scopes: vec!["https://example.test/.default".to_string()],
                                 refresh_before_seconds: 300,
                                 max_lifetime_seconds: 3600,
+                                additional_outputs: Vec::new(),
                                 material: vec![
                                     ProviderCredentialRefreshMaterial {
                                         name: "client_id".to_string(),
@@ -6169,6 +6197,151 @@ mod tests {
             response.strategy,
             ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32
         );
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_persists_resolved_additional_output_keys() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-outputs".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-outputs".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-outputs")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            provider.object_id(),
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap()
+        .expect("refresh state should exist");
+
+        assert_eq!(
+            stored.additional_output_keys.get("secret_access_key"),
+            Some(&"AWS_SECRET_ACCESS_KEY".to_string())
+        );
+        assert_eq!(
+            stored.additional_output_keys.get("session_token"),
+            Some(&"AWS_SESSION_TOKEN".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn active_provider_environment_keys_include_additional_output_keys() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-env".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-env")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A configured-but-not-yet-minted STS refresh: no minted values are in
+        // provider.credentials yet, but the reserved keys must still surface.
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "AWS_ACCESS_KEY_ID",
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::from([
+                    (
+                        "secret_access_key".to_string(),
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ),
+                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
+                ]),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        let keys = active_provider_environment_keys(state.store.as_ref(), &provider, 0)
+            .await
+            .unwrap();
+        assert!(keys.contains(&"AWS_ACCESS_KEY_ID".to_string()));
+        assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
+        assert!(keys.contains(&"AWS_SESSION_TOKEN".to_string()));
     }
 
     #[tokio::test]
