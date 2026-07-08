@@ -235,8 +235,17 @@ pub fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<()> {
         let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(None);
         return Ok(());
     };
-    let namespace = SupervisorIdentityMountNamespace::from_socket_path(&socket_path)?;
-    let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(namespace);
+    match SupervisorIdentityMountNamespace::from_socket_path(&socket_path) {
+        Ok(namespace) => {
+            let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(namespace);
+        }
+        Err(err) => {
+            eprintln!(
+                "WARN: supervisor identity mount namespace setup failed ({err}), continuing without isolation"
+            );
+            let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(None);
+        }
+    }
     Ok(())
 }
 
@@ -336,16 +345,24 @@ fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> 
             .map_err(|err| miette::miette!("failed to open sanitized mount namespace: {err}"))
     })();
 
-    set_mount_namespace(original_ns.as_raw_fd()).map_err(|restore_err| {
+    if let Err(restore_err) = set_mount_namespace(original_ns.as_raw_fd()) {
+        // Cannot restore the original mount namespace. Undo the tmpfs
+        // overlay so the SPIFFE workload API socket stays reachable in the
+        // namespace PID 1 is stuck in.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+        }
         let result_msg = result.as_ref().err().map_or_else(
             || "sanitized namespace was created".to_string(),
             ToString::to_string,
         );
-        miette::miette!(
+        return Err(miette::miette!(
             "failed to restore original mount namespace after supervisor identity isolation setup: \
-             {restore_err}; setup result: {result_msg}"
-        )
-    })?;
+             {restore_err}; undid tmpfs overlay so SPIFFE socket remains accessible; \
+             setup result: {result_msg}"
+        ));
+    }
 
     result
 }

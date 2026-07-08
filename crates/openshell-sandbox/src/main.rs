@@ -222,6 +222,9 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    #[cfg(target_os = "linux")]
+    openshell_supervisor_process::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
