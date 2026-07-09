@@ -854,6 +854,8 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
+# Expose middleware policy data to Rust. Selection and validation stay in Rust;
+# Rego does not evaluate middleware selectors.
 network_middlewares := object.get(data, "network_middlewares", [])
 
 _policy_has_exact_declared_endpoint(policy) if {
@@ -909,17 +911,13 @@ endpoint_path_matches_request(ep, request) if {
 }
 
 # An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# middleware, or an explicit tls mode (e.g. tls: skip).
+# or an explicit tls mode (e.g. tls: skip).
 endpoint_has_extended_config(ep) if {
 	ep.protocol
 }
 
 endpoint_has_extended_config(ep) if {
 	count(object.get(ep, "allowed_ips", [])) > 0
-}
-
-endpoint_has_extended_config(ep) if {
-	count(object.get(ep, "middleware", [])) > 0
 }
 
 endpoint_has_extended_config(ep) if {

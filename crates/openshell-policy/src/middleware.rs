@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy};
+use openshell_core::proto::{
+    MiddlewareEndpointSelector, NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule,
+    SandboxPolicy,
+};
 use openshell_core::proto_struct::{
     ProtoStructError, json_object_to_struct, struct_to_json_object,
 };
@@ -13,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::PolicyViolation;
 
-pub use openshell_core::middleware::host_matches as middleware_host_matches;
+pub use openshell_core::host_pattern::host_matches as middleware_host_matches;
+use openshell_core::host_pattern::{HostPattern, HostSelector};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +45,33 @@ struct MiddlewareEndpointSelectorDef {
     include: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     exclude: Vec<String>,
+}
+
+/// Middleware-relevant projection of the runtime policy JSON accepted by the
+/// supervisor's local-file mode. Unrelated network and L7 fields are ignored;
+/// middleware entries retain their strict canonical schema.
+#[derive(Debug, Default, Deserialize)]
+struct MiddlewareValidationPolicyDef {
+    #[serde(default)]
+    network_middlewares: Vec<NetworkMiddlewareConfigDef>,
+    #[serde(default)]
+    network_policies: BTreeMap<String, MiddlewareValidationNetworkPolicyDef>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MiddlewareValidationNetworkPolicyDef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    endpoints: Vec<MiddlewareValidationEndpointDef>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MiddlewareValidationEndpointDef {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    tls: String,
 }
 
 pub fn into_proto(
@@ -93,23 +124,38 @@ pub fn from_proto(middlewares: &[NetworkMiddlewareConfig]) -> Vec<NetworkMiddlew
         .collect()
 }
 
-fn selector_matches_host(middleware: &NetworkMiddlewareConfig, host: &str) -> Result<bool, String> {
-    let Some(selector) = &middleware.endpoints else {
-        return Ok(false);
-    };
-    let matches_include = selector
-        .include
-        .iter()
-        .try_fold(false, |matched, pattern| {
-            middleware_host_matches(pattern, host).map(|matches| matched || matches)
-        })?;
-    let matches_exclude = selector
-        .exclude
-        .iter()
-        .try_fold(false, |matched, pattern| {
-            middleware_host_matches(pattern, host).map(|matches| matched || matches)
-        })?;
-    Ok(matches_include && !matches_exclude)
+/// Validate middleware configuration from the supervisor's runtime policy
+/// JSON through the same typed validator used for protobuf policies.
+pub fn validate_json(data: &serde_json::Value) -> Result<Vec<PolicyViolation>, String> {
+    let definition: MiddlewareValidationPolicyDef = serde_json::from_value(data.clone())
+        .map_err(|error| format!("failed to parse network middleware policy: {error}"))?;
+    let network_middlewares = into_proto(definition.network_middlewares)
+        .map_err(|error| format!("failed to convert network middleware config: {error}"))?;
+    let network_policies = definition
+        .network_policies
+        .into_iter()
+        .map(|(key, rule)| {
+            let rule = NetworkPolicyRule {
+                name: rule.name,
+                endpoints: rule
+                    .endpoints
+                    .into_iter()
+                    .map(|endpoint| NetworkEndpoint {
+                        host: endpoint.host,
+                        tls: endpoint.tls,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            (key, rule)
+        })
+        .collect();
+    Ok(validate(&SandboxPolicy {
+        network_middlewares,
+        network_policies,
+        ..Default::default()
+    }))
 }
 
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
@@ -165,14 +211,21 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 reason: "endpoint selector must include at least one host pattern".to_string(),
             });
         }
+        let mut selector_valid = !selector.include.is_empty();
         for pattern in selector.include.iter().chain(&selector.exclude) {
-            if let Err(reason) = middleware_host_matches(pattern, "validation.invalid") {
+            if let Err(reason) = HostPattern::new(pattern) {
+                selector_valid = false;
                 violations.push(PolicyViolation::InvalidMiddlewareConfig {
                     name: middleware.name.clone(),
                     reason: format!("endpoint selector pattern '{pattern}' is invalid: {reason}"),
                 });
             }
         }
+        let compiled_selector = if selector_valid {
+            HostSelector::new(&selector.include, &selector.exclude).ok()
+        } else {
+            None
+        };
 
         if middleware.middleware == openshell_core::middleware::BUILTIN_SECRETS {
             let config = middleware.config.clone().unwrap_or_default();
@@ -193,9 +246,12 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 &rule.name
             };
             for endpoint in &rule.endpoints {
-                if endpoint.tls == "skip"
-                    && selector_matches_host(middleware, &endpoint.host).unwrap_or(false)
-                {
+                let overlaps_tls_skip = endpoint.tls == "skip"
+                    && compiled_selector.as_ref().is_some_and(|selector| {
+                        HostPattern::new(&endpoint.host)
+                            .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))
+                    });
+                if overlaps_tls_skip {
                     violations.push(PolicyViolation::MiddlewareTlsSkipConflict {
                         middleware_name: middleware.name.clone(),
                         policy_name: policy_name.clone(),

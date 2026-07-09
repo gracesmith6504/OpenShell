@@ -75,11 +75,15 @@ operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and policy-owned config before delivery. Supervisors keep
 the last-known-good service registry when a live config reload fails. Built-in
-middleware identifiers, host-selector matching, and pure config validation live
-in `openshell-core` so policy admission does not depend on the supervisor
-runtime implementation. The policy and runtime also share the core
-JSON/protobuf adapter for middleware configuration, keeping serialization
-consistent across that boundary.
+middleware identifiers live in `openshell-core::middleware`; reusable compiled
+DNS host patterns and selectors live in the neutral
+`openshell-core::host_pattern` module. Structural policy validation lives in
+`openshell-policy`; the supervisor's local-file path projects its JSON into the
+same typed validator instead of maintaining an OPA-specific copy. Rego exposes
+the middleware list as policy data, but Rust performs selector validation,
+overlap detection, matching, and chain ordering. The policy and runtime also
+share the core JSON/protobuf adapter for middleware configuration, keeping
+serialization consistent across that boundary.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

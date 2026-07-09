@@ -8,13 +8,13 @@
 //! on every proxy CONNECT request.
 
 use miette::Result;
+use openshell_core::host_pattern::HostSelector;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::L7ConfigStanza;
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
@@ -698,10 +698,6 @@ fn query_middleware_chain_locked(
     engine: &mut regorus::Engine,
     input: &NetworkInput,
 ) -> Result<Vec<ChainEntry>> {
-    engine
-        .set_input_json(&network_input_json(input).to_string())
-        .map_err(|e| miette::miette!("{e}"))?;
-
     let configs_val = engine
         .eval_rule("data.openshell.sandbox.network_middlewares".into())
         .map_err(|e| miette::miette!("{e}"))?;
@@ -737,23 +733,10 @@ fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bo
     let Some(selector) = get_field(config, "endpoints") else {
         return Ok(false);
     };
-    let include_patterns = get_str_array(selector, "include");
-    let exclude_patterns = get_str_array(selector, "exclude");
-    let matches_include = include_patterns
-        .iter()
-        .try_fold(false, |matched, pattern| {
-            openshell_core::middleware::host_matches(pattern, host)
-                .map(|matches| matched || matches)
-                .map_err(|error| miette::miette!(error))
-        })?;
-    let matches_exclude = exclude_patterns
-        .iter()
-        .try_fold(false, |matched, pattern| {
-            openshell_core::middleware::host_matches(pattern, host)
-                .map(|matches| matched || matches)
-                .map_err(|error| miette::miette!(error))
-        })?;
-    Ok(matches_include && !matches_exclude)
+    let include = get_str_array(selector, "include");
+    let exclude = get_str_array(selector, "exclude");
+    let selector = HostSelector::new(&include, &exclude).map_err(|error| miette::miette!(error))?;
+    Ok(selector.matches(host))
 }
 
 fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
@@ -877,11 +860,16 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     }
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
-    let middleware_errors = validate_middleware_policies(&data);
+    let middleware_errors = openshell_policy::validate_network_middleware_json(&data)
+        .map_err(|error| miette::miette!(error))?;
     if !middleware_errors.is_empty() {
         return Err(miette::miette!(
             "middleware policy validation failed:\n{}",
-            middleware_errors.join("\n")
+            middleware_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 
@@ -1103,137 +1091,6 @@ fn normalize_l7_rule_aliases(
             );
         }
     }
-}
-
-fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
-    let mut errors = Vec::new();
-    let middlewares = data
-        .get("network_middlewares")
-        .and_then(serde_json::Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut names = HashSet::new();
-    for mw in middlewares {
-        let name = mw
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let implementation = mw
-            .get("middleware")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if name.is_empty() {
-            errors.push("network_middlewares entry has empty name".to_string());
-        } else if !names.insert(name.to_string()) {
-            errors.push(format!("duplicate middleware config '{name}'"));
-        }
-        if implementation.is_empty() {
-            errors.push(format!(
-                "middleware config '{name}' has empty implementation"
-            ));
-        }
-        if implementation.starts_with("openshell/")
-            && implementation != openshell_supervisor_middleware::BUILTIN_SECRETS
-        {
-            errors.push(format!(
-                "middleware config '{name}' references unsupported built-in '{implementation}'"
-            ));
-        }
-        let on_error = mw
-            .get("on_error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if !matches!(on_error, "" | "fail_closed" | "fail_open") {
-            errors.push(format!(
-                "middleware config '{name}' has invalid on_error '{on_error}'"
-            ));
-        }
-
-        let Some(selector) = mw.get("endpoints") else {
-            errors.push(format!(
-                "middleware config '{name}' requires an endpoint selector"
-            ));
-            continue;
-        };
-        let includes = json_string_array(selector.get("include"));
-        let excludes = json_string_array(selector.get("exclude"));
-        if includes.is_empty() {
-            errors.push(format!(
-                "middleware config '{name}' endpoint selector must include at least one host pattern"
-            ));
-        }
-        for pattern in includes.iter().chain(&excludes) {
-            if let Err(error) =
-                openshell_core::middleware::host_matches(pattern, "validation.invalid")
-            {
-                errors.push(format!(
-                    "middleware config '{name}' has invalid endpoint selector pattern '{pattern}': {error}"
-                ));
-            }
-        }
-    }
-
-    let Some(policies) = data
-        .get("network_policies")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return errors;
-    };
-
-    for (policy_name, policy) in policies {
-        for endpoint in policy
-            .get("endpoints")
-            .and_then(serde_json::Value::as_array)
-            .map_or(&[][..], Vec::as_slice)
-        {
-            let tls_skip = endpoint
-                .get("tls")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|tls| tls == "skip");
-            if tls_skip && global_selector_matches_any_middleware(middlewares, endpoint) {
-                errors.push(format!(
-                    "network policy '{policy_name}' tls: skip endpoint matches a global middleware selector"
-                ));
-            }
-        }
-    }
-    errors
-}
-
-fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
-    value
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn global_selector_matches_any_middleware(
-    middlewares: &[serde_json::Value],
-    endpoint: &serde_json::Value,
-) -> bool {
-    let host = endpoint
-        .get("host")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    middlewares.iter().any(|mw| {
-        let Some(selector) = mw.get("endpoints") else {
-            return false;
-        };
-        let includes = json_string_array(selector.get("include"));
-        let excludes = json_string_array(selector.get("exclude"));
-        !includes.is_empty()
-            && includes.iter().any(|pattern| {
-                openshell_core::middleware::host_matches(pattern, host).unwrap_or(false)
-            })
-            && !excludes.iter().any(|pattern| {
-                openshell_core::middleware::host_matches(pattern, host).unwrap_or(false)
-            })
-    })
 }
 
 /// Resolve a policy binary path through the container's root filesystem.
@@ -6792,6 +6649,124 @@ network_policies:
     }
 
     #[test]
+    fn middleware_chain_uses_dns_label_glob_semantics() {
+        let data = r#"
+network_middlewares:
+  - name: single-label
+    middleware: openshell/secrets
+    order: 10
+    endpoints:
+      include: ["*.Example.COM"]
+      exclude: ["trusted.example.com"]
+  - name: recursive
+    middleware: openshell/secrets
+    order: 20
+    endpoints:
+      include: ["**.example.com"]
+  - name: intra-label
+    middleware: openshell/secrets
+    order: 30
+    endpoints:
+      include: ["*-api.example.com"]
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let names_for = |host: &str| {
+            let input = NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            engine
+                .query_middleware_chain_with_generation(&input)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names_for("api.example.com"),
+            vec!["single-label", "recursive"]
+        );
+        assert_eq!(names_for("deep.api.example.com"), vec!["recursive"]);
+        assert_eq!(names_for("trusted.example.com"), vec!["recursive"]);
+        assert_eq!(
+            names_for("tenant-api.example.com"),
+            vec!["single-label", "recursive", "intra-label"]
+        );
+    }
+
+    #[test]
+    fn host_pattern_matches_rego_endpoint_host_semantics() {
+        // Middleware selectors and the tls-skip overlap validation promise the
+        // same host semantics as endpoint admission, which is decided by the
+        // endpoint_allowed branches in sandbox-policy.rego. Pin parity by
+        // running one table through openshell_core::host_pattern and through
+        // regorus with those branches verbatim.
+        let policy = r#"
+package test
+
+default host_match = false
+
+host_match if {
+	not contains(input.pattern, "*")
+	lower(input.pattern) == lower(input.host)
+}
+
+host_match if {
+	contains(input.pattern, "*")
+	glob.match(lower(input.pattern), ["."], lower(input.host))
+}
+"#;
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("test.rego".into(), policy.into())
+            .unwrap();
+
+        let cases = [
+            ("api.example.com", "api.example.com"),
+            ("api.example.com", "API.EXAMPLE.COM"),
+            ("api.example.com", "api.example.org"),
+            ("*.example.com", "api.example.com"),
+            ("*.example.com", "example.com"),
+            ("*.example.com", "deep.api.example.com"),
+            ("*-api.example.com", "tenant-api.example.com"),
+            ("*-api.example.com", "api.example.com"),
+            ("*.a?i.example.com", "x.abi.example.com"),
+            ("**.example.com", "example.com"),
+            ("**.example.com", "api.example.com"),
+            ("**.example.com", "deep.api.example.com"),
+            ("api.**.com", "api.com"),
+            ("api.**.com", "api.x.com"),
+            ("api.**.com", "api.x.y.com"),
+            ("api.**", "api"),
+            ("api.**", "api.com"),
+            ("*", "com"),
+            ("*", "example.com"),
+            ("**", "com"),
+            ("**", "deep.api.example.com"),
+        ];
+        for (pattern, host) in cases {
+            let rust = openshell_core::host_pattern::host_matches(pattern, host).unwrap();
+            engine
+                .set_input_json(
+                    &serde_json::json!({ "pattern": pattern, "host": host }).to_string(),
+                )
+                .unwrap();
+            let rego = engine.eval_rule("data.test.host_match".into()).unwrap()
+                == regorus::Value::from(true);
+            assert_eq!(
+                rust, rego,
+                "host pattern parity mismatch: pattern={pattern} host={host} rust={rust} rego={rego}"
+            );
+        }
+    }
+
+    #[test]
     fn middleware_policy_validation_rejects_bad_configs() {
         let cases = [
             (
@@ -6839,7 +6814,7 @@ network_middlewares:
   - name: redactor
     middleware: openshell/secrets
 "#,
-                "requires an endpoint selector",
+                "endpoint selector is required",
             ),
             (
                 "malformed selector",
@@ -6864,6 +6839,25 @@ network_policies:
   api:
     endpoints:
       - host: api.example.com
+        port: 443
+        tls: skip
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+                "tls: skip",
+            ),
+            (
+                "tls skip wildcard overlap",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    endpoints:
+      - host: "*.example.com"
         port: 443
         tls: skip
     binaries:

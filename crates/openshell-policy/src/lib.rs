@@ -34,6 +34,7 @@ pub use merge::{
     merge_policy, policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
+pub use middleware::validate_json as validate_network_middleware_json;
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -1940,7 +1941,9 @@ network_policies:
     fn middleware_host_selector_matching_is_case_insensitive() {
         assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
         assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
-        assert!(middleware_host_matches("*", "deep.api.example.com").unwrap());
+        assert!(!middleware_host_matches("*.example.com", "deep.api.example.com").unwrap());
+        assert!(middleware_host_matches("**.example.com", "deep.api.example.com").unwrap());
+        assert!(!middleware_host_matches("**.example.com", "example.com").unwrap());
     }
 
     #[test]
@@ -1971,6 +1974,37 @@ network_policies:
                 policy_name,
                 host,
             } if middleware_name == "redactor" && policy_name == "api" && host == "api.example.com"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_concrete_selector_overlapping_tls_skip_wildcard() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        middleware.endpoints.as_mut().unwrap().include = vec!["api.example.com".into()];
+        policy.network_middlewares.push(middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } if middleware_name == "redactor" && policy_name == "api" && host == "*.example.com"
         )));
     }
 

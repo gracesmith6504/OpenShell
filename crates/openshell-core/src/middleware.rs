@@ -8,23 +8,6 @@ use miette::{Result, miette};
 /// Binding identifier for the built-in secret redaction middleware.
 pub const BUILTIN_SECRETS: &str = "openshell/secrets";
 
-/// Match a middleware host selector pattern using the runtime's glob semantics.
-///
-/// Matching is case-insensitive. Invalid or empty patterns return an error
-/// instead of silently becoming a non-match.
-pub fn host_matches(pattern: &str, host: &str) -> std::result::Result<bool, String> {
-    if pattern.is_empty() {
-        return Err("host pattern must not be empty".to_string());
-    }
-    if pattern.chars().any(char::is_whitespace) {
-        return Err("host pattern must not contain whitespace".to_string());
-    }
-
-    let pattern = glob::Pattern::new(&pattern.to_ascii_lowercase())
-        .map_err(|error| format!("invalid host pattern: {error}"))?;
-    Ok(pattern.matches(&host.to_ascii_lowercase()))
-}
-
 /// Validate policy-owned configuration for a built-in middleware.
 pub fn validate_builtin_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
@@ -55,20 +38,6 @@ fn validate_secrets_config(config: &prost_types::Struct) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_matching_is_case_insensitive() {
-        assert!(host_matches("*.Example.COM", "API.example.com").unwrap());
-        assert!(!host_matches("*.example.com", "example.com").unwrap());
-        assert!(host_matches("*", "deep.api.example.com").unwrap());
-    }
-
-    #[test]
-    fn host_matching_rejects_invalid_patterns() {
-        assert!(host_matches("", "api.example.com").is_err());
-        assert!(host_matches("api .example.com", "api.example.com").is_err());
-        assert!(host_matches("api[.example.com", "api.example.com").is_err());
-    }
 
     #[test]
     fn secrets_config_defaults_to_redact() {

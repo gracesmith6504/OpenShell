@@ -74,7 +74,7 @@ network_middlewares:
 
 Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors.
 
-`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints.
+`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
 
 Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may reference the same binding and run as separate stages. Config names must be unique.
 
