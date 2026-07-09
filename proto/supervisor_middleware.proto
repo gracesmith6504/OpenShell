@@ -22,16 +22,17 @@ service SupervisorMiddleware {
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 }
 
-// MiddlewareManifest describes one service and the bindings it exposes.
+// MiddlewareManifest describes one middleware service and the bindings it
+// exposes. The service is the operator-run gRPC server implementing
+// SupervisorMiddleware.
 message MiddlewareManifest {
-  // Middleware protocol version implemented by the service.
-  string api_version = 1;
-  // Human-readable service name used for diagnostics.
-  string name = 2;
-  // Service-defined version string used for diagnostics.
-  string service_version = 3;
-  // Bindings exposed by this service.
-  repeated MiddlewareBinding bindings = 4;
+  // Human-readable middleware service name used for diagnostics.
+  string name = 1;
+  // Release version of the middleware service implementation, used for
+  // diagnostics.
+  string service_version = 2;
+  // Bindings exposed by this middleware service.
+  repeated MiddlewareBinding bindings = 3;
 }
 
 // MiddlewareBinding declares one operation and phase supported by a service.
@@ -48,12 +49,10 @@ message MiddlewareBinding {
 
 // ValidateConfigRequest contains one policy configuration to validate.
 message ValidateConfigRequest {
-  // Middleware protocol version selected by OpenShell.
-  string api_version = 1;
   // Manifest binding id associated with this configuration.
-  string binding_id = 2;
+  string binding_id = 1;
   // Service-specific policy configuration.
-  google.protobuf.Struct config = 3;
+  google.protobuf.Struct config = 2;
 }
 
 // ValidateConfigResponse reports whether a policy configuration is accepted.
@@ -66,22 +65,20 @@ message ValidateConfigResponse {
 
 // HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
-  // Middleware protocol version selected by OpenShell.
-  string api_version = 1;
   // Manifest binding id selected for this evaluation.
-  string binding_id = 2;
+  string binding_id = 1;
   // Evaluation phase selected for this request.
-  SupervisorMiddlewarePhase phase = 3;
+  SupervisorMiddlewarePhase phase = 2;
   // Sandbox and request identity available to the supervisor.
-  RequestContext context = 4;
+  RequestContext context = 3;
   // Validated service-specific policy configuration.
-  google.protobuf.Struct config = 5;
+  google.protobuf.Struct config = 4;
   // Destination and HTTP request target.
-  HttpRequestTarget target = 6;
+  HttpRequestTarget target = 5;
   // HTTP request headers before OpenShell injects credentials.
-  map<string, string> headers = 7;
+  map<string, string> headers = 6;
   // Buffered request body. Empty for a bodyless request.
-  bytes body = 8;
+  bytes body = 7;
 }
 
 // Supervisor operation selected for middleware evaluation.

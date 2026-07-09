@@ -24,7 +24,6 @@ use openshell_core::proto::{
 use tokio::sync::OnceCell;
 use tonic::Request;
 
-pub const API_VERSION: &str = "openshell.middleware.v1";
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
 const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
@@ -272,13 +271,6 @@ fn validate_external_manifest(
     operator_max_body_bytes: usize,
     known_binding_ids: &mut HashSet<String>,
 ) -> Result<Vec<String>> {
-    if manifest.api_version != API_VERSION {
-        return Err(miette!(
-            "middleware registration '{}' reports unsupported API version '{}'",
-            registration.name,
-            manifest.api_version
-        ));
-    }
     if manifest.bindings.is_empty() {
         return Err(miette!(
             "middleware registration '{}' describes no bindings",
@@ -590,7 +582,6 @@ impl ChainRunner {
         let response = state
             .service
             .validate_config(Request::new(ValidateConfigRequest {
-                api_version: API_VERSION.into(),
                 binding_id: implementation.into(),
                 config: Some(config),
             }))
@@ -835,7 +826,6 @@ fn build_evaluation(
     body: &[u8],
 ) -> HttpRequestEvaluation {
     HttpRequestEvaluation {
-        api_version: API_VERSION.into(),
         binding_id: binding.id.clone(),
         phase: binding.phase,
         context: Some(RequestContext {
@@ -1078,7 +1068,6 @@ mod tests {
             .await
             .expect("describe")
             .into_inner();
-        assert_eq!(manifest.api_version, API_VERSION);
         assert_eq!(manifest.bindings[0].id, BUILTIN_SECRETS);
         assert_eq!(
             manifest.bindings[0].operation,
@@ -1133,7 +1122,6 @@ mod tests {
             _request: Request<()>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
-                api_version: API_VERSION.into(),
                 name: "test/middleware".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
@@ -1332,7 +1320,6 @@ mod tests {
     fn external_manifest_rejects_operator_limit_above_capability() {
         let registration = external_registration(4097);
         let manifest = MiddlewareManifest {
-            api_version: API_VERSION.into(),
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {

@@ -8,7 +8,7 @@ use openshell_core::proto::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{API_VERSION, builtins, safe_reason, validate_builtin_config};
+use crate::{builtins, safe_reason, validate_builtin_config};
 
 #[derive(Debug, Default)]
 pub struct InProcessMiddlewareService;
@@ -20,7 +20,6 @@ impl SupervisorMiddleware for InProcessMiddlewareService {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            api_version: API_VERSION.into(),
             name: "openshell/in-process".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: builtins::describe(),
