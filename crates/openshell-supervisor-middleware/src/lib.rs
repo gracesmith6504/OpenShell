@@ -16,7 +16,7 @@ pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
+    Decision, Finding, HttpHeader, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
     MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
@@ -116,7 +116,10 @@ pub struct HttpRequestInput {
     pub method: String,
     pub path: String,
     pub query: String,
-    pub headers: BTreeMap<String, String>,
+    /// Lowercased request headers in wire order. Repeated header names are
+    /// preserved as separate entries so middleware inspects every value the
+    /// upstream will receive.
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -771,7 +774,7 @@ impl ChainRunner {
                 }
             }
             for (name, value) in &result.add_headers {
-                headers.insert(name.to_ascii_lowercase(), value.clone());
+                headers.push((name.to_ascii_lowercase(), value.clone()));
                 added_headers.insert(name.to_ascii_lowercase(), value.clone());
             }
             let transformed = result.has_body;
@@ -824,7 +827,7 @@ fn build_evaluation(
     entry: &DescribedChainEntry,
     binding: &MiddlewareBinding,
     input: &HttpRequestInput,
-    headers: &BTreeMap<String, String>,
+    headers: &[(String, String)],
     body: &[u8],
 ) -> HttpRequestEvaluation {
     HttpRequestEvaluation {
@@ -844,19 +847,25 @@ fn build_evaluation(
             path: input.path.clone(),
             query: input.query.clone(),
         }),
-        headers: headers.clone().into_iter().collect(),
+        headers: headers
+            .iter()
+            .map(|(name, value)| HttpHeader {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
         body: body.to_vec(),
     }
 }
 
 fn validate_header_mutations(
-    existing_headers: &BTreeMap<String, String>,
+    existing_headers: &[(String, String)],
     mutations: &HashMap<String, String>,
 ) -> Result<()> {
     let mut seen = HashSet::new();
     for (name, value) in mutations {
         let lower = name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) || existing_headers.contains_key(&lower) {
+        if !seen.insert(lower.clone()) || existing_headers.iter().any(|(name, _)| *name == lower) {
             return Err(miette!(
                 "middleware cannot rewrite existing header '{name}'"
             ));
@@ -948,7 +957,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1".into(),
             query: String::new(),
-            headers: BTreeMap::new(),
+            headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         }
     }
@@ -962,7 +971,7 @@ mod tests {
         let entry = &entries[0];
         let binding = entry.binding.as_ref().expect("described binding");
         let input = input("payload");
-        let evaluation = build_evaluation(entry, binding, &input, &BTreeMap::new(), b"payload");
+        let evaluation = build_evaluation(entry, binding, &input, &[], b"payload");
 
         assert_eq!(
             evaluation.phase,
@@ -1088,7 +1097,7 @@ mod tests {
     #[test]
     fn unsafe_header_mutation_is_rejected() {
         let err = validate_header_mutations(
-            &BTreeMap::new(),
+            &[],
             &std::iter::once(("Authorization".into(), "Bearer nope".into())).collect(),
         )
         .expect_err("unsafe header");
@@ -1101,7 +1110,7 @@ mod tests {
         // A safe header *name* with a CRLF-bearing value must still be rejected,
         // otherwise it would inject extra headers into the upstream request.
         let err = validate_header_mutations(
-            &BTreeMap::new(),
+            &[],
             &std::iter::once((
                 "x-openshell-middleware-inject".into(),
                 "ok\r\nAuthorization: Bearer evil".into(),
@@ -1183,6 +1192,124 @@ mod tests {
             findings: Vec::new(),
             metadata: HashMap::new(),
         }
+    }
+
+    /// A middleware that records every evaluation it receives and allows the
+    /// request, for asserting what the supervisor actually sends to services.
+    struct RecordingService {
+        received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for RecordingService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/recorder".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/recorder".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            self.received
+                .lock()
+                .expect("recording lock")
+                .push(request.into_inner());
+            Ok(tonic::Response::new(allow_result()))
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_request_headers_reach_middleware_in_wire_order() {
+        // A map contract would collapse repeated header names to one value
+        // while the upstream still receives every original value, creating an
+        // inspection differential. The service must see each entry in wire
+        // order.
+        let service = Arc::new(RecordingService {
+            received: std::sync::Mutex::new(Vec::new()),
+        });
+        let recorder: Arc<dyn SupervisorMiddleware> = service.clone();
+        let runner = ChainRunner::new(recorder);
+        let recorder_entry = ChainEntry {
+            name: "recorder".into(),
+            implementation: "example/recorder".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let mut request = input("payload");
+        request.headers = vec![
+            ("x-api-key".into(), "first-value".into()),
+            ("accept".into(), "application/json".into()),
+            ("x-api-key".into(), "second-value".into()),
+        ];
+
+        let outcome = runner
+            .evaluate(&[recorder_entry], request)
+            .await
+            .expect("evaluate recording chain");
+        assert!(outcome.allowed);
+
+        let received = service.received.lock().expect("recorded evaluations");
+        assert_eq!(received.len(), 1);
+        let headers: Vec<(&str, &str)> = received[0]
+            .headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                ("x-api-key", "first-value"),
+                ("accept", "application/json"),
+                ("x-api-key", "second-value"),
+            ]
+        );
+    }
+
+    #[test]
+    fn existing_header_rewrite_is_rejected() {
+        // Any occurrence of an existing name blocks the mutation, including
+        // repeated names where only one entry matches.
+        let existing = [
+            ("x-openshell-middleware-tag".to_string(), "one".to_string()),
+            ("accept".to_string(), "application/json".to_string()),
+        ];
+        let err = validate_header_mutations(
+            &existing,
+            &std::iter::once(("X-OpenShell-Middleware-Tag".into(), "two".into())).collect(),
+        )
+        .expect_err("rewrite of existing header");
+        assert!(err.to_string().contains("cannot rewrite existing header"));
     }
 
     fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {

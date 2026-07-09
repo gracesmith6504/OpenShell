@@ -21,7 +21,7 @@ For each inspected HTTP request, the supervisor:
 4. Runs matching middleware by ascending `order`, using the policy-local name to break ties.
 5. Applies allowed transformations, injects provider credentials, and forwards the request.
 
-Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials.
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Request headers are delivered in wire order and repeated header names are preserved as separate entries, so a service inspects every value the upstream will receive.
 
 ## Choose a Middleware Type
 

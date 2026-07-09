@@ -10,7 +10,6 @@ use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -68,14 +67,8 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input = middleware_request_input(
-            scheme,
-            &req,
-            ctx,
-            BTreeMap::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let input =
+            middleware_request_input(scheme, &req, ctx, Vec::new(), String::new(), Vec::new());
         let outcome = runner.evaluate_described(&chain, input).await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
@@ -119,7 +112,7 @@ pub(super) fn middleware_request_input(
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
-    headers: BTreeMap<String, String>,
+    headers: Vec<(String, String)>,
     query: String,
     body: Vec<u8>,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
@@ -197,10 +190,13 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
     ocsf_emit!(event);
 }
 
-fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
+/// Parse the raw header block into middleware-visible headers, preserving
+/// wire order and repeated names so middleware inspects every value the
+/// upstream will receive. Credential-bearing headers are omitted.
+fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for line in header_str.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -221,7 +217,7 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
         {
             continue;
         }
-        out.insert(name, value.trim().to_string());
+        out.push((name, value.trim().to_string()));
     }
     Ok(out)
 }
@@ -376,10 +372,32 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers.get("x-request-id").map(String::as_str),
-            Some("request-123")
+            headers,
+            vec![("x-request-id".to_string(), "request-123".to_string())]
         );
-        assert!(!headers.contains_key("authorization"));
-        assert!(!headers.contains_key("proxy-authorization"));
+    }
+
+    #[test]
+    fn middleware_headers_preserve_repeated_names_in_wire_order() {
+        // Repeated header names must reach middleware as separate entries in
+        // wire order: keeping only one value would let a request smuggle a
+        // differently-positioned duplicate past inspection while the upstream
+        // still receives every original value.
+        let headers = safe_middleware_headers(
+            b"POST /v1 HTTP/1.1\r\n\
+              X-Api-Key: first-value\r\n\
+              Accept: application/json\r\n\
+              X-Api-Key: second-value\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers,
+            vec![
+                ("x-api-key".to_string(), "first-value".to_string()),
+                ("accept".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "second-value".to_string()),
+            ]
+        );
     }
 }

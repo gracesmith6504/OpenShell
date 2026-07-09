@@ -75,10 +75,21 @@ message HttpRequestEvaluation {
   google.protobuf.Struct config = 4;
   // Destination and HTTP request target.
   HttpRequestTarget target = 5;
-  // HTTP request headers before OpenShell injects credentials.
-  map<string, string> headers = 6;
+  // HTTP request headers before OpenShell injects credentials, in wire
+  // order. Repeated header names are preserved as separate entries so a
+  // service inspects every value the upstream will receive. Protected
+  // headers such as authorization or cookie are omitted.
+  repeated HttpHeader headers = 6;
   // Buffered request body. Empty for a bodyless request.
   bytes body = 7;
+}
+
+// HttpHeader is one request header line.
+message HttpHeader {
+  // Lowercased header name.
+  string name = 1;
+  // Header value with surrounding whitespace trimmed.
+  string value = 2;
 }
 
 // Supervisor operation selected for middleware evaluation.

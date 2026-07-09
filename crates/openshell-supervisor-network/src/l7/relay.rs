@@ -3231,14 +3231,8 @@ network_policies:
             token_grant_resolver: None,
         };
 
-        let input = middleware_request_input(
-            "http",
-            &req,
-            &ctx,
-            BTreeMap::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let input =
+            middleware_request_input("http", &req, &ctx, Vec::new(), String::new(), Vec::new());
 
         assert_eq!(input.scheme, "http");
     }
