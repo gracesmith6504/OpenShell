@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod lima;
+mod release_smoke_test;
+mod vm;
+
 use std::env;
 use std::ffi::OsString;
 use std::process::{Command, ExitCode, ExitStatus};
 
-const USAGE: &str = "Usage: cargo xtask run [--no-deps] [--skip-deps] <task> [-- <args>...]";
+const USAGE: &str = "Usage:\n  cargo xtask run [--no-deps] [--skip-deps] <task> [-- <args>...]\n  cargo xtask release-smoke-test --deb <path> [--arch <amd64|arm64>] [--guest-os <ubuntu-24.04|ubuntu-26.04>] [--snapshot] [--rebuild-vm] [--keep-vm]";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -19,11 +23,21 @@ fn main() -> ExitCode {
 }
 
 fn run(args: impl Iterator<Item = OsString>) -> Result<ExitStatus, String> {
-    let command = RunCommand::parse(args)?;
+    let arguments = args.collect::<Vec<_>>();
 
+    match arguments.first().and_then(|argument| argument.to_str()) {
+        Some("release-smoke-test") => release_smoke_test::run(arguments.into_iter().skip(1)),
+        _ => {
+            let command = RunCommand::parse(arguments.into_iter())?;
+            run_task(&command)
+        }
+    }
+}
+
+fn run_task(command: &RunCommand) -> Result<ExitStatus, String> {
     match command.task.to_str() {
         Some("rust:format:check") => rust_format_check(&command.task_args),
-        _ => legacy_mise_task(&command),
+        _ => legacy_mise_task(command),
     }
 }
 

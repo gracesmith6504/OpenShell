@@ -48,6 +48,10 @@
             rustToolchain
             # Reproducible local build and packaging pipelines.
             dagger
+            # Required for running packaging tests.
+            (lima.override {
+              withAdditionalGuestAgents = true;
+            })
             # Required to find packages
             pkg-config
             # Required for bindgen generation.
