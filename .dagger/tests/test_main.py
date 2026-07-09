@@ -3,7 +3,11 @@
 
 import unittest
 
-from open_shell.main import _rust_build_spec, _validate_inputs
+from open_shell.main import (
+    _rust_build_spec,
+    _validate_deb_version,
+    _validate_inputs,
+)
 
 
 class RustNativeBuildTest(unittest.TestCase):
@@ -31,6 +35,12 @@ class RustNativeBuildTest(unittest.TestCase):
             _validate_inputs("not a version", "")
         with self.assertRaisesRegex(ValueError, "features"):
             _validate_inputs("0.12.3", "feature; echo unsafe")
+
+    def test_validates_debian_version(self) -> None:
+        _validate_deb_version("1:0.12.3~rc.1-2")
+
+        with self.assertRaisesRegex(ValueError, "deb-version"):
+            _validate_deb_version("0.12.3; echo unsafe")
 
 
 if __name__ == "__main__":

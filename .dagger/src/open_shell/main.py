@@ -25,8 +25,15 @@ RUST_BUILD_SOURCE_INCLUDE = [
     "rust-toolchain.toml",
 ]
 
+DEB_PACKAGE_SOURCE_INCLUDE = [
+    "LICENSE",
+    "deploy/deb/",
+    "tasks/scripts/package-deb.sh",
+]
+
 _CARGO_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 _FEATURES_RE = re.compile(r"^[0-9A-Za-z_, -]*$")
+_DEB_VERSION_RE = re.compile(r"^[0-9A-Za-z.+~:-]+$")
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,27 @@ def _validate_inputs(cargo_version: str, features: str) -> None:
         raise ValueError("features contains unsupported characters")
 
 
+def _validate_deb_version(deb_version: str) -> None:
+    if not deb_version or not _DEB_VERSION_RE.fullmatch(deb_version):
+        raise ValueError("deb-version contains unsupported characters")
+
+
+def _image_container(
+    platform: dagger.Platform,
+    image: str,
+    github_username: str,
+    github_token: dagger.Secret | None,
+) -> dagger.Container:
+    base = dag.container(platform=platform)
+    if github_token is not None:
+        if not github_username:
+            raise ValueError(
+                "github-username is required when github-token is provided"
+            )
+        base = base.with_registry_auth("ghcr.io", github_username, github_token)
+    return base.from_(image)
+
+
 @object_type
 class OpenShell:
     """Build reproducible OpenShell artifacts."""
@@ -103,16 +131,13 @@ class OpenShell:
             include=RUST_BUILD_SOURCE_INCLUDE,
             gitignore=True,
         )
-        base = dag.container(platform=spec.platform)
-        if github_token is not None:
-            if not github_username:
-                raise ValueError(
-                    "github-username is required when github-token is provided"
-                )
-            base = base.with_registry_auth("ghcr.io", github_username, github_token)
-
         container = (
-            base.from_(toolchain_image)
+            _image_container(
+                spec.platform,
+                toolchain_image,
+                github_username,
+                github_token,
+            )
             .with_directory(WORKDIR, project_source)
             .with_workdir(WORKDIR)
             # Workflow parity: "Cache Rust target and registry".
@@ -242,3 +267,78 @@ install -m 0755 "$binary" "/out/${RUST_BUILD_BINARY}"
             .with_exec(["bash", "-ec", stage_script])
             .directory("/out")
         )
+
+    @function
+    def deb_package(
+        self,
+        gateway_binary: dagger.File,
+        driver_vm_binary: dagger.File,
+        deb_version: str,
+        source_path: str = ".",
+        arch: str = "amd64",
+        cargo_version: str = "",
+        image_tag: str = "dagger",
+        toolchain_image: str = DEFAULT_TOOLCHAIN_IMAGE,
+        github_username: str = "",
+        github_token: dagger.Secret | None = None,
+    ) -> dagger.Directory:
+        """Build a Debian package using a Dagger-built CLI binary."""
+        spec = _rust_build_spec("cli", arch)
+        _validate_deb_version(deb_version)
+
+        cli_binary = self.rust_native_build(
+            source_path=source_path,
+            component="cli",
+            arch=arch,
+            cargo_version=cargo_version,
+            image_tag=image_tag,
+            features="bundled-z3",
+            toolchain_image=toolchain_image,
+            github_username=github_username,
+            github_token=github_token,
+        ).file("openshell")
+        package_source = dag.current_workspace().directory(
+            source_path,
+            include=DEB_PACKAGE_SOURCE_INCLUDE,
+            gitignore=True,
+        )
+
+        # Workflow parity: "Download <component> artifact" and
+        # "Extract package inputs" in deb-package.yml. Typed File inputs avoid
+        # the Actions artifact/tar transport while preserving the same paths.
+        container = (
+            _image_container(
+                spec.platform,
+                toolchain_image,
+                github_username,
+                github_token,
+            )
+            .with_directory(WORKDIR, package_source)
+            .with_workdir(WORKDIR)
+            .with_file("/package-binaries/openshell", cli_binary, permissions=0o755)
+            .with_file(
+                "/package-binaries/openshell-gateway",
+                gateway_binary,
+                permissions=0o755,
+            )
+            .with_file(
+                "/package-binaries/openshell-driver-vm",
+                driver_vm_binary,
+                permissions=0o755,
+            )
+            .with_env_variable("OPENSHELL_CLI_BINARY", "/package-binaries/openshell")
+            .with_env_variable(
+                "OPENSHELL_GATEWAY_BINARY",
+                "/package-binaries/openshell-gateway",
+            )
+            .with_env_variable(
+                "OPENSHELL_DRIVER_VM_BINARY",
+                "/package-binaries/openshell-driver-vm",
+            )
+            .with_env_variable("OPENSHELL_DEB_VERSION", deb_version)
+            .with_env_variable("OPENSHELL_DEB_ARCH", arch)
+            .with_env_variable("OPENSHELL_OUTPUT_DIR", "/out")
+            # Workflow parity: "Build Debian package".
+            .with_exec(["bash", "tasks/scripts/package-deb.sh"])
+        )
+        return container.directory("/out")

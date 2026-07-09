@@ -8,6 +8,4 @@
 /.dagger/.venv
 /.dagger/sdk
 /architecture/plans
-/artifacts
-/deploy/docker/.build
 /e2e/rust/target

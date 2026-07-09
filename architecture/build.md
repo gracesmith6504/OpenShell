@@ -79,6 +79,13 @@ step via the `rust-native-build.yml` workflow (per-architecture, per-component)
 and uploads the result as an artifact that the image build job downloads back
 into the staging directory before running Buildx.
 
+The Dagger module provides a local, architecture-selectable build path for the
+Linux CLI and can assemble a Debian package with that CLI plus prebuilt gateway
+and VM driver binaries. It uses the same CI toolchain image and
+`tasks/scripts/package-deb.sh` as the GitHub Actions workflows. The gateway and
+VM driver remain explicit file inputs until their native builds move into
+Dagger.
+
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
