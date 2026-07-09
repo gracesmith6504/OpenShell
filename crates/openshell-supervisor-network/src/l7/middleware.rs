@@ -205,7 +205,12 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
         if name.is_empty()
             || matches!(
                 name.as_str(),
-                "authorization" | "cookie" | "host" | "content-length" | "transfer-encoding"
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "host"
+                    | "content-length"
+                    | "transfer-encoding"
             )
             || name.starts_with("x-amz-")
             || name.starts_with("x-openshell-credential")
@@ -349,5 +354,28 @@ fn emit_middleware_events(
 ) {
     for event in middleware_events(ctx, req, outcome) {
         ocsf_emit!(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_middleware_headers;
+
+    #[test]
+    fn middleware_headers_exclude_origin_and_proxy_credentials() {
+        let headers = safe_middleware_headers(
+            b"GET http://api.example.test/v1 HTTP/1.1\r\n\
+              Authorization: Bearer origin-secret\r\n\
+              Proxy-Authorization: Basic proxy-secret\r\n\
+              X-Request-ID: request-123\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("request-123")
+        );
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("proxy-authorization"));
     }
 }
