@@ -1598,6 +1598,10 @@ fn all_scenarios() -> &'static [Scenario] {
             name: "concurrent",
             description: "Two sandboxes created simultaneously do not interfere",
         },
+        Scenario {
+            name: "labels",
+            description: "Labels are persisted on create and filter list results correctly",
+        },
     ]
 }
 
@@ -1701,8 +1705,63 @@ pub async fn conformance_run(
 async fn run_scenario(name: &str, client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
     match name {
         "lifecycle" => scenario_lifecycle(client, run_id).await,
+        "not-found" => scenario_not_found(client, run_id).await,
+        "idempotent-delete" => scenario_idempotent_delete(client, run_id).await,
+        "validate" => scenario_validate(client).await,
+        "concurrent" => scenario_concurrent(client, run_id).await,
+        "labels" => scenario_labels(client, run_id).await,
         _ => Err(miette::miette!("scenario '{name}' is not yet implemented")),
     }
+}
+
+/// Poll `WatchSandbox` until the sandbox reaches Ready, returning an error on
+/// Error phase or a closed stream. Does not perform cleanup — callers are
+/// responsible for deleting the sandbox if this returns an error.
+#[cfg(feature = "conformance")]
+async fn wait_for_ready(
+    client: &mut crate::tls::GrpcClient,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<()> {
+    let mut stream = client
+        .watch_sandbox(WatchSandboxRequest {
+            id: sandbox_id.to_string(),
+            follow_status: true,
+            follow_logs: false,
+            follow_events: false,
+            log_tail_lines: 0,
+            event_tail: 0,
+            stop_on_terminal: false,
+            log_since_ms: 0,
+            log_sources: vec![],
+            log_min_level: String::new(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("watch_sandbox failed")?
+        .into_inner();
+
+    while let Some(item) = stream.next().await {
+        let evt = item
+            .into_diagnostic()
+            .wrap_err("watch_sandbox stream error")?;
+        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) = evt.payload
+        {
+            match SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown) {
+                SandboxPhase::Ready => return Ok(()),
+                SandboxPhase::Error => {
+                    return Err(miette::miette!(
+                        "sandbox '{sandbox_name}' entered Error phase before becoming Ready"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Err(miette::miette!(
+        "watch stream ended before sandbox '{sandbox_name}' reached Ready"
+    ))
 }
 
 /// Scenario: create → ready → delete.
@@ -1732,61 +1791,13 @@ async fn scenario_lifecycle(client: &mut crate::tls::GrpcClient, run_id: &str) -
     let sandbox_id = sandbox.object_id().to_string();
 
     // ── 2. Wait for Ready ────────────────────────────────────────────────
-    let mut stream = client
-        .watch_sandbox(WatchSandboxRequest {
-            id: sandbox_id.clone(),
-            follow_status: true,
-            follow_logs: false,
-            follow_events: false,
-            log_tail_lines: 0,
-            event_tail: 0,
-            stop_on_terminal: false,
-            log_since_ms: 0,
-            log_sources: vec![],
-            log_min_level: String::new(),
-        })
-        .await
-        .into_diagnostic()
-        .wrap_err("watch_sandbox failed")?
-        .into_inner();
-
-    let mut ready = false;
-    while let Some(item) = stream.next().await {
-        let evt = item
-            .into_diagnostic()
-            .wrap_err("watch_sandbox stream error")?;
-        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) = evt.payload
-        {
-            match SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown) {
-                SandboxPhase::Ready => {
-                    ready = true;
-                    break;
-                }
-                SandboxPhase::Error => {
-                    // Best-effort cleanup before returning the error.
-                    let _ = client
-                        .delete_sandbox(DeleteSandboxRequest {
-                            name: sandbox_name.clone(),
-                        })
-                        .await;
-                    return Err(miette::miette!(
-                        "sandbox entered Error phase before becoming Ready"
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if !ready {
+    if let Err(e) = wait_for_ready(client, &sandbox_id, &sandbox_name).await {
         let _ = client
             .delete_sandbox(DeleteSandboxRequest {
                 name: sandbox_name.clone(),
             })
             .await;
-        return Err(miette::miette!(
-            "watch stream ended before sandbox reached Ready"
-        ));
+        return Err(e);
     }
 
     // ── 3. Verify it appears in the list ────────────────────────────────
@@ -1825,6 +1836,355 @@ async fn scenario_lifecycle(client: &mut crate::tls::GrpcClient, run_id: &str) -
     if !del_response.into_inner().deleted {
         return Err(miette::miette!(
             "delete_sandbox reported sandbox '{sandbox_name}' was not deleted"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scenario: get and delete a sandbox that does not exist.
+///
+/// Verifies that `GetSandbox` returns `NOT_FOUND` and that `DeleteSandbox`
+/// returns `deleted: false` without erroring for a name that was never
+/// created.
+#[cfg(feature = "conformance")]
+async fn scenario_not_found(client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
+    let phantom_name = format!("conformance-not-found-{run_id}");
+
+    // ── 1. GetSandbox → NOT_FOUND ────────────────────────────────────────
+    let err = client
+        .get_sandbox(GetSandboxRequest {
+            name: phantom_name.clone(),
+        })
+        .await
+        .expect_err("get_sandbox on a non-existent sandbox should have returned NOT_FOUND");
+
+    if err.code() != Code::NotFound {
+        return Err(miette::miette!(
+            "get_sandbox returned {} instead of NOT_FOUND",
+            err.code()
+        ));
+    }
+
+    // ── 2. DeleteSandbox → ok, deleted: false ────────────────────────────
+    let del = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: phantom_name.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("delete_sandbox on a non-existent sandbox should not error")?
+        .into_inner();
+
+    if del.deleted {
+        return Err(miette::miette!(
+            "delete_sandbox reported deleted=true for a sandbox that was never created"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scenario: delete an already-deleted sandbox does not error.
+///
+/// Creates a sandbox, waits for it to be Ready, deletes it (expecting
+/// `deleted: true`), then deletes it again and asserts the second call
+/// returns `deleted: false` without an error.
+#[cfg(feature = "conformance")]
+async fn scenario_idempotent_delete(
+    client: &mut crate::tls::GrpcClient,
+    run_id: &str,
+) -> Result<()> {
+    let sandbox_name = format!("conformance-idempotent-delete-{run_id}");
+
+    // ── 1. Create ────────────────────────────────────────────────────────
+    let response = client
+        .create_sandbox(CreateSandboxRequest {
+            name: sandbox_name.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: Default::default(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("create_sandbox failed")?;
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("create_sandbox response missing sandbox"))?;
+    let sandbox_id = sandbox.object_id().to_string();
+
+    // ── 2. Wait for Ready ────────────────────────────────────────────────
+    if let Err(e) = wait_for_ready(client, &sandbox_id, &sandbox_name).await {
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: sandbox_name.clone(),
+            })
+            .await;
+        return Err(e);
+    }
+
+    // ── 3. First delete → deleted: true ──────────────────────────────────
+    let del1 = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: sandbox_name.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("first delete_sandbox failed")?
+        .into_inner();
+
+    if !del1.deleted {
+        return Err(miette::miette!(
+            "first delete_sandbox reported deleted=false for sandbox '{sandbox_name}'"
+        ));
+    }
+
+    // ── 4. Second delete → ok, deleted: false ────────────────────────────
+    let del2 = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: sandbox_name.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("second delete_sandbox (idempotency check) returned an error")?
+        .into_inner();
+
+    if del2.deleted {
+        return Err(miette::miette!(
+            "second delete_sandbox reported deleted=true — expected deleted=false"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scenario: invalid sandbox specs are rejected before creation.
+///
+/// Verifies that the gateway returns `INVALID_ARGUMENT` for two distinct
+/// invalid inputs without creating any sandbox: a missing spec field and a
+/// zero GPU count.
+#[cfg(feature = "conformance")]
+async fn scenario_validate(client: &mut crate::tls::GrpcClient) -> Result<()> {
+    // ── 1. spec=None → INVALID_ARGUMENT ──────────────────────────────────
+    let err = client
+        .create_sandbox(CreateSandboxRequest {
+            name: String::new(),
+            spec: None,
+            labels: Default::default(),
+        })
+        .await
+        .expect_err("create_sandbox with spec=None should have been rejected");
+
+    if err.code() != Code::InvalidArgument {
+        return Err(miette::miette!(
+            "create_sandbox(spec=None) returned {} instead of INVALID_ARGUMENT",
+            err.code()
+        ));
+    }
+
+    // ── 2. gpu.count=0 → INVALID_ARGUMENT ────────────────────────────────
+    let err2 = client
+        .create_sandbox(CreateSandboxRequest {
+            name: String::new(),
+            spec: Some(SandboxSpec {
+                resource_requirements: Some(ResourceRequirements {
+                    gpu: Some(GpuResourceRequirements { count: Some(0) }),
+                }),
+                ..Default::default()
+            }),
+            labels: Default::default(),
+        })
+        .await
+        .expect_err("create_sandbox with gpu.count=0 should have been rejected");
+
+    if err2.code() != Code::InvalidArgument {
+        return Err(miette::miette!(
+            "create_sandbox(gpu.count=0) returned {} instead of INVALID_ARGUMENT",
+            err2.code()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scenario: two sandboxes created simultaneously do not interfere.
+///
+/// Issues two `CreateSandbox` calls concurrently, waits for both to reach
+/// Ready in parallel, verifies both appear in `ListSandboxes`, then deletes
+/// both. Any failure cleans up both sandboxes before returning.
+#[cfg(feature = "conformance")]
+async fn scenario_concurrent(client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
+    let name_a = format!("conformance-concurrent-a-{run_id}");
+    let name_b = format!("conformance-concurrent-b-{run_id}");
+
+    // ── 1. Create both sandboxes concurrently ────────────────────────────
+    let mut client_a = client.clone();
+    let mut client_b = client.clone();
+
+    let (resp_a, resp_b) = tokio::join!(
+        client_a.create_sandbox(CreateSandboxRequest {
+            name: name_a.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: Default::default(),
+        }),
+        client_b.create_sandbox(CreateSandboxRequest {
+            name: name_b.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: Default::default(),
+        }),
+    );
+
+    let sandbox_a = resp_a
+        .into_diagnostic()
+        .wrap_err("create_sandbox(a) failed")?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("create_sandbox(a) response missing sandbox"))?;
+    let sandbox_b = resp_b
+        .into_diagnostic()
+        .wrap_err("create_sandbox(b) failed")?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("create_sandbox(b) response missing sandbox"))?;
+
+    let id_a = sandbox_a.object_id().to_string();
+    let id_b = sandbox_b.object_id().to_string();
+
+    // ── 2. Wait for both to reach Ready concurrently ─────────────────────
+    let (ready_a, ready_b) = tokio::join!(
+        wait_for_ready(&mut client_a, &id_a, &name_a),
+        wait_for_ready(&mut client_b, &id_b, &name_b),
+    );
+
+    // Best-effort cleanup before surfacing watch errors.
+    if ready_a.is_err() || ready_b.is_err() {
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: name_a.clone(),
+            })
+            .await;
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: name_b.clone(),
+            })
+            .await;
+        ready_a?;
+        ready_b?;
+    }
+
+    // ── 3. Both appear in the list ───────────────────────────────────────
+    let sandboxes = client
+        .list_sandboxes(ListSandboxesRequest::default())
+        .await
+        .into_diagnostic()
+        .wrap_err("list_sandboxes failed")?
+        .into_inner()
+        .sandboxes;
+
+    let found_a = sandboxes.iter().any(|s| s.object_name() == name_a);
+    let found_b = sandboxes.iter().any(|s| s.object_name() == name_b);
+
+    // ── 4. Delete both ───────────────────────────────────────────────────
+    let _ = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: name_a.clone(),
+        })
+        .await;
+    let _ = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: name_b.clone(),
+        })
+        .await;
+
+    if !found_a {
+        return Err(miette::miette!(
+            "sandbox '{name_a}' not found in list_sandboxes after concurrent create"
+        ));
+    }
+    if !found_b {
+        return Err(miette::miette!(
+            "sandbox '{name_b}' not found in list_sandboxes after concurrent create"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Scenario: labels are persisted on create and filter list results correctly.
+///
+/// Creates two sandboxes with distinct label values, calls `ListSandboxes`
+/// with a label selector, and verifies that only the matching sandbox is
+/// returned. Labels are stored by the gateway on creation so no Ready wait
+/// is required; both sandboxes are deleted after the assertion.
+#[cfg(feature = "conformance")]
+async fn scenario_labels(client: &mut crate::tls::GrpcClient, run_id: &str) -> Result<()> {
+    let name_a = format!("conformance-labels-a-{run_id}");
+    let name_b = format!("conformance-labels-b-{run_id}");
+    let label_key = "conformance-scenario".to_string();
+
+    // ── 1. Create two sandboxes with distinct label values ───────────────
+    client
+        .create_sandbox(CreateSandboxRequest {
+            name: name_a.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: [(label_key.clone(), "labels-a".to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("create_sandbox(a) failed")?;
+
+    client
+        .create_sandbox(CreateSandboxRequest {
+            name: name_b.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: [(label_key.clone(), "labels-b".to_string())]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("create_sandbox(b) failed")?;
+
+    // ── 2. Filter by label — must return only sandbox A ──────────────────
+    let filtered = client
+        .list_sandboxes(ListSandboxesRequest {
+            label_selector: format!("{label_key}=labels-a"),
+            ..Default::default()
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("list_sandboxes with label_selector failed")?
+        .into_inner()
+        .sandboxes;
+
+    // ── 3. Cleanup ───────────────────────────────────────────────────────
+    let _ = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: name_a.clone(),
+        })
+        .await;
+    let _ = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: name_b.clone(),
+        })
+        .await;
+
+    // ── 4. Assert after cleanup so both sandboxes are always removed ──────
+    let found_a = filtered.iter().any(|s| s.object_name() == name_a);
+    let found_b = filtered.iter().any(|s| s.object_name() == name_b);
+
+    if !found_a {
+        return Err(miette::miette!(
+            "sandbox '{name_a}' not found in label-filtered list (selector: {label_key}=labels-a)"
+        ));
+    }
+    if found_b {
+        return Err(miette::miette!(
+            "sandbox '{name_b}' appeared in label-filtered list but should have been excluded \
+             (selector: {label_key}=labels-a)"
         ));
     }
 
