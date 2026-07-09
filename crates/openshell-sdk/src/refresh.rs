@@ -257,7 +257,10 @@ impl TokenSource {
                                 Ok(state.token.clone())
                             }
                         }
-                        Err(err) => Err(SdkError::from(err).to_string()),
+                        // Store the bare refresh-error text; the single
+                        // `SdkError::auth` wrap happens where the shared
+                        // result is awaited below, so it isn't double-wrapped.
+                        Err(err) => Err(err.to_string()),
                     };
                     // Clear this attempt's slot so the next caller starts a
                     // fresh refresh. Epoch-guarded so a newer attempt is never

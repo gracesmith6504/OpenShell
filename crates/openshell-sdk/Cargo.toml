@@ -20,12 +20,10 @@ miette = { workspace = true }
 oauth2 = "5"
 reqwest = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
-tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tower = { workspace = true }
@@ -33,6 +31,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { workspace = true }
 
 [lints]
 workspace = true

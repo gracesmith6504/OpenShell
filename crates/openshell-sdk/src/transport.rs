@@ -74,9 +74,7 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 /// Open a gRPC channel to the gateway described by `config`.
 ///
 /// Routing is determined by `gateway` scheme + `auth` variant +
-/// `insecure_skip_verify`. Reference today's CLI implementation in
-/// `openshell-cli/src/tls.rs::build_channel` (lines 219–308) for behavior
-/// the SDK needs to preserve.
+/// `insecure_skip_verify`.
 ///
 /// **Branch table:**
 ///
@@ -90,7 +88,6 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     let gateway = &config.gateway;
 
     // Branch 1 — plaintext.
-    // Reference: cli/tls.rs:220-228 (http:// branch).
     if gateway.starts_with("http://") {
         return standard_endpoint(gateway.clone())?
             .connect()
@@ -105,9 +102,6 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
     }
 
     // Branch 2 — Cloudflare Access edge JWT: tunnel proxy + plaintext-to-local.
-    // Reference: cli/tls.rs:233-249 (https:// + edge_token branch). Use
-    // `edge_tunnel_addr(gateway, token).await?` to get the local proxy
-    // address, then `standard_endpoint(format!("http://{local_addr}"))?.connect()`.
     if let Some(AuthConfig::EdgeJwt(token)) = &config.auth {
         let local_addr = edge_tunnel_addr(gateway, token).await?;
         return standard_endpoint(format!("http://{local_addr}"))?
@@ -116,11 +110,9 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
             .map_err(|e| SdkError::connect(format!("{e}")));
     }
 
-    // Branch 3 — insecure TLS (skip cert verification).
-    // Reference: cli/tls.rs:251-268 (gateway_insecure branch). Build the
-    // insecure rustls config, wrap it in `InsecureTlsConnector`, swap the
-    // gateway scheme to http:// (so tonic doesn't double-layer TLS), and
-    // call `endpoint.connect_with_connector(connector)`.
+    // Branch 3 — insecure TLS (skip cert verification): swap the scheme to
+    // http:// so tonic doesn't double-layer TLS, then connect through the
+    // insecure rustls connector.
     if config.insecure_skip_verify {
         tracing::warn!("TLS certificate verification is disabled — do not use in production");
         let rustls_config = build_insecure_rustls_config()?;
@@ -133,15 +125,10 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
             .map_err(|e| SdkError::connect(format!("{e}")));
     }
 
-    // Branch 4 — anonymous TLS or OIDC bearer over HTTPS.
-    // Reference: cli/tls.rs:270-307 (the `oidc_token` and final mTLS
-    // branches collapsed). Build a `ClientTlsConfig`:
-    //   - if `config.ca_cert` is `Some(pem)`, pin it via `.ca_certificate(...)`
-    //   - else fall back to `.with_enabled_roots()` (system roots)
-    // Then `endpoint.tls_config(tls_config)?.connect()`.
-    //
-    // The OIDC bearer header is added by the gRPC interceptor at request
-    // time, not here — `build_channel` only owns the TLS layer.
+    // Branch 4 — anonymous TLS or OIDC bearer over HTTPS: pin `ca_cert` when
+    // supplied, otherwise fall back to system roots. The OIDC bearer header
+    // is added by the gRPC interceptor at request time, not here —
+    // `build_channel` only owns the TLS layer.
 
     let tls_config = config.ca_cert.as_ref().map_or_else(
         || ClientTlsConfig::new().with_enabled_roots(),

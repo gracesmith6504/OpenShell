@@ -271,25 +271,16 @@ impl OpenShellClient {
             rows: 0,
         };
 
-        // Proactively refresh, then open the stream. On `Unauthenticated` at
-        // open time, force-refresh and retry once; mid-stream rotation is out
-        // of scope (streaming retry is tracked separately).
-        self.ensure_fresh().await?;
-        let mut stream = match self.raw_grpc().exec_sandbox(request.clone()).await {
-            Ok(resp) => resp.into_inner(),
-            Err(status) if status.code() == tonic::Code::Unauthenticated => {
-                if self.refresh_on_unauthorized().await? {
-                    self.raw_grpc()
-                        .exec_sandbox(request)
-                        .await
-                        .map_err(map_status)?
-                        .into_inner()
-                } else {
-                    return Err(map_status(status));
-                }
-            }
-            Err(status) => return Err(map_status(status)),
-        };
+        // Open the stream under the same OIDC-aware auth policy as unary RPCs
+        // (proactive refresh, then one reactive retry on `Unauthenticated`).
+        // Mid-stream rotation is out of scope; streaming retry is tracked
+        // separately.
+        let mut stream = self
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.exec_sandbox(request).await }
+            })
+            .await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -349,8 +340,20 @@ impl OpenShellClient {
     /// bearer slot. Tokens with no advertised expiry are left untouched.
     async fn ensure_fresh(&self) -> Result<()> {
         if let (Some(source), Some(slot)) = (&self.token_source, &self.bearer_slot) {
-            let token = source.current().await?;
-            store_bearer(slot, &token)?;
+            // Proactive refresh is best-effort: on a transient failure (e.g. an
+            // IdP blip) the token already in the slot may still be valid, so
+            // fall through and let the request proceed. A genuinely
+            // expired/rejected token surfaces as `Unauthenticated`, which
+            // drives the reactive refresh in `refresh_on_unauthorized`.
+            match source.current().await {
+                Ok(token) => store_bearer(slot, &token)?,
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        "proactive token refresh failed; using existing token"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -515,10 +518,23 @@ mod tests {
         }
     }
 
+    struct FailingRefresher;
+
+    #[async_trait::async_trait]
+    impl Refresh for FailingRefresher {
+        async fn refresh(&self) -> std::result::Result<RefreshedToken, RefreshError> {
+            Err(RefreshError::Transient("idp blip".into()))
+        }
+    }
+
     /// Build an OIDC client wired to a refresher, with a near-expiry initial
     /// token, over a lazy channel that never actually connects (no RPC is
     /// issued in these tests).
     fn oidc_client_with_refresher(calls: Arc<AtomicUsize>) -> OpenShellClient {
+        oidc_client_with(Arc::new(StubRefresher { calls }))
+    }
+
+    fn oidc_client_with(refresher: Arc<dyn Refresh>) -> OpenShellClient {
         let interceptor = EdgeAuthInterceptor::new(Some("initial"), None).unwrap();
         let bearer_slot = interceptor.bearer_slot();
         let near = SystemTime::now()
@@ -528,7 +544,7 @@ mod tests {
             + 5;
         let source = TokenSource::new(
             RefreshedToken::new("initial").with_expires_at(near),
-            Arc::new(StubRefresher { calls }),
+            refresher,
         );
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         OpenShellClient {
@@ -579,6 +595,24 @@ mod tests {
             slot_token(client.bearer_slot.as_ref().unwrap()),
             "Bearer token-1",
             "refreshed token must reach the live slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_tolerates_proactive_refresh_failure() {
+        // A transient proactive-refresh failure must not fail the request: the
+        // near-expiry token in the slot may still be valid, so `ensure_fresh`
+        // falls through and leaves the existing token in place for the
+        // reactive `Unauthenticated` path to handle if the server rejects it.
+        let client = oidc_client_with(Arc::new(FailingRefresher));
+        client
+            .ensure_fresh()
+            .await
+            .expect("proactive refresh failure must be non-fatal");
+        assert_eq!(
+            slot_token(client.bearer_slot.as_ref().unwrap()),
+            "Bearer initial",
+            "existing token must remain in the slot"
         );
     }
 

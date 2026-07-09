@@ -3857,7 +3857,6 @@ dependencies = [
  "openshell-core",
  "reqwest 0.12.28",
  "rustls",
- "rustls-pemfile",
  "serde",
  "thiserror 2.0.18",
  "tokio",

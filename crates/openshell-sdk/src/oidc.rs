@@ -162,7 +162,7 @@ fn output_from_oauth2_response(resp: &oauth2::basic::BasicTokenResponse) -> Refr
     RefreshTokenOutput {
         access_token: resp.access_token().secret().clone(),
         refresh_token: resp.refresh_token().map(|rt| rt.secret().clone()),
-        expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
+        expires_at: resp.expires_in().map(|ei| now.saturating_add(ei.as_secs())),
     }
 }
 

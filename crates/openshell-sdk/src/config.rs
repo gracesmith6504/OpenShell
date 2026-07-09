@@ -18,9 +18,8 @@ use std::sync::Arc;
 /// connects directly over HTTPS and adds an `authorization: Bearer ...`
 /// header.
 //
-// `#[non_exhaustive]` keeps phase 2 additive: when we promote `Oidc(String)`
-// to `Oidc { token, refresh: Option<Arc<dyn Refresh>> }` or add a third
-// variant, downstream `match` arms aren't forced to break.
+// `#[non_exhaustive]` keeps future additions non-breaking: adding a third
+// auth variant won't force downstream `match` arms to break.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum AuthConfig {
