@@ -18,6 +18,69 @@ pub enum MiddlewareApplyResult {
     Denied(String),
 }
 
+/// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
+/// protocols without an L7 relay) must be handled for a matching chain.
+///
+/// This is derived from each entry's `on_error` today. A future per-config
+/// `on_uninspectable` knob could let an operator keep `fail_closed` error
+/// handling for HTTP traffic while allowing uninspectable protocols through
+/// without maintaining host excludes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninspectableTrafficGate {
+    /// No middleware matches this destination; raw relay is unaffected.
+    Unrestricted,
+    /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
+    /// detection finding.
+    BypassWithFinding,
+    /// At least one matching entry is `fail_closed`: deny, the middleware
+    /// must be able to see the traffic for it to flow.
+    Deny,
+}
+
+pub fn uninspectable_traffic_gate(
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+) -> UninspectableTrafficGate {
+    if chain.is_empty() {
+        return UninspectableTrafficGate::Unrestricted;
+    }
+    if chain
+        .iter()
+        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
+    {
+        UninspectableTrafficGate::BypassWithFinding
+    } else {
+        UninspectableTrafficGate::Deny
+    }
+}
+
+/// Emit the detection finding for traffic a matching middleware chain cannot
+/// inspect: denied under a fail-closed chain, bypassed under fail-open.
+pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: bool) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(if denied {
+            SeverityId::High
+        } else {
+            SeverityId::Medium
+        })
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.traffic_uninspectable",
+            "Supervisor middleware cannot inspect this traffic",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("protocol", detail),
+            ("disposition", if denied { "denied" } else { "fail_open" }),
+        ])
+        .message(if denied {
+            "Uninspectable traffic to host with required middleware; denied"
+        } else {
+            "Uninspectable traffic bypassed middleware (fail_open)"
+        })
+        .build();
+    ocsf_emit!(event);
+}
+
 /// Largest body-buffering limit across the entries that actually resolved to a
 /// registered binding. Buffering for the most capable stage lets every stage
 /// that can handle the body run; stages whose own limit is smaller are failed
@@ -44,11 +107,22 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
+    validator: Option<&openshell_supervisor_middleware::TransformedBodyValidator<'_>>,
 ) -> Result<MiddlewareApplyResult> {
-    apply_middleware_chain_for_scheme(req, client, ctx, "https", chain, runner, generation_guard)
-        .await
+    apply_middleware_chain_for_scheme(
+        req,
+        client,
+        ctx,
+        "https",
+        chain,
+        runner,
+        generation_guard,
+        validator,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
@@ -57,6 +131,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
+    validator: Option<&openshell_supervisor_middleware::TransformedBodyValidator<'_>>,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
@@ -93,7 +168,12 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
-    let outcome = runner.evaluate_described(&chain, input).await?;
+    // The chain re-checks the body against sandbox policy after every
+    // transforming stage via `validator`, so an ALLOW outcome here already
+    // means the final body is policy-compliant.
+    let outcome = runner
+        .evaluate_described_with_validator(&chain, input, validator)
+        .await?;
     emit_middleware_events(ctx, &req, &outcome);
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
         &req,
@@ -222,7 +302,7 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-pub(super) fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
+pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
     crate::opa::NetworkInput {
         host: ctx.host.clone(),
         port: ctx.port,

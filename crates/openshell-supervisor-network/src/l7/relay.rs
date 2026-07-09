@@ -8,7 +8,8 @@
 //! and either forwards or denies the request.
 
 use crate::l7::middleware::{
-    MiddlewareApplyResult, apply_middleware_chain, middleware_network_input,
+    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain,
+    emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
 };
 #[cfg(test)]
 use crate::l7::middleware::{
@@ -211,6 +212,20 @@ where
         L7Protocol::Sql => {
             if close_if_stale(engine.generation_guard(), ctx) {
                 return Ok(());
+            }
+            // The SQL relay is not implemented, so a matching middleware
+            // chain can never inspect this stream: gate it like any other
+            // uninspectable protocol.
+            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            match uninspectable_traffic_gate(&chain) {
+                UninspectableTrafficGate::Deny => {
+                    emit_middleware_uninspectable(ctx, "sql passthrough", true);
+                    return Ok(());
+                }
+                UninspectableTrafficGate::BypassWithFinding => {
+                    emit_middleware_uninspectable(ctx, "sql passthrough", false);
+                }
+                UninspectableTrafficGate::Unrestricted => {}
             }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {
@@ -461,6 +476,11 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            // Route selection resolved `config` per request, so re-check the
+            // body against that protocol's policy after every transforming
+            // stage (a no-op for REST and websocket, whose policy inputs the
+            // chain cannot mutate).
+            let validate = transformed_body_validator(config, &engine, ctx, &request_info);
             let req = match apply_middleware_chain(
                 req,
                 client,
@@ -468,10 +488,11 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
+                Some(&validate),
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
                     crate::l7::rest::RestProvider::default()
                         .deny_with_redacted_target(
@@ -950,6 +971,9 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            // REST and websocket-upgrade policy evaluates only the method,
+            // path, and query, which a middleware result cannot mutate, so no
+            // per-stage body re-check is needed.
             let req = match apply_middleware_chain(
                 req,
                 client,
@@ -957,10 +981,11 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
+                None,
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
                     provider
                         .deny_with_redacted_target(
@@ -1225,6 +1250,11 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            // Policy admitted the original body above; re-check the body
+            // against the same body-aware policy after every transforming
+            // stage so a middleware cannot smuggle a denied operation to the
+            // upstream or the next stage.
+            let validate = transformed_body_validator(config, engine, ctx, &request_info);
             let req = match apply_middleware_chain(
                 req,
                 client,
@@ -1232,10 +1262,11 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
+                Some(&validate),
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
                     crate::l7::rest::RestProvider::default()
                         .deny_with_redacted_target(
@@ -1455,6 +1486,11 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            // Policy admitted the original body above; re-check the body
+            // against the same body-aware policy after every transforming
+            // stage so a middleware cannot smuggle a denied operation to the
+            // upstream or the next stage.
+            let validate = transformed_body_validator(config, engine, ctx, &request_info);
             let req = match apply_middleware_chain(
                 req,
                 client,
@@ -1462,10 +1498,11 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
+                Some(&validate),
             )
             .await?
             {
-                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
                     crate::l7::rest::RestProvider::default()
                         .deny_with_redacted_target(
@@ -1746,6 +1783,143 @@ fn jsonrpc_request_for_call(
     item_request
 }
 
+/// Re-evaluate body-aware policy against a middleware-transformed body. Policy
+/// admits the original body before the chain runs, so each replaced body must
+/// be checked again before the next stage or the upstream sees it: a
+/// transformation cannot smuggle a denied or unparseable operation past the
+/// policy. Returns the deny reason, or `None` when the transformed body is
+/// admissible. An unparseable replacement or a response frame denies even
+/// under audit, mirroring `force_deny` for the original body; a policy deny
+/// respects the endpoint's enforcement mode. Method, path, and query come from
+/// `request_info` because a middleware result cannot mutate them.
+///
+/// The match is exhaustive over `L7Protocol` on purpose: adding a protocol
+/// does not compile until its transformed-body re-evaluation is defined here,
+/// either by re-deriving the body-dependent policy inputs or by documenting
+/// why none exist. Build the per-request validator with
+/// [`transformed_body_validator`].
+fn reevaluate_transformed_body(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request_info: &L7RequestInfo,
+    body: &[u8],
+) -> Result<Option<String>> {
+    let (engine_type, transformed_info, hard_deny_reason) = match config.protocol {
+        // REST and websocket-upgrade policy evaluates only the method, path,
+        // and query, which a middleware result cannot mutate; the body is not
+        // a policy input. SQL has no body-aware L7 policy either; the
+        // uninspectable-traffic gate keeps required middleware ahead of the
+        // unimplemented SQL relay.
+        L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => return Ok(None),
+        L7Protocol::JsonRpc | L7Protocol::Mcp => {
+            let info = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+                body,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+            );
+            let hard_deny_reason = info
+                .error
+                .as_deref()
+                .map(|error| format!("JSON-RPC request rejected: {error}"))
+                .or_else(|| jsonrpc_response_frame_hard_deny_reason(config.protocol, &info));
+            let mut transformed_info = request_info.clone();
+            transformed_info.jsonrpc = Some(info);
+            (
+                jsonrpc_engine_type(config.protocol),
+                transformed_info,
+                hard_deny_reason,
+            )
+        }
+        L7Protocol::Graphql => {
+            // GraphQL classification needs the request method and query
+            // params; only the body was replaced, so rebuild from
+            // `request_info` and the new body.
+            let request = crate::l7::provider::L7Request {
+                action: request_info.action.clone(),
+                target: request_info.target.clone(),
+                query_params: request_info.query_params.clone(),
+                raw_header: Vec::new(),
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            let info = crate::l7::graphql::classify_request(&request, body);
+            let hard_deny_reason = info
+                .error
+                .as_deref()
+                .map(|error| format!("GraphQL request rejected: {error}"));
+            let mut transformed_info = request_info.clone();
+            transformed_info.graphql = Some(info);
+            ("l7-graphql", transformed_info, hard_deny_reason)
+        }
+    };
+
+    if let Some(reason) = hard_deny_reason {
+        let reason = format!("middleware transformation rejected: {reason}");
+        emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+        return Ok(Some(reason));
+    }
+
+    let (allowed, reason) = evaluate_l7_request(engine, ctx, &transformed_info)?;
+    if allowed {
+        return Ok(None);
+    }
+    let reason = format!("middleware transformation denied by policy: {reason}");
+    if config.enforcement == EnforcementMode::Audit {
+        emit_transformed_body_decision(ctx, request_info, engine_type, "audit", &reason);
+        return Ok(None);
+    }
+    emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+    Ok(Some(reason))
+}
+
+/// Build the per-stage transformed-body validator the middleware chain calls
+/// after every stage that replaces the body. Borrows the policy inputs, so it
+/// lives only as long as this request's evaluation.
+pub(crate) fn transformed_body_validator<'a>(
+    config: &'a L7EndpointConfig,
+    engine: &'a TunnelPolicyEngine,
+    ctx: &'a L7EvalContext,
+    request_info: &'a L7RequestInfo,
+) -> impl Fn(&[u8]) -> Result<Option<String>> + Send + Sync + 'a {
+    move |body: &[u8]| reevaluate_transformed_body(config, engine, ctx, request_info, body)
+}
+
+/// Log the post-transformation policy decision as an OCSF HTTP Activity
+/// event, mirroring the pre-middleware decision logs. `request_info.target`
+/// is already redacted by the callers.
+fn emit_transformed_body_decision(
+    ctx: &L7EvalContext,
+    request_info: &L7RequestInfo,
+    engine_type: &str,
+    decision_str: &str,
+    reason: &str,
+) {
+    let (action_id, disposition_id, severity) = match decision_str {
+        "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+        _ => (
+            ActionId::Allowed,
+            DispositionId::Allowed,
+            SeverityId::Informational,
+        ),
+    };
+    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(action_id)
+        .disposition(disposition_id)
+        .severity(severity)
+        .http_request(HttpRequest::new(
+            &request_info.action,
+            OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, engine_type)
+        .message(format!(
+            "L7_REQUEST_TRANSFORMED {decision_str} {} {}:{}{} reason={}",
+            request_info.action, ctx.host, ctx.port, request_info.target, reason
+        ))
+        .build();
+    ocsf_emit!(event);
+}
+
 fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -1918,9 +2092,12 @@ where
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;
-            match apply_middleware_chain(req, client, ctx, chain, &runner, generation_guard).await?
+            // The passthrough path enforces no L7 policy, so there is no
+            // body-aware decision to re-check after a transformation.
+            match apply_middleware_chain(req, client, ctx, chain, &runner, generation_guard, None)
+                .await?
             {
-                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
                     crate::l7::rest::RestProvider::default()
                         .deny_with_redacted_target(
@@ -2998,6 +3175,510 @@ network_policies:
         assert_eq!(middleware_chain_body_limit(&none), None);
     }
 
+    /// A middleware service whose single binding replaces every request body
+    /// with a fixed payload, for exercising post-transformation policy
+    /// re-evaluation.
+    struct BodyReplacingService {
+        replacement: &'static [u8],
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
+        for BodyReplacingService
+    {
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/rewriter".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        id: "example/rewriter".into(),
+                        operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
+                            as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        max_body_bytes: 8192,
+                    }],
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::HttpRequestResult {
+                    decision: openshell_core::proto::Decision::Allow as i32,
+                    body: self.replacement.to_vec(),
+                    has_body: true,
+                    ..Default::default()
+                },
+            ))
+        }
+    }
+
+    fn jsonrpc_transforming_relay_parts(
+        enforcement: &str,
+        replacement: &'static [u8],
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_middlewares:
+  - name: rewriter
+    middleware: example/rewriter
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  jsonrpc_api:
+    name: jsonrpc_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        protocol: json-rpc
+        enforcement: {enforcement}
+        rules:
+          - allow:
+              method: reports.list
+    binaries:
+      - {{ path: /usr/bin/node }}
+"#
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(
+            Arc::new(BodyReplacingService { replacement }),
+        ));
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("json-rpc config"))
+            .expect("parse JSON-RPC config");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "jsonrpc_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
+    async fn run_jsonrpc_transform_case(
+        enforcement: &str,
+        replacement: &'static [u8],
+    ) -> (String, Option<String>) {
+        let (config, tunnel_engine, ctx) =
+            jsonrpc_transforming_relay_parts(enforcement, replacement);
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_jsonrpc(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"reports.list"}"#;
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        // Give the relay a moment to either deny (client sees a response) or
+        // forward (upstream sees the request).
+        let mut upstream_request = [0u8; 1024];
+        let upstream_read = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        let upstream_seen = match upstream_read {
+            Ok(Ok(n)) if n > 0 => {
+                let seen = String::from_utf8_lossy(&upstream_request[..n]).to_string();
+                upstream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                Some(seen)
+            }
+            _ => None,
+        };
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client should receive a response")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]).to_string();
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+        (response, upstream_seen)
+    }
+
+    #[tokio::test]
+    async fn transformed_jsonrpc_body_is_reevaluated_and_denied() {
+        // Policy allows reports.list; the middleware replaces the body with a
+        // method the policy denies. The transformed body must be re-evaluated
+        // and the request denied before anything reaches the upstream.
+        let (response, upstream_seen) = run_jsonrpc_transform_case(
+            "enforce",
+            br#"{"jsonrpc":"2.0","id":1,"method":"admin.delete"}"#,
+        )
+        .await;
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("middleware transformation denied by policy"),
+            "{response}"
+        );
+        assert!(upstream_seen.is_none(), "upstream must not see the request");
+    }
+
+    #[tokio::test]
+    async fn transformed_jsonrpc_body_policy_deny_forwards_under_audit() {
+        // Under enforcement: audit a policy deny of the transformed body is
+        // logged but forwarded, mirroring audit semantics for original
+        // bodies.
+        let (response, upstream_seen) = run_jsonrpc_transform_case(
+            "audit",
+            br#"{"jsonrpc":"2.0","id":1,"method":"admin.delete"}"#,
+        )
+        .await;
+        assert!(response.contains("204 No Content"), "{response}");
+        let upstream_seen = upstream_seen.expect("audited request reaches upstream");
+        assert!(upstream_seen.contains("admin.delete"), "{upstream_seen}");
+    }
+
+    #[tokio::test]
+    async fn unparseable_transformation_denies_even_under_audit() {
+        // An unparseable replacement mirrors force_deny for original parse
+        // errors: denied even on an audit endpoint.
+        let (response, upstream_seen) = run_jsonrpc_transform_case("audit", b"not json").await;
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("middleware transformation rejected"),
+            "{response}"
+        );
+        assert!(upstream_seen.is_none(), "upstream must not see the request");
+    }
+
+    #[tokio::test]
+    async fn transformed_graphql_body_is_reevaluated_and_denied() {
+        // GraphQL counterpart: policy allows query { viewer }; the middleware
+        // rewrites the body into a denied mutation.
+        let data = r#"
+network_middlewares:
+  - name: rewriter
+    middleware: example/rewriter
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  graphql_api:
+    name: graphql_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer]
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(
+            Arc::new(BodyReplacingService {
+                replacement: br#"{"query":"mutation { deleteRepository }"}"#,
+            }),
+        ));
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("graphql config"))
+            .expect("parse GraphQL config");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "graphql_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_graphql(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"query":"query { viewer }"}"#;
+        let request = format!(
+            "POST /graphql HTTP/1.1\r\nHost: api.example.test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("middleware transformation denied by policy"),
+            "{response}"
+        );
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    fn sql_middleware_relay_context(
+        on_error: &str,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_middlewares:
+  - name: guard
+    middleware: example/unavailable
+    on_error: {on_error}
+    endpoints:
+      include: ["db.example.test"]
+network_policies:
+  sql_db:
+    name: sql_db
+    endpoints:
+      - host: db.example.test
+        port: 5432
+        protocol: sql
+        enforcement: audit
+        rules:
+          - allow:
+              command: SELECT
+    binaries:
+      - {{ path: /usr/bin/psql }}
+"#
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        let input = NetworkInput {
+            host: "db.example.test".into(),
+            port: 5432,
+            binary_path: PathBuf::from("/usr/bin/psql"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("sql config"))
+            .expect("parse SQL config");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "db.example.test".into(),
+            port: 5432,
+            policy_name: "sql_db".into(),
+            binary_path: "/usr/bin/psql".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
+    #[tokio::test]
+    async fn sql_passthrough_denies_with_fail_closed_middleware() {
+        // The SQL relay is unimplemented, so a fail-closed chain can never
+        // inspect the stream: the connection must be closed instead of
+        // silently bypassing the middleware.
+        let (config, tunnel_engine, ctx) = sql_middleware_relay_context("fail_closed");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")
+            .await
+            .ok();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should close the connection")
+            .unwrap()
+            .unwrap();
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive SQL bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_passthrough_relays_with_fail_open_middleware() {
+        // An all-fail-open chain accepts the bypass (with a detection
+        // finding) and the raw stream flows.
+        let (config, tunnel_engine, ctx) = sql_middleware_relay_context("fail_open");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let _relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")
+            .await
+            .unwrap();
+
+        let mut upstream_bytes = [0u8; 16];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await
+        .expect("fail-open chain must relay SQL bytes")
+        .unwrap();
+        assert_eq!(&upstream_bytes[..n], b"\x00\x00\x00\x08\x04\xd2\x16\x2f");
+    }
+
+    #[test]
+    fn uninspectable_gate_reflects_chain_on_error() {
+        use openshell_supervisor_middleware::{ChainEntry, OnError};
+
+        let entry = |on_error| ChainEntry {
+            name: "m".into(),
+            implementation: "example/guard".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error,
+        };
+
+        assert_eq!(
+            uninspectable_traffic_gate(&[]),
+            UninspectableTrafficGate::Unrestricted
+        );
+        assert_eq!(
+            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailOpen)]),
+            UninspectableTrafficGate::BypassWithFinding
+        );
+        assert_eq!(
+            uninspectable_traffic_gate(&[entry(OnError::FailOpen), entry(OnError::FailClosed)]),
+            UninspectableTrafficGate::Deny
+        );
+    }
+
     /// A middleware service advertising two bindings with different body
     /// limits, for exercising mixed-limit chain buffering at the relay level.
     /// The redactor binding replaces the body; the guard binding allows as-is.
@@ -3120,6 +3801,7 @@ network_policies:
             chain,
             &runner,
             tunnel_engine.generation_guard(),
+            None,
         )
         .await
         .expect("apply middleware chain");

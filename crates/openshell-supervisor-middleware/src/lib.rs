@@ -106,6 +106,14 @@ impl DescribedChainEntry {
     }
 }
 
+/// Re-checks a middleware-transformed request body against sandbox policy.
+///
+/// Returns `Some(reason)` to deny the chain, `None` to proceed. Invoked after
+/// each stage that replaces the body so neither a later stage nor the upstream
+/// sees a payload the policy would reject. Protocols with no body-aware policy
+/// pass `None` for the validator instead.
+pub type TransformedBodyValidator<'a> = dyn Fn(&[u8]) -> Result<Option<String>> + Send + Sync + 'a;
+
 #[derive(Debug, Clone)]
 pub struct HttpRequestInput {
     pub request_id: String,
@@ -617,6 +625,23 @@ impl ChainRunner {
         entries: &[DescribedChainEntry],
         input: HttpRequestInput,
     ) -> Result<ChainOutcome> {
+        self.evaluate_described_with_validator(entries, input, None)
+            .await
+    }
+
+    /// Evaluate a described chain, re-checking the request body against sandbox
+    /// policy after every stage that replaces it. Policy runs on the original
+    /// body before the chain, so without this a stage could hand the next stage
+    /// (or the upstream) a payload the policy rejects. When `validator` returns
+    /// a deny reason the chain stops with that reason, so no later stage ever
+    /// sees a non-compliant body. `None` skips re-checks for protocols with no
+    /// body-aware policy.
+    pub async fn evaluate_described_with_validator(
+        &self,
+        entries: &[DescribedChainEntry],
+        input: HttpRequestInput,
+        validator: Option<&TransformedBodyValidator<'_>>,
+    ) -> Result<ChainOutcome> {
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
         let mut added_headers = BTreeMap::new();
@@ -800,6 +825,25 @@ impl ChainRunner {
                 transformed,
                 failed: false,
             });
+
+            // The stage ran successfully but its output must still satisfy the
+            // sandbox policy the original body was admitted under. Re-check now,
+            // before the next stage or the upstream sees the replaced body. A
+            // policy deny here is a hard deny, independent of `on_error`.
+            if transformed
+                && let Some(validate) = validator
+                && let Some(reason) = validate(&body)?
+            {
+                return Ok(ChainOutcome {
+                    allowed: false,
+                    reason,
+                    body,
+                    added_headers,
+                    findings,
+                    metadata,
+                    applied,
+                });
+            }
         }
 
         Ok(ChainOutcome {
@@ -1172,6 +1216,159 @@ mod tests {
         > {
             Ok(tonic::Response::new(self.result.clone()))
         }
+    }
+
+    /// A two-binding service for exercising per-stage validation: `test/transform`
+    /// replaces the body, `test/second` records that it ran and allows.
+    struct TwoStageService {
+        second_ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for TwoStageService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            let binding = |id: &str| MiddlewareBinding {
+                id: id.into(),
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_body_bytes: 256 * 1024,
+            };
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/two-stage".into(),
+                service_version: "test".into(),
+                bindings: vec![binding("test/transform"), binding("test/second")],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            let evaluation = request.into_inner();
+            let mut result = allow_result();
+            if evaluation.binding_id == "test/transform" {
+                result.body = b"TRANSFORMED".to_vec();
+                result.has_body = true;
+            } else {
+                self.second_ran
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(tonic::Response::new(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn per_stage_validation_denies_before_the_next_stage_runs() {
+        // The validator rejects the first stage's transformed body. The chain
+        // must stop there: the second stage never runs, so it never sees a
+        // payload the policy would reject.
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+            second_ran: Arc::clone(&second_ran),
+        });
+        let runner = ChainRunner::new(service);
+        let transform = ChainEntry {
+            name: "transform".into(),
+            implementation: "test/transform".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let second = ChainEntry {
+            name: "second".into(),
+            implementation: "test/second".into(),
+            order: 10,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let described = runner
+            .describe_chain(&[transform, second])
+            .await
+            .expect("describe two-stage chain");
+
+        let validator: Box<TransformedBodyValidator<'_>> = Box::new(|body: &[u8]| {
+            if body == b"TRANSFORMED" {
+                Ok(Some("transformed body denied by policy".to_string()))
+            } else {
+                Ok(None)
+            }
+        });
+        let outcome = runner
+            .evaluate_described_with_validator(&described, input("original"), Some(&*validator))
+            .await
+            .expect("evaluate two-stage chain");
+
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "transformed body denied by policy");
+        assert_eq!(outcome.applied.len(), 1, "only the first stage should run");
+        assert_eq!(outcome.applied[0].name, "transform");
+        assert!(
+            !second_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "second stage must not run after a policy deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_stage_validator_allows_compliant_transformations() {
+        // A validator that accepts every body lets both stages run; the second
+        // stage sees the first stage's output.
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+            second_ran: Arc::clone(&second_ran),
+        });
+        let runner = ChainRunner::new(service);
+        let transform = ChainEntry {
+            name: "transform".into(),
+            implementation: "test/transform".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let second = ChainEntry {
+            name: "second".into(),
+            implementation: "test/second".into(),
+            order: 10,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let described = runner
+            .describe_chain(&[transform, second])
+            .await
+            .expect("describe two-stage chain");
+
+        let validator: Box<TransformedBodyValidator<'_>> = Box::new(|_body: &[u8]| Ok(None));
+        let outcome = runner
+            .evaluate_described_with_validator(&described, input("original"), Some(&*validator))
+            .await
+            .expect("evaluate two-stage chain");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), 2);
+        assert!(
+            second_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "second stage should run when the transformation is compliant"
+        );
     }
 
     fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {

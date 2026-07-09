@@ -19,7 +19,10 @@ For each inspected HTTP request, the supervisor:
 2. Selects middleware whose host selectors match the admitted destination.
 3. Buffers the request body using the largest body limit in the selected chain.
 4. Runs matching middleware by ascending `order`, using the policy-local name to break ties.
-5. Applies allowed transformations, injects provider credentials, and forwards the request.
+5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
+6. Applies allowed transformations, injects provider credentials, and forwards the request.
+
+Because each transformed body is re-checked before the next stage runs, a middleware hook always receives a request that satisfies the sandbox policy. A stage whose output the policy rejects stops the chain; under `enforcement: audit` the rejection is logged and the request proceeds.
 
 Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Request headers are delivered in wire order and repeated header names are preserved as separate entries, so a service inspects every value the upstream will receive.
 
@@ -139,7 +142,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 
 ## Current Limitations
 
-- Middleware applies only to HTTP requests parsed by the supervisor.
+- Middleware applies only to HTTP requests parsed by the supervisor. Traffic the supervisor cannot inspect, such as HTTP/2 prior knowledge or non-HTTP TCP protocols, is denied on hosts matched by a fail-closed middleware, and relayed with a detection finding when every matching middleware is `fail_open`.
 - The typed operation and phase are `HTTP_REQUEST/PRE_CREDENTIALS`.
 - Selection uses destination host include and exclude patterns.
 - Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.

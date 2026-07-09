@@ -440,6 +440,17 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))
     }
 
+    /// Test-only: swap the middleware runner without a connected registry, so
+    /// relay tests can inject scripted middleware services. Does not bump the
+    /// policy generation; call before capturing tunnel engines.
+    #[cfg(test)]
+    pub(crate) fn set_middleware_runner_for_tests(&self, runner: ChainRunner) {
+        *self
+            .middleware_runner
+            .write()
+            .expect("middleware runner lock") = runner;
+    }
+
     /// Return a guard for a previously captured policy generation.
     pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
         let generation = self.current_generation();
