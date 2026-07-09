@@ -160,7 +160,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto) =
+    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) =
         if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
             load_policy_from_sidecar_bootstrap(bootstrap)?
         } else {
@@ -534,6 +534,7 @@ pub async fn run_sandbox(
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
             opa_engine: poll_engine,
+            loaded_policy_origin,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
@@ -744,18 +745,26 @@ fn sidecar_control_socket() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-fn load_policy_from_sidecar_bootstrap(
-    bootstrap: &sidecar_control::BootstrapData,
-) -> Result<(
+type LoadedPolicyBundle = (
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
-)> {
+    LoadedPolicyOrigin,
+);
+
+fn load_policy_from_sidecar_bootstrap(
+    bootstrap: &sidecar_control::BootstrapData,
+) -> Result<LoadedPolicyBundle> {
     let proto = bootstrap.policy_proto.clone();
     let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto)?));
     let policy = SandboxPolicy::try_from(proto.clone())?;
     info!("Loaded sidecar policy from control socket bootstrap");
-    Ok((policy, opa_engine, Some(proto)))
+    Ok((
+        policy,
+        opa_engine,
+        Some(proto),
+        LoadedPolicyOrigin::Gateway { revision: None },
+    ))
 }
 
 fn spawn_sidecar_control_update_watcher(
@@ -1701,11 +1710,7 @@ async fn load_policy(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-) -> Result<(
-    SandboxPolicy,
-    Option<Arc<OpaEngine>>,
-    Option<openshell_core::proto::SandboxPolicy>,
-)> {
+) -> Result<LoadedPolicyBundle> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -1734,7 +1739,12 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None));
+        return Ok((
+            policy,
+            Some(Arc::new(engine)),
+            None,
+            LoadedPolicyOrigin::LocalOverride,
+        ));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1744,12 +1754,12 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_retry("Policy fetch", || {
-            openshell_core::grpc_client::fetch_policy(endpoint, id)
+        let mut snapshot = grpc_retry("Policy fetch", || {
+            openshell_core::grpc_client::fetch_settings_snapshot(endpoint, id)
         })
         .await?;
 
-        let mut proto_policy = if let Some(p) = proto_policy {
+        let mut proto_policy = if let Some(p) = snapshot.policy.clone() {
             p
         } else {
             // No policy configured on the server. Discover from disk or
@@ -1777,32 +1787,67 @@ async fn load_policy(
 
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
-            grpc_retry("Policy discovery sync", || {
-                openshell_core::grpc_client::discover_and_sync_policy(
+            snapshot = grpc_retry("Policy discovery sync", || {
+                openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
                     id,
                     sandbox,
                     &discovered,
                 )
             })
-            .await?
+            .await?;
+            snapshot.policy.clone().ok_or_else(|| {
+                miette::miette!("Server still returned no policy after sync — this is a bug")
+            })?
         };
+
+        // True only while `snapshot` describes the exact policy that will be
+        // constructed below. If enrichment cannot be synced and re-fetched,
+        // the policy remains enforceable but cannot be acknowledged by
+        // inferred structural equality.
+        let mut policy_bound_to_snapshot = true;
 
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
         let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
-        if let Some(sync_policy) = sync_policy
-            && let Some(sandbox_name) = sandbox.as_deref()
-            && let Err(e) =
-                openshell_core::grpc_client::sync_policy(endpoint, sandbox_name, &sync_policy).await
-        {
-            warn!(
-                error = %e,
-                "Failed to sync enriched policy back to gateway (non-fatal)"
-            );
+        if let Some(sync_policy) = sync_policy {
+            if let Some(sandbox_name) = sandbox.as_deref() {
+                match openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+                    endpoint,
+                    id,
+                    sandbox_name,
+                    &sync_policy,
+                )
+                .await
+                {
+                    Ok(canonical) => {
+                        if let Some(policy) = canonical.policy.clone() {
+                            proto_policy = policy;
+                            snapshot = canonical;
+                        } else {
+                            policy_bound_to_snapshot = false;
+                            warn!(
+                                "Gateway returned no policy after enrichment sync; initial revision will be reconciled"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        policy_bound_to_snapshot = false;
+                        warn!(
+                            error = %e,
+                            "Failed to sync enriched policy back to gateway; initial revision will be reconciled"
+                        );
+                    }
+                }
+            } else {
+                policy_bound_to_snapshot = false;
+            }
         }
+
+        let loaded_policy_revision =
+            policy_bound_to_snapshot.then(|| LoadedPolicyRevision::from_snapshot(&snapshot));
 
         // Build OPA engine from baked-in rules + typed proto data.
         // In cluster mode, proxy networking is always enabled so OPA is
@@ -1811,10 +1856,31 @@ async fn load_policy(
         // container hasn't started yet. After the entrypoint spawns, the
         // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
-        let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
+        let opa_engine = match OpaEngine::from_proto(&proto_policy) {
+            Ok(engine) => Some(Arc::new(engine)),
+            Err(e) => {
+                report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
+                    .await;
+                return Err(e);
+            }
+        };
 
-        let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy)));
+        let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
+            Ok(policy) => policy,
+            Err(e) => {
+                report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
+                    .await;
+                return Err(e);
+            }
+        };
+        return Ok((
+            policy,
+            opa_engine,
+            Some(proto_policy),
+            LoadedPolicyOrigin::Gateway {
+                revision: loaded_policy_revision,
+            },
+        ));
     }
 
     // No policy source available
@@ -1933,6 +1999,271 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
     }
 }
 
+/// Identity returned with the exact policy snapshot used to construct OPA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LoadedPolicyRevision {
+    version: u32,
+    policy_hash: String,
+    config_revision: u64,
+    policy_source: openshell_core::proto::PolicySource,
+}
+
+/// Identifies where the policy currently loaded into OPA came from.
+///
+/// A missing gateway revision means the policy was loaded from the gateway but
+/// could not be bound to an authoritative snapshot (for example, enrichment
+/// sync failed). That state must reconcile on the first successful poll. A
+/// local-file override is different: gateway policy revisions are observed for
+/// settings/provider refreshes but must never replace the explicit local OPA
+/// policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LoadedPolicyOrigin {
+    LocalOverride,
+    Gateway {
+        revision: Option<LoadedPolicyRevision>,
+    },
+}
+
+impl LoadedPolicyOrigin {
+    fn allows_gateway_policy_reload(&self) -> bool {
+        matches!(self, Self::Gateway { .. })
+    }
+}
+
+impl LoadedPolicyRevision {
+    fn from_snapshot(snapshot: &openshell_core::grpc_client::SettingsPollResult) -> Self {
+        Self {
+            version: snapshot.version,
+            policy_hash: snapshot.policy_hash.clone(),
+            config_revision: snapshot.config_revision,
+            policy_source: snapshot.policy_source,
+        }
+    }
+}
+
+/// A sandbox-scoped policy revision that was constructed successfully at
+/// startup and must be acknowledged to the gateway exactly once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InitialPolicyAck {
+    version: u32,
+    policy_hash: String,
+    config_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyStatusUpdate {
+    version: u32,
+    loaded: bool,
+    error: String,
+    initial_policy_hash: Option<String>,
+}
+
+impl PolicyStatusUpdate {
+    fn initial_loaded(ack: &InitialPolicyAck) -> Self {
+        Self {
+            version: ack.version,
+            loaded: true,
+            error: String::new(),
+            initial_policy_hash: Some(ack.policy_hash.clone()),
+        }
+    }
+
+    fn loaded(version: u32) -> Self {
+        Self {
+            version,
+            loaded: true,
+            error: String::new(),
+            initial_policy_hash: None,
+        }
+    }
+
+    fn failed(version: u32, error: String) -> Self {
+        Self {
+            version,
+            loaded: false,
+            error,
+            initial_policy_hash: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InitialPollDisposition {
+    Acknowledge(InitialPolicyAck),
+    Reconcile,
+    TrackOnly,
+}
+
+/// Determine whether the initially loaded policy corresponds to an
+/// authoritative sandbox-scoped revision that must be acknowledged.
+///
+/// Returns `Some` only for sandbox-sourced revisions (version > 0) whose
+/// captured gateway identity matches the current version and hash. Global
+/// policies, local-file development policies, version zero, and changed
+/// identities yield `None`, so those paths never emit a sandbox-revision
+/// acknowledgement.
+fn initial_policy_ack_candidate(
+    loaded: Option<&LoadedPolicyRevision>,
+    canonical: &openshell_core::grpc_client::SettingsPollResult,
+) -> Option<InitialPolicyAck> {
+    let loaded = loaded?;
+    if loaded.policy_source != openshell_core::proto::PolicySource::Sandbox
+        || canonical.policy_source != openshell_core::proto::PolicySource::Sandbox
+    {
+        return None;
+    }
+    if loaded.version == 0 || canonical.version == 0 {
+        return None;
+    }
+    if loaded.version != canonical.version
+        || loaded.policy_hash != canonical.policy_hash
+        || canonical.config_revision < loaded.config_revision
+    {
+        return None;
+    }
+    Some(InitialPolicyAck {
+        version: loaded.version,
+        policy_hash: loaded.policy_hash.clone(),
+        config_revision: canonical.config_revision,
+    })
+}
+
+fn initial_poll_disposition(
+    origin: &LoadedPolicyOrigin,
+    canonical: &openshell_core::grpc_client::SettingsPollResult,
+) -> InitialPollDisposition {
+    match origin {
+        LoadedPolicyOrigin::LocalOverride => InitialPollDisposition::TrackOnly,
+        LoadedPolicyOrigin::Gateway { revision } => {
+            initial_policy_ack_candidate(revision.as_ref(), canonical).map_or(
+                InitialPollDisposition::Reconcile,
+                InitialPollDisposition::Acknowledge,
+            )
+        }
+    }
+}
+
+/// Deliver policy status updates independently from policy reconciliation.
+///
+/// The channel is FIFO, so a delayed older status can never arrive after a
+/// newer status and move the gateway's active version backward. Delivery uses
+/// the existing bounded retry, but failures never delay policy enforcement.
+async fn run_policy_status_reporter(
+    client: openshell_core::grpc_client::CachedOpenShellClient,
+    sandbox_id: String,
+    mut updates: tokio::sync::mpsc::UnboundedReceiver<PolicyStatusUpdate>,
+) {
+    'updates: while let Some(update) = updates.recv().await {
+        let operation = if update.initial_policy_hash.is_some() {
+            "Initial policy acknowledgement"
+        } else {
+            "Policy status report"
+        };
+        let mut attempt = 1_u32;
+        loop {
+            let sandbox_id = sandbox_id.clone();
+            let error = update.error.clone();
+            let client = client.clone();
+            match client
+                .report_policy_status(&sandbox_id, update.version, update.loaded, &error)
+                .await
+            {
+                Ok(()) => break,
+                Err(error) if is_retryable_error(&error) => {
+                    let backoff = Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(5));
+                    warn!(
+                        %error,
+                        attempt,
+                        version = update.version,
+                        loaded = update.loaded,
+                        retry_in_secs = backoff.as_secs(),
+                        "{operation} failed transiently; retaining ordered update"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        version = update.version,
+                        loaded = update.loaded,
+                        "Discarding terminal policy status update"
+                    );
+                    continue 'updates;
+                }
+            }
+        }
+
+        if let Some(policy_hash) = update.initial_policy_hash {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("version", serde_json::json!(update.version))
+                    .unmapped("policy_hash", serde_json::json!(policy_hash))
+                    .message(format!(
+                        "Acknowledged initial policy revision as loaded [version:{}]",
+                        update.version
+                    ))
+                    .build()
+            );
+        }
+    }
+}
+
+fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: PolicyStatusUpdate) {
+    let version = update.version;
+    if let Err(error) = sender.send(update) {
+        warn!(
+            %error,
+            version,
+            "Policy status reporter unavailable during shutdown"
+        );
+    }
+}
+
+/// Best-effort `FAILED` acknowledgement when initial policy construction or
+/// conversion fails.
+///
+/// Uses the revision identity captured with the policy that failed to build,
+/// and preserves the original construction error as the reported message. A
+/// delivery failure here is swallowed so it can never mask that error.
+async fn report_initial_policy_failure(
+    endpoint: &str,
+    sandbox_id: &str,
+    revision: Option<&LoadedPolicyRevision>,
+    error: &miette::Report,
+) {
+    let Some(revision) = revision.filter(|revision| {
+        revision.version > 0
+            && revision.policy_source == openshell_core::proto::PolicySource::Sandbox
+    }) else {
+        return;
+    };
+    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(error = %e, "Failed to connect to report initial policy failure");
+            return;
+        }
+    };
+    let message = error.to_string();
+    if let Err(e) = grpc_retry("Initial policy failure report", || {
+        let client = client.clone();
+        let message = message.clone();
+        async move {
+            client
+                .report_policy_status(sandbox_id, revision.version, false, &message)
+                .await
+        }
+    })
+    .await
+    {
+        warn!(error = %e, version = revision.version, "Failed to report initial policy failure");
+    }
+}
+
 /// Background loop that polls the server for policy updates.
 ///
 /// When a new version is detected, attempts to reload the OPA engine via
@@ -1945,6 +2276,10 @@ struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
     opa_engine: Arc<OpaEngine>,
+    /// Source of the policy currently loaded into OPA. This distinguishes an
+    /// explicit local-file override from an unbound gateway revision so the
+    /// former is never replaced by policy polling.
+    loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -1959,6 +2294,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use std::sync::atomic::Ordering;
 
     let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
+    let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_policy_status_reporter(
+        client.clone(),
+        ctx.sandbox_id.clone(),
+        status_receiver,
+    ));
+
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
@@ -1967,18 +2309,42 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
 
-    // Initialize revision from the first poll.
+    // A first poll that does not match the policy already loaded into OPA must
+    // pass through the normal reconciliation path immediately. It must never
+    // seed the applied-state trackers before OPA actually loads it.
+    let mut pending_result = None;
+
+    // Initialize revision from the first poll and acknowledge the initial
+    // policy revision the supervisor actually loaded. A mismatched result is
+    // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => {
-            apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-            current_config_revision = result.config_revision;
-            current_policy_hash = result.policy_hash.clone();
-            current_settings = result.settings;
-            debug!(
-                config_revision = current_config_revision,
-                "Settings poll: initial config revision"
-            );
-        }
+        Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
+            InitialPollDisposition::Acknowledge(candidate) => {
+                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                current_config_revision = candidate.config_revision;
+                current_policy_hash.clone_from(&candidate.policy_hash);
+                current_settings = result.settings;
+                enqueue_policy_status(
+                    &status_sender,
+                    PolicyStatusUpdate::initial_loaded(&candidate),
+                );
+                debug!(
+                    config_revision = current_config_revision,
+                    "Settings poll: initial policy matches loaded revision"
+                );
+            }
+            InitialPollDisposition::Reconcile => pending_result = Some(result),
+            InitialPollDisposition::TrackOnly => {
+                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                current_config_revision = result.config_revision;
+                current_policy_hash = result.policy_hash.clone();
+                current_settings = result.settings;
+                debug!(
+                    config_revision = current_config_revision,
+                    "Settings poll: tracking gateway config while preserving local policy override"
+                );
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -1986,13 +2352,16 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
     let interval = Duration::from_secs(ctx.interval_secs);
     loop {
-        tokio::time::sleep(interval).await;
-
-        let result = match client.poll_settings(&ctx.sandbox_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(error = %e, "Settings poll: server unreachable, will retry");
-                continue;
+        let result = if let Some(result) = pending_result.take() {
+            result
+        } else {
+            tokio::time::sleep(interval).await;
+            match client.poll_settings(&ctx.sandbox_id).await {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(error = %e, "Settings poll: server unreachable, will retry");
+                    continue;
+                }
             }
         };
 
@@ -2070,7 +2439,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         // Only reload OPA when the policy payload actually changed.
-        if policy_changed {
+        if policy_changed && ctx.loaded_policy_origin.allows_gateway_policy_reload() {
             let Some(policy) = result.policy.as_ref() else {
                 ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::Medium)
@@ -2124,13 +2493,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 .build()
                         );
                     }
-                    if result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                        && let Err(e) = client
-                            .report_policy_status(&ctx.sandbox_id, result.version, true, "")
-                            .await
-                    {
-                        warn!(error = %e, "Failed to report policy load success");
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        enqueue_policy_status(
+                            &status_sender,
+                            PolicyStatusUpdate::loaded(result.version),
+                        );
                     }
                 }
                 Err(e) => {
@@ -2145,18 +2512,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             result.version
                         ))
                         .build());
-                    if result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                        && let Err(report_err) = client
-                            .report_policy_status(
-                                &ctx.sandbox_id,
-                                result.version,
-                                false,
-                                &e.to_string(),
-                            )
-                            .await
-                    {
-                        warn!(error = %report_err, "Failed to report policy load failure");
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        enqueue_policy_status(
+                            &status_sender,
+                            PolicyStatusUpdate::failed(result.version, e.to_string()),
+                        );
                     }
                 }
             }
@@ -2548,5 +2908,177 @@ filesystem_policy:
         let proto = openshell_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
+    }
+
+    // ---- Initial policy acknowledgement tests ----
+
+    fn proto_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::restrictive_default_policy()
+    }
+
+    fn settings_poll_result(
+        policy: Option<openshell_core::proto::SandboxPolicy>,
+        version: u32,
+        source: openshell_core::proto::PolicySource,
+    ) -> openshell_core::grpc_client::SettingsPollResult {
+        openshell_core::grpc_client::SettingsPollResult {
+            policy,
+            version,
+            policy_hash: format!("hash-v{version}"),
+            config_revision: u64::from(version) * 100,
+            policy_source: source,
+            settings: std::collections::HashMap::new(),
+            global_policy_version: 0,
+            provider_env_revision: 0,
+        }
+    }
+
+    #[test]
+    fn initial_ack_candidate_matches_sandbox_revision() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let loaded = LoadedPolicyRevision::from_snapshot(&canonical);
+
+        let ack = initial_policy_ack_candidate(Some(&loaded), &canonical)
+            .expect("sandbox-sourced matching revision should be acknowledged");
+
+        assert_eq!(ack.version, 2);
+        assert_eq!(ack.policy_hash, "hash-v2");
+        assert_eq!(ack.config_revision, 200);
+    }
+
+    #[test]
+    fn initial_ack_candidate_ignores_global_policy() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Global,
+        );
+        let loaded = LoadedPolicyRevision::from_snapshot(&canonical);
+
+        assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
+    }
+
+    #[test]
+    fn initial_ack_candidate_ignores_version_zero() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            0,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let loaded = LoadedPolicyRevision::from_snapshot(&canonical);
+
+        assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
+    }
+
+    #[test]
+    fn initial_ack_candidate_ignores_local_file_mode() {
+        // Local-file mode retains no proto policy, so there is nothing to
+        // acknowledge to the gateway.
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert!(initial_policy_ack_candidate(None, &canonical).is_none());
+    }
+
+    #[test]
+    fn initial_ack_candidate_rejects_mismatched_identity() {
+        let loaded_snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let loaded = LoadedPolicyRevision::from_snapshot(&loaded_snapshot);
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
+    }
+
+    #[test]
+    fn initial_poll_reconciles_provider_composition_that_was_not_loaded() {
+        let loaded_snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let loaded = LoadedPolicyRevision::from_snapshot(&loaded_snapshot);
+        let mut newer = proto_policy_fixture();
+        newer.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+        let canonical =
+            settings_poll_result(Some(newer), 1, openshell_core::proto::PolicySource::Sandbox);
+        let canonical = openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: "hash-provider-change".to_string(),
+            config_revision: loaded.config_revision + 1,
+            ..canonical
+        };
+
+        assert_eq!(
+            initial_poll_disposition(
+                &LoadedPolicyOrigin::Gateway {
+                    revision: Some(loaded),
+                },
+                &canonical,
+            ),
+            InitialPollDisposition::Reconcile
+        );
+    }
+
+    #[test]
+    fn initial_poll_tracks_local_override_without_reconciliation() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert_eq!(
+            initial_poll_disposition(&LoadedPolicyOrigin::LocalOverride, &canonical),
+            InitialPollDisposition::TrackOnly
+        );
+        assert!(!LoadedPolicyOrigin::LocalOverride.allows_gateway_policy_reload());
+    }
+
+    #[test]
+    fn initial_poll_reconciles_unbound_gateway_policy() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let origin = LoadedPolicyOrigin::Gateway { revision: None };
+
+        assert_eq!(
+            initial_poll_disposition(&origin, &canonical),
+            InitialPollDisposition::Reconcile
+        );
+        assert!(origin.allows_gateway_policy_reload());
+    }
+
+    #[test]
+    fn policy_status_outbox_preserves_all_revision_order() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        for version in 1..=128 {
+            enqueue_policy_status(&sender, PolicyStatusUpdate::loaded(version));
+        }
+
+        for version in 1..=128 {
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                PolicyStatusUpdate::loaded(version)
+            );
+        }
     }
 }
