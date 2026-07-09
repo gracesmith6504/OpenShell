@@ -2098,6 +2098,14 @@ network_policies:
         middleware_impl: &str,
         on_error: &str,
     ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        middleware_relay_context_with_enforcement(middleware_impl, on_error, "enforce")
+    }
+
+    fn middleware_relay_context_with_enforcement(
+        middleware_impl: &str,
+        on_error: &str,
+        enforcement: &str,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
         let data = format!(
             r#"
 network_middlewares:
@@ -2113,7 +2121,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
-        enforcement: enforce
+        enforcement: {enforcement}
         rules:
           - allow:
               method: POST
@@ -2591,6 +2599,121 @@ network_policies:
 
         app.write_all(
             b"POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("middleware_failed"));
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_forwards_policy_denied_request_through_healthy_chain() {
+        // Baseline for audit semantics: a request the L7 policy denies is
+        // still forwarded on an `enforcement: audit` endpoint when the
+        // middleware chain is healthy and allows it.
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context_with_enforcement("openshell/secrets", "fail_closed", "audit");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /other HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_request = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("audited request should reach upstream")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&upstream_request[..n]).starts_with("GET /other"));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_endpoint_still_enforces_middleware_deny() {
+        // `enforcement: audit` applies to the endpoint's L7 policy rules, not
+        // to middleware: a middleware deny (here a fail-closed failure) must
+        // block with 403 even though the same request would be forwarded
+        // under audit with a healthy chain.
+        let (config, tunnel_engine, ctx) = middleware_relay_context_with_enforcement(
+            "example/unavailable",
+            "fail_closed",
+            "audit",
+        );
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /other HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();

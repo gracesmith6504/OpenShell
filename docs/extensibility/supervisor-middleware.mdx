@@ -93,6 +93,8 @@ Use `fail_open` only when bypassing the middleware preserves the intended securi
 
 An explicit deny decision always stops the chain and denies the request, regardless of `on_error`.
 
+Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
+
 ## Set Body Limits
 
 Every middleware binding declares the largest request or replacement body it supports.
