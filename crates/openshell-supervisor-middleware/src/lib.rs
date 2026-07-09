@@ -751,9 +751,11 @@ impl ChainRunner {
             }
 
             // A result proposing unsafe header mutations is a malformed response:
-            // route it through `on_error` instead of applying any of it.
-            if validate_header_mutations(&headers, &result.add_headers).is_err() {
-                match apply_on_error(entry, "unsafe_response_headers", &mut applied) {
+            // route it through `on_error` instead of applying any of it. The
+            // validation error names the offending header and the required
+            // x-openshell-middleware- prefix so operators can fix the service.
+            if let Err(error) = validate_header_mutations(&headers, &result.add_headers) {
+                match apply_on_error(entry, &safe_reason(&error.to_string()), &mut applied) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
@@ -860,7 +862,10 @@ fn validate_header_mutations(
             ));
         }
         if !is_safe_append_header(&lower) {
-            return Err(miette!("middleware cannot append unsafe header '{name}'"));
+            return Err(miette!(
+                "middleware can only append new request headers prefixed with \
+                 x-openshell-middleware- and cannot append '{name}'"
+            ));
         }
         // Reject CR/LF and other control characters in the value: writing them
         // verbatim into the upstream header block would enable header injection
@@ -1087,7 +1092,8 @@ mod tests {
             &std::iter::once(("Authorization".into(), "Bearer nope".into())).collect(),
         )
         .expect_err("unsafe header");
-        assert!(err.to_string().contains("unsafe header"));
+        assert!(err.to_string().contains("x-openshell-middleware-"));
+        assert!(err.to_string().contains("'Authorization'"));
     }
 
     #[test]
@@ -1567,6 +1573,13 @@ mod tests {
             .expect("evaluate");
         assert!(!outcome.allowed);
         assert!(outcome.reason.starts_with("middleware_failed:"));
+        // The deny reason names the offending header so operators can fix the
+        // service without reading supervisor source.
+        assert!(
+            outcome.reason.contains("x-openshell-middleware-inject"),
+            "reason should name the offending header: {}",
+            outcome.reason
+        );
         assert!(outcome.applied.iter().any(|inv| inv.failed));
         // The unsafe header is never forwarded.
         assert!(outcome.added_headers.is_empty());

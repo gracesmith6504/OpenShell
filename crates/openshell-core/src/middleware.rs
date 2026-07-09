@@ -4,53 +4,100 @@
 //! Shared supervisor middleware identifiers and policy validation contracts.
 
 use miette::{Result, miette};
+use serde::Deserialize;
 
 /// Binding identifier for the built-in secret redaction middleware.
 pub const BUILTIN_SECRETS: &str = "openshell/secrets";
 
+/// Policy-owned configuration for the built-in `openshell/secrets` middleware.
+///
+/// Unknown fields and wrong-typed values are rejected so a config typo fails
+/// policy validation instead of silently running with defaults.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// Redaction mode. Omitting the field selects [`SecretsMode::Redact`].
+    pub secrets: SecretsMode,
+}
+
+/// Supported `openshell/secrets` modes. Phase 1 supports only `redact`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretsMode {
+    #[default]
+    Redact,
+}
+
+impl SecretsConfig {
+    /// Parse and validate a policy-owned protobuf config.
+    pub fn from_struct(config: &prost_types::Struct) -> Result<Self> {
+        serde_json::from_value(crate::proto_struct::struct_to_json_value(config)).map_err(|error| {
+            miette!(
+                "invalid {BUILTIN_SECRETS} config: {error}; phase 1 supports only secrets: redact"
+            )
+        })
+    }
+}
+
 /// Validate policy-owned configuration for a built-in middleware.
 pub fn validate_builtin_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
-        BUILTIN_SECRETS => validate_secrets_config(config),
+        BUILTIN_SECRETS => SecretsConfig::from_struct(config).map(|_| ()),
         other => Err(miette!(
             "middleware implementation '{other}' is not available in phase 1"
         )),
     }
 }
 
-fn validate_secrets_config(config: &prost_types::Struct) -> Result<()> {
-    let mode = config
-        .fields
-        .get("secrets")
-        .and_then(|value| match value.kind.as_ref() {
-            Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
-            _ => None,
-        })
-        .unwrap_or("redact");
-    if mode != "redact" {
-        return Err(miette!(
-            "{BUILTIN_SECRETS} only supports config.secrets: redact in phase 1"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn string_config(key: &str, value: &str) -> prost_types::Struct {
+        prost_types::Struct {
+            fields: std::iter::once((
+                key.to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(value.into())),
+                },
+            ))
+            .collect(),
+        }
+    }
+
     #[test]
     fn secrets_config_defaults_to_redact() {
-        validate_builtin_config(BUILTIN_SECRETS, &prost_types::Struct::default()).unwrap();
+        let config = SecretsConfig::from_struct(&prost_types::Struct::default()).unwrap();
+        assert_eq!(config.secrets, SecretsMode::Redact);
+    }
+
+    #[test]
+    fn secrets_config_accepts_explicit_redact() {
+        let config = SecretsConfig::from_struct(&string_config("secrets", "redact")).unwrap();
+        assert_eq!(config.secrets, SecretsMode::Redact);
     }
 
     #[test]
     fn secrets_config_rejects_unsupported_mode() {
+        let error = validate_builtin_config(BUILTIN_SECRETS, &string_config("secrets", "allow"))
+            .unwrap_err();
+        assert!(error.to_string().contains("supports only secrets: redact"));
+    }
+
+    #[test]
+    fn secrets_config_rejects_unknown_field() {
+        let error = validate_builtin_config(BUILTIN_SECRETS, &string_config("secret", "redact"))
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn secrets_config_rejects_non_string_mode() {
         let config = prost_types::Struct {
             fields: std::iter::once((
                 "secrets".to_string(),
                 prost_types::Value {
-                    kind: Some(prost_types::value::Kind::StringValue("allow".into())),
+                    kind: Some(prost_types::value::Kind::NumberValue(42.0)),
                 },
             ))
             .collect(),
@@ -60,7 +107,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only supports config.secrets: redact")
+                .contains("invalid openshell/secrets config")
         );
     }
 

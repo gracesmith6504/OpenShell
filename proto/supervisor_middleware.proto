@@ -165,7 +165,12 @@ message HttpRequestResult {
   bytes body = 3;
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
-  // Request headers to add before forwarding. Protected headers are rejected.
+  // Request headers to add before forwarding. Only new headers whose
+  // case-insensitive names start with "x-openshell-middleware-" are accepted.
+  // Existing request headers cannot be rewritten, protected headers such as
+  // authorization or transfer-encoding are always rejected, and values must
+  // not contain control characters. A violating result is a middleware
+  // failure handled according to the policy failure mode.
   map<string, string> add_headers = 5;
   // Audit-safe findings produced during evaluation.
   repeated Finding findings = 6;

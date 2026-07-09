@@ -30,7 +30,7 @@ Middleware receives the request before credential injection. Operator-run servic
 | Built-in | None | Defined by OpenShell | Runs inside the supervisor |
 | Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
 
-`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox.
+`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox. Its `config` accepts one field, `secrets: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation.
 
 Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
 
@@ -103,6 +103,12 @@ Every middleware binding declares the largest request or replacement body it sup
 - The same per-stage limit applies to request bodies and replacement bodies.
 
 The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure and follows that config's `on_error` behavior.
+
+## Add Request Headers
+
+A middleware result can add new request headers before OpenShell injects credentials. Header names are case-insensitive and must start with `x-openshell-middleware-`. Values must not contain control characters.
+
+A result that rewrites an existing request header, uses a name outside the required prefix, or carries an unsafe value is treated as a middleware failure and follows that config's `on_error` behavior. The failure reason names the offending header. Protected headers, including `authorization`, `cookie`, `host`, `content-length`, `transfer-encoding`, and OpenShell credential and signature headers, are always rejected.
 
 ## Operate Middleware Services
 
