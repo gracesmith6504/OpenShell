@@ -19,11 +19,14 @@ pub enum MiddlewareApplyResult {
     Denied(String),
 }
 
-/// Smallest body-buffering limit across the entries that actually resolved to a
-/// registered binding. Unresolved entries (`is_resolved() == false`) report a
-/// zero limit and are excluded here: they are handled by their `on_error` policy
-/// in `evaluate_described` without inspecting the body, so letting a zero drag
-/// the chain limit to zero would spuriously fail the whole chain over capacity.
+/// Largest body-buffering limit across the entries that actually resolved to a
+/// registered binding. Buffering for the most capable stage lets every stage
+/// that can handle the body run; stages whose own limit is smaller are failed
+/// individually with `request_body_over_capacity` through their `on_error`
+/// policy in `evaluate_described`, instead of one undersized stage forcing the
+/// whole chain onto the unbuffered path. Unresolved entries
+/// (`is_resolved() == false`) report a zero limit and are excluded here: they
+/// are handled by their `on_error` policy without inspecting the body.
 /// Returns `None` when no entry resolved, so the caller can skip buffering.
 pub(super) fn middleware_chain_body_limit(
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
@@ -32,7 +35,7 @@ pub(super) fn middleware_chain_body_limit(
         .iter()
         .filter(|entry| entry.is_resolved())
         .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
-        .min()
+        .max()
 }
 
 pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -147,10 +150,11 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
         .map_or_else(String::new, |(_, query)| query.to_string()))
 }
 
-/// Apply the chain's `on_error` policy when the request body cannot be buffered
-/// for inspection because it exceeds the size cap. The RFC treats an unbufferable
-/// body as an `on_error` event: it is denied unless every attached middleware is
-/// `fail_open`, and passing it through is only safe when no bytes were consumed.
+/// Apply the chain's `on_error` policy when the request body exceeds every
+/// stage's buffering limit. No stage can inspect such a body, so each stage
+/// would individually fail with `request_body_over_capacity`; the aggregate is
+/// a deny unless every attached middleware is `fail_open`, and passing the
+/// body through is only safe when no bytes were consumed.
 pub(super) fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,

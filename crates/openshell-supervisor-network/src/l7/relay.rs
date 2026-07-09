@@ -2875,6 +2875,146 @@ network_policies:
         assert_eq!(middleware_chain_body_limit(&none), None);
     }
 
+    /// A middleware service advertising two bindings with different body
+    /// limits, for exercising mixed-limit chain buffering at the relay level.
+    /// The redactor binding replaces the body; the guard binding allows as-is.
+    struct TwoLimitService;
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
+        for TwoLimitService
+    {
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            use openshell_core::proto::{
+                MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+                SupervisorMiddlewarePhase,
+            };
+            let binding = |id: &str, max_body_bytes: u64| MiddlewareBinding {
+                id: id.into(),
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_body_bytes,
+            };
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/two-limits".into(),
+                service_version: "test".into(),
+                bindings: vec![binding("test/redactor", 8192), binding("test/guard", 16)],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            let evaluation = request.into_inner();
+            let mut result = openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            };
+            if evaluation.binding_id == "test/redactor" {
+                result.body = b"[SCRUBBED BY TEST REDACTOR]".to_vec();
+                result.has_body = true;
+            }
+            Ok(tonic::Response::new(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn body_over_smallest_stage_limit_is_buffered_and_evaluated() {
+        use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
+
+        // A 64-byte body exceeds the 16-byte guard limit but fits the 8 KiB
+        // redactor. The chain must buffer for its largest stage so the
+        // redactor runs and replaces the body, while the undersized fail-open
+        // guard is skipped through its own on_error, instead of the whole
+        // chain taking the unbuffered over-capacity path.
+        let (_config, tunnel_engine, ctx) =
+            middleware_relay_context("openshell/secrets", "fail_closed");
+        let runner = ChainRunner::new(Arc::new(TwoLimitService));
+        let chain = vec![
+            ChainEntry {
+                name: "redact".into(),
+                implementation: "test/redactor".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "guard".into(),
+                implementation: "test/guard".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailOpen,
+            },
+        ];
+        let described = runner.describe_chain(&chain).await.expect("describe chain");
+        assert_eq!(middleware_chain_body_limit(&described), Some(8192));
+
+        let body = [b'a'; 64];
+        let raw_header = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        app.write_all(&body).await.unwrap();
+
+        let result = crate::l7::middleware::apply_middleware_chain_for_scheme(
+            req,
+            &mut relay_client,
+            &ctx,
+            "https",
+            chain,
+            &runner,
+            tunnel_engine.generation_guard(),
+        )
+        .await
+        .expect("apply middleware chain");
+
+        match result {
+            MiddlewareApplyResult::Allowed(rebuilt) => {
+                let raw = String::from_utf8(rebuilt.raw_header).expect("utf8 request");
+                assert!(
+                    raw.ends_with("[SCRUBBED BY TEST REDACTOR]"),
+                    "redactor must replace the body: {raw}"
+                );
+            }
+            MiddlewareApplyResult::Denied(reason) => {
+                panic!("body within the largest stage limit must not fail the chain: {reason}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn all_unresolved_fail_open_forwards_body_unbuffered() {
         // A chain whose only entry is an unregistered binding has no resolvable

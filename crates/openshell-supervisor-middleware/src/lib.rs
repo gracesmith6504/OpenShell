@@ -1322,6 +1322,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn undersized_stage_fails_open_while_later_stage_runs() {
+        // A body over one stage's limit must fail only that stage through its
+        // own `on_error`, not the whole chain: the 1 KiB fail-open guard is
+        // skipped while the 256 KiB fail-closed redactor still runs.
+        let external = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: allow_result(),
+        });
+        let registry = registry_with_external(external, external_registration(1024)).await;
+        let runner = ChainRunner::from_registry(registry);
+        let guard_entry = ChainEntry {
+            name: "guard".into(),
+            implementation: "example/content-guard".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        };
+        let mut redact_entry = entry("redact", OnError::FailClosed);
+        redact_entry.order = 10;
+        let entries = [guard_entry, redact_entry];
+
+        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let outcome = runner
+            .evaluate(&entries, input(&body))
+            .await
+            .expect("evaluate mixed-limit chain");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), 2);
+        assert!(
+            outcome.applied[0].failed,
+            "undersized guard must be skipped"
+        );
+        assert_eq!(outcome.applied[0].decision, Decision::Allow);
+        assert!(!outcome.applied[1].failed);
+        assert!(outcome.applied[1].transformed);
+        let body = String::from_utf8(outcome.body).expect("utf8");
+        assert!(body.contains("[REDACTED]"));
+        assert!(!body.contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn transformed_body_still_over_later_stage_capacity_honors_on_error() {
+        // Per-stage capacity applies to the current body: the redactor's
+        // replacement is still over the 1 KiB guard limit, so the fail-closed
+        // guard denies through its own `on_error` after the redactor ran.
+        let external = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: allow_result(),
+        });
+        let registry = registry_with_external(external, external_registration(1024)).await;
+        let runner = ChainRunner::from_registry(registry);
+        let guard_entry = ChainEntry {
+            name: "guard".into(),
+            implementation: "example/content-guard".into(),
+            order: 10,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let entries = [entry("redact", OnError::FailClosed), guard_entry];
+
+        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let outcome = runner
+            .evaluate(&entries, input(&body))
+            .await
+            .expect("evaluate mixed-limit chain");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason,
+            "middleware_failed: request_body_over_capacity"
+        );
+        assert_eq!(outcome.applied.len(), 2);
+        assert!(
+            outcome.applied[0].transformed,
+            "redactor ran before the deny"
+        );
+        assert!(outcome.applied[1].failed);
+    }
+
     #[test]
     fn external_manifest_rejects_operator_limit_above_capability() {
         let registration = external_registration(4097);

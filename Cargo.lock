@@ -3983,6 +3983,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.26.2",
+ "tonic",
  "tower-mcp-types",
  "tracing",
  "tracing-subscriber",
