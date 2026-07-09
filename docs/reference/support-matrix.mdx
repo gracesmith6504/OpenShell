@@ -41,7 +41,7 @@ the workload.
 
 | Compute driver | Supported environment       | Device interface          | Requirements and limits                                                                                                              |
 | -------------- | --------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Docker         | Linux; Windows through WSL2 | NVIDIA CDI                | Docker CDI is enabled and NVIDIA devices are visible. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device. |
+| Docker         | Linux; Windows through WSL2 | NVIDIA CDI                | Docker is CDI-enabled and NVIDIA devices are visible. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device. |
 | Podman         | Linux; Windows through WSL2 | NVIDIA CDI                | NVIDIA CDI devices are visible to Podman. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device.             |
 | MicroVM        | Linux                       | QEMU/VFIO PCI passthrough | The host provides IOMMU and VFIO support, root privileges, and a compatible sandbox image. Each sandbox supports one GPU.                           |
 | Kubernetes     | Linux GPU nodes             | `nvidia.com/gpu` extended resources | The NVIDIA GPU Device Plugin (e.g. installed by the GPU Operator) exposes allocatable GPU capacity, and the sandbox image includes the required user-space libraries.          |
