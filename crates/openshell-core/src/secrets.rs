@@ -1922,6 +1922,17 @@ mod tests {
     }
 
     #[test]
+    fn no_resolver_with_percent_encoded_marker_fails_closed() {
+        // Percent-encoded form of the canonical marker: a client (or an evasive
+        // sender) can URL-encode the reserved token, and the no-resolver scan
+        // must still catch it via the percent-decoded pass.
+        let raw = b"GET /api/openshell%3Aresolve%3Aenv%3AKEY HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = rewrite_http_header_block(raw, None)
+            .expect_err("percent-encoded placeholder without resolver must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
     fn no_resolver_with_provider_alias_marker_fails_closed() {
         // The provider-shaped alias marker is also a reserved credential token
         // and must fail closed when no resolver can rewrite it.
