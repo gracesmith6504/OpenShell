@@ -8024,14 +8024,18 @@ network_policies:
         let proxy_port = listener.local_addr().unwrap().port();
 
         // The child connects, sends the CONNECT request, then reads the proxy's
-        // reply to EOF. `cat` keeps the socket ESTABLISHED while the proxy
-        // resolves identity, then surfaces whatever bytes the proxy wrote.
+        // reply to EOF and prints it. Everything is a bash builtin (exec,
+        // printf, read) so NO external command is forked — a forked `cat`/`head`
+        // would inherit the socket fd, making the inode owned by two PIDs with
+        // different binaries, which the resolver correctly denies as ambiguous
+        // shared-socket ownership. `read -d ''` reads all bytes up to EOF into
+        // `resp`; on EOF it returns non-zero but `resp` still holds the reply.
         let script = format!(
             "exec 3<>/dev/tcp/127.0.0.1/{proxy_port}; \
              printf 'CONNECT {connect_target} HTTP/1.1\\r\\nHost: {connect_target}\\r\\n\\r\\n' >&3; \
-             cat <&3",
+             IFS= read -r -d '' resp <&3; printf '%s' \"$resp\"",
         );
-        let mut child = Command::new(&bash)
+        let child = Command::new(&bash)
             .arg("-c")
             .arg(&script)
             .stdin(Stdio::null())
@@ -8064,7 +8068,10 @@ network_policies:
         .await
         .is_ok();
 
-        let _ = child.kill();
+        // Do not kill the child: it exits on its own once the server socket is
+        // dropped (normal return or timeout), at which point its read sees EOF
+        // and it prints whatever the proxy wrote. Killing it here would race
+        // that final read and truncate the captured response.
         let output = child.wait_with_output().expect("collect child output");
         (completed, output.stdout)
     }
