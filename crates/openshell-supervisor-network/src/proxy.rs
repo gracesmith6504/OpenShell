@@ -741,6 +741,53 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    // Determine the route's TLS treatment before acknowledging the tunnel.
+    // `query_tls_mode` resolves purely from the policy decision + host/port
+    // (no peeked bytes), so it is valid here, before the `200`.
+    let effective_tls_skip =
+        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+
+    // Fail closed BEFORE `200 Connection Established`. A terminating route with
+    // no TLS termination state cannot rewrite credential placeholders; the 503
+    // must be the first bytes on the socket (see the helper) rather than a
+    // post-200 in-tunnel write the client would misread as a TLS error. No
+    // "allowed CONNECT" event is emitted for this path — that log lives after
+    // the `200` below.
+    if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
+        .await?
+    {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "tls")
+            .message(format!(
+                "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
+            ))
+            .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
+            .build();
+        ocsf_emit!(event);
+        emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            TLS_TERMINATION_UNAVAILABLE_DETAIL,
+            "connect-tls-termination-unavailable",
+        );
+        return Ok(());
+    }
+
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     // Query allowed_ips from the matched endpoint config (if any).
@@ -1070,10 +1117,8 @@ async fn handle_tcp_connection(
     }
     emit_connect_activity_if_l4_only(&activity_tx, l7_route.as_ref());
 
-    // Determine effective TLS mode. Check the raw endpoint config for
-    // `tls: skip` independently of L7 config (which requires `protocol`).
-    let effective_tls_skip =
-        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+    // `effective_tls_skip` was resolved before the `200` above (the fail-closed
+    // gate needs it) and drives the raw-tunnel branch below.
 
     // Build L7 eval context (shared by TLS-terminated and plaintext paths).
     let ctx = crate::l7::relay::L7EvalContext {
@@ -1207,16 +1252,18 @@ async fn handle_tcp_connection(
                 }
             }
         } else {
-            // Fail-closed: TLS was detected but no TLS termination state is
-            // available. Inside the proxy handler this can only mean the
-            // ephemeral CA failed to generate or write at startup (run.rs) —
-            // the `mode != Proxy` case never starts this handler, and
-            // `tls: skip` is handled earlier. Raw-tunneling here would forward
-            // the client's TLS stream straight to the upstream, bypassing
-            // credential rewrite and leaking any `openshell:resolve:env:*`
-            // placeholder verbatim. Refuse the connection instead.
-            const DETAIL: &str = "TLS termination unavailable (CA initialization failed); \
-                 refusing to tunnel — credential rewrite would be bypassed";
+            // Defense in depth; unreachable in normal operation. The pre-200
+            // fail-closed gate already refuses terminating routes when no TLS
+            // termination state exists, and `tls: skip` routes raw-tunnel
+            // before this peek. Reaching here means a future refactor bypassed
+            // that gate. The `200 Connection Established` was already sent, so
+            // the tunnel is live: any HTTP bytes now would be decoded as a TLS
+            // protocol error, so we fail closed by DROPPING the connection
+            // rather than raw-tunneling (which would forward the client's TLS
+            // stream upstream and leak any `openshell:resolve:env:*`
+            // placeholder verbatim).
+            const DETAIL: &str = "TLS termination unavailable after tunnel establishment; \
+                 closing connection — credential rewrite would be bypassed";
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
@@ -1244,16 +1291,8 @@ async fn handle_tcp_connection(
                 DETAIL,
                 "connect-tls-termination-unavailable",
             );
-            respond(
-                &mut client,
-                &build_json_error_response(
-                    503,
-                    "Service Unavailable",
-                    "tls_termination_unavailable",
-                    DETAIL,
-                ),
-            )
-            .await?;
+            // No HTTP response: the tunnel is already established, so writing
+            // bytes here would corrupt the client's TLS handshake. Drop instead.
             return Ok(());
         }
     } else if tunnel_protocol == TunnelProtocol::Http1 {
@@ -4378,6 +4417,50 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
         body_str,
     )
     .into_bytes()
+}
+
+/// Detail shared by the fail-closed 503 body, the OCSF denial event, and the
+/// denial notification when a terminating CONNECT route has no TLS termination
+/// state available.
+const TLS_TERMINATION_UNAVAILABLE_DETAIL: &str = "TLS termination unavailable (CA initialization failed); \
+     refusing to tunnel — credential rewrite would be bypassed";
+
+/// Fail-closed gate evaluated BEFORE `200 Connection Established`.
+///
+/// A CONNECT route that terminates TLS (`tls: skip` is exempt) relies on the
+/// ephemeral CA to rewrite credential placeholders. When no TLS termination
+/// state exists — the CA failed to generate or write at startup (`run.rs`);
+/// `mode != Proxy` never starts this handler — the proxy cannot rewrite those
+/// placeholders, so raw-tunneling would forward the client's TLS stream
+/// straight upstream and leak any `openshell:resolve:env:*` placeholder
+/// verbatim.
+///
+/// The refusal is written here, as the first bytes on the socket, because a
+/// CONNECT client only sends its TLS `ClientHello` after reading the `200`.
+/// Refusing after the `200` would land the 503 inside the established tunnel,
+/// where the client decodes it as a TLS protocol error rather than a readable
+/// HTTP status (the flaw this replaces). Returns `true` when the connection was
+/// refused (the caller must stop) and `false` when the caller should proceed to
+/// establish the tunnel.
+async fn refuse_connect_when_tls_unavailable(
+    client: &mut TcpStream,
+    tls_state_present: bool,
+    effective_tls_skip: bool,
+) -> Result<bool> {
+    if tls_state_present || effective_tls_skip {
+        return Ok(false);
+    }
+    respond(
+        client,
+        &build_json_error_response(
+            503,
+            "Service Unavailable",
+            "tls_termination_unavailable",
+            TLS_TERMINATION_UNAVAILABLE_DETAIL,
+        ),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Check if a miette error represents a benign connection close.
@@ -7804,8 +7887,7 @@ network_policies:
     /// placeholders verbatim.
     #[test]
     fn test_json_error_response_503_tls_termination_unavailable() {
-        let detail = "TLS termination unavailable (CA initialization failed); \
-             refusing to tunnel — credential rewrite would be bypassed";
+        let detail = TLS_TERMINATION_UNAVAILABLE_DETAIL;
         let resp = build_json_error_response(
             503,
             "Service Unavailable",
@@ -7821,6 +7903,80 @@ network_policies:
         let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
         assert_eq!(body["error"], "tls_termination_unavailable");
         assert_eq!(body["detail"], detail);
+    }
+
+    /// Connection-level regression for the pre-200 fail-closed gate. A real
+    /// loopback client opens a connection and the proxy-side gate runs with no
+    /// TLS termination state for a terminating (non-`tls: skip`) route. The
+    /// FIRST bytes the client reads back must be a real `HTTP/1.1 503`, not the
+    /// `HTTP/1.1 200 Connection Established` that would establish the tunnel and
+    /// bury the refusal inside it as a TLS protocol error (PR #2162 gator flaw).
+    #[tokio::test]
+    async fn connect_without_tls_termination_refused_with_503_before_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        // Terminating route (tls: skip = false) with no termination state.
+        let refused = refuse_connect_when_tls_unavailable(&mut server, false, false)
+            .await
+            .expect("gate write should succeed");
+        assert!(
+            refused,
+            "gate must refuse when TLS termination is unavailable"
+        );
+
+        let mut buf = vec![0u8; 512];
+        let n = client.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "client must read a 503 as the first bytes, not a 200; got: {response}"
+        );
+        assert!(
+            !response.contains("200 Connection Established"),
+            "no tunnel must be established before the refusal; got: {response}"
+        );
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&response[body_start..]).unwrap();
+        assert_eq!(body["error"], "tls_termination_unavailable");
+        assert_eq!(body["detail"], TLS_TERMINATION_UNAVAILABLE_DETAIL);
+    }
+
+    /// The pre-200 gate must NOT touch the socket when the route can proceed:
+    /// either TLS termination state is present, or the route is `tls: skip`
+    /// (raw tunnel, no termination or credential injection). In both cases the
+    /// gate returns `false` and writes nothing, letting the caller send its
+    /// own `200 Connection Established`.
+    #[tokio::test]
+    async fn connect_with_tls_termination_or_skip_proceeds_without_writing() {
+        for (tls_present, tls_skip) in [(true, false), (false, true), (true, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+
+            let refused = refuse_connect_when_tls_unavailable(&mut server, tls_present, tls_skip)
+                .await
+                .expect("gate should succeed");
+            assert!(
+                !refused,
+                "gate must proceed (tls_present={tls_present}, tls_skip={tls_skip})"
+            );
+
+            // Nothing was written; after dropping the server the client sees a
+            // clean EOF (0 bytes) rather than any buffered response.
+            drop(server);
+            let mut buf = vec![0u8; 16];
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(
+                n, 0,
+                "gate must not write to the socket when proceeding \
+                 (tls_present={tls_present}, tls_skip={tls_skip})"
+            );
+        }
     }
 
     #[test]
