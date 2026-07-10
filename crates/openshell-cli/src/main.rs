@@ -535,6 +535,14 @@ enum Commands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Status,
 
+    /// Show elevated live gateway runtime information.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Info {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
     /// Manage inference configuration.
     #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Inference {
@@ -2101,6 +2109,19 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------
+        // Top-level info
+        // -----------------------------------------------------------
+        Some(Commands::Info { output }) => {
+            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name);
+                run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
+            } else {
+                run::gateway_info_not_configured()?;
+            }
+        }
+
+        // -----------------------------------------------------------
         // Top-level forward (was `sandbox forward`)
         // -----------------------------------------------------------
         Some(Commands::Forward {
@@ -3464,6 +3485,19 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn info_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "info", "-o", "json"])
+            .expect("info -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Info {
+                output: OutputFormat::Json
+            })
+        ));
     }
 
     #[test]

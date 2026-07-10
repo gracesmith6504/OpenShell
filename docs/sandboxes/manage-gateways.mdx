@@ -104,13 +104,28 @@ openshell status -g staging
 
 ## Inspect Gateway Status
 
-Use `openshell status` for a quick health check:
+Use `openshell status` for a live gateway check. It verifies that the CLI can
+reach the running gateway, then reports health and the gateway version:
 
 ```shell
 openshell status
 ```
 
-Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
+Use `openshell info` when you need elevated runtime details such as initialized
+compute drivers and driver-reported capability versions:
+
+```shell
+openshell info
+```
+
+Use structured output when scripting against live runtime info:
+
+```shell
+openshell info -o json
+```
+
+Use `openshell gateway info` when you need local registration details such as
+the registered endpoint, gateway metadata source, or authentication mode:
 
 ```shell
 openshell gateway info
