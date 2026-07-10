@@ -426,18 +426,9 @@ where
             return Ok(());
         }
 
-        let parse_error_reason = graphql_info
-            .as_ref()
-            .and_then(|info| info.error.as_deref())
-            .map(|error| format!("GraphQL request rejected: {error}"))
-            .or_else(|| {
-                jsonrpc_info
-                    .as_ref()
-                    .and_then(|info| info.error.as_deref())
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
-            });
-        let force_deny = parse_error_reason.is_some();
-        let (allowed, reason) = if let Some(reason) = parse_error_reason {
+        let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
+        let force_deny = hard_deny_reason.is_some();
+        let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
             evaluate_l7_request(&engine, ctx, &request_info)?
@@ -488,7 +479,7 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
-                Some(&validate),
+                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
             )
             .await?
             {
@@ -981,7 +972,7 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
-                None,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
             )
             .await?
             {
@@ -1186,16 +1177,9 @@ where
             jsonrpc: Some(jsonrpc_info.clone()),
         };
 
-        let parse_error_reason = jsonrpc_info
-            .error
-            .as_deref()
-            .map(|e| format!("JSON-RPC request rejected: {e}"));
-        let response_frame_reason =
-            jsonrpc_response_frame_hard_deny_reason(config.protocol, &jsonrpc_info);
-        let force_deny = parse_error_reason.is_some() || response_frame_reason.is_some();
-        let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = parse_error_reason {
-            (false, reason, jsonrpc_info.clone())
-        } else if let Some(reason) = response_frame_reason {
+        let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
+        let force_deny = hard_deny_reason.is_some();
+        let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = hard_deny_reason {
             (false, reason, jsonrpc_info.clone())
         } else {
             let evaluation =
@@ -1262,7 +1246,7 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
-                Some(&validate),
+                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
             )
             .await?
             {
@@ -1426,12 +1410,9 @@ where
         // control parameters, are rejected before policy evaluation. This
         // keeps parser-differential cases fail-closed even if the endpoint is
         // otherwise in audit mode.
-        let parse_error_reason = graphql_info
-            .error
-            .as_deref()
-            .map(|error| format!("GraphQL request rejected: {error}"));
-        let force_deny = parse_error_reason.is_some();
-        let (allowed, reason) = if let Some(reason) = parse_error_reason {
+        let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
+        let force_deny = hard_deny_reason.is_some();
+        let (allowed, reason) = if let Some(reason) = hard_deny_reason {
             (false, reason)
         } else {
             evaluate_l7_request(engine, ctx, &request_info)?
@@ -1498,7 +1479,7 @@ where
                 chain,
                 engine.middleware_runner(),
                 engine.generation_guard(),
-                Some(&validate),
+                openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
             )
             .await?
             {
@@ -1659,6 +1640,31 @@ pub(crate) fn jsonrpc_response_frame_hard_deny_reason(
         .then(|| JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string())
 }
 
+/// Classify malformed or protocol-invalid requests that must be denied even
+/// when the selected endpoint is in audit mode.
+///
+/// All HTTP entry points use this helper so dedicated relays, route-selected
+/// relays, forward proxying, and post-middleware re-evaluation cannot drift on
+/// hard-deny semantics.
+pub(crate) fn l7_request_hard_deny_reason(
+    protocol: L7Protocol,
+    request: &L7RequestInfo,
+) -> Option<String> {
+    request
+        .graphql
+        .as_ref()
+        .and_then(|info| info.error.as_deref())
+        .map(|error| format!("GraphQL request rejected: {error}"))
+        .or_else(|| {
+            request.jsonrpc.as_ref().and_then(|info| {
+                info.error
+                    .as_deref()
+                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .or_else(|| jsonrpc_response_frame_hard_deny_reason(protocol, info))
+            })
+        })
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -1805,7 +1811,7 @@ fn reevaluate_transformed_body(
     request_info: &L7RequestInfo,
     body: &[u8],
 ) -> Result<Option<String>> {
-    let (engine_type, transformed_info, hard_deny_reason) = match config.protocol {
+    let (engine_type, transformed_info) = match config.protocol {
         // REST and websocket-upgrade policy evaluates only the method, path,
         // and query, which a middleware result cannot mutate; the body is not
         // a policy input. SQL has no body-aware L7 policy either; the
@@ -1817,18 +1823,9 @@ fn reevaluate_transformed_body(
                 body,
                 crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
             );
-            let hard_deny_reason = info
-                .error
-                .as_deref()
-                .map(|error| format!("JSON-RPC request rejected: {error}"))
-                .or_else(|| jsonrpc_response_frame_hard_deny_reason(config.protocol, &info));
             let mut transformed_info = request_info.clone();
             transformed_info.jsonrpc = Some(info);
-            (
-                jsonrpc_engine_type(config.protocol),
-                transformed_info,
-                hard_deny_reason,
-            )
+            (jsonrpc_engine_type(config.protocol), transformed_info)
         }
         L7Protocol::Graphql => {
             // GraphQL classification needs the request method and query
@@ -1842,17 +1839,13 @@ fn reevaluate_transformed_body(
                 body_length: crate::l7::provider::BodyLength::None,
             };
             let info = crate::l7::graphql::classify_request(&request, body);
-            let hard_deny_reason = info
-                .error
-                .as_deref()
-                .map(|error| format!("GraphQL request rejected: {error}"));
             let mut transformed_info = request_info.clone();
             transformed_info.graphql = Some(info);
-            ("l7-graphql", transformed_info, hard_deny_reason)
+            ("l7-graphql", transformed_info)
         }
     };
 
-    if let Some(reason) = hard_deny_reason {
+    if let Some(reason) = l7_request_hard_deny_reason(config.protocol, &transformed_info) {
         let reason = format!("middleware transformation rejected: {reason}");
         emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
         return Ok(Some(reason));
@@ -2094,8 +2087,16 @@ where
             let runner = engine.middleware_runner()?;
             // The passthrough path enforces no L7 policy, so there is no
             // body-aware decision to re-check after a transformation.
-            match apply_middleware_chain(req, client, ctx, chain, &runner, generation_guard, None)
-                .await?
+            match apply_middleware_chain(
+                req,
+                client,
+                ctx,
+                chain,
+                &runner,
+                generation_guard,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            )
+            .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied(reason) => {
@@ -3801,7 +3802,7 @@ network_policies:
             chain,
             &runner,
             tunnel_engine.generation_guard(),
-            None,
+            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
         )
         .await
         .expect("apply middleware chain");
@@ -4729,6 +4730,102 @@ network_policies:
             "",
         );
         assert!(no_params_message.contains("rule_methods=initialize"));
+    }
+
+    #[tokio::test]
+    async fn route_selected_jsonrpc_response_frame_hard_denies_under_audit() {
+        let data = r"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: audit
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - { path: /usr/bin/node }
+";
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let configs = vec![
+            crate::l7::parse_l7_config(&endpoint.expect("JSON-RPC endpoint"))
+                .expect("parse JSON-RPC config"),
+        ];
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: gateway.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("hard denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(response.contains("response frames"), "{response}");
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "hard-denied response frame must not reach upstream"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

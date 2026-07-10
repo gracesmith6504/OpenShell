@@ -111,8 +111,22 @@ impl DescribedChainEntry {
 /// Returns `Some(reason)` to deny the chain, `None` to proceed. Invoked after
 /// each stage that replaces the body so neither a later stage nor the upstream
 /// sees a payload the policy would reject. Protocols with no body-aware policy
-/// pass `None` for the validator instead.
+/// select [`TransformedBodyPolicy::NotPolicyRelevant`] instead.
 pub type TransformedBodyValidator<'a> = dyn Fn(&[u8]) -> Result<Option<String>> + Send + Sync + 'a;
+
+/// Whether middleware body replacements affect the selected request policy.
+///
+/// The network pipeline must choose a mode explicitly. This avoids representing
+/// a security-relevant re-evaluation requirement as an optional callback where
+/// an omitted value is indistinguishable from an intentionally body-independent
+/// protocol.
+#[derive(Clone, Copy)]
+pub enum TransformedBodyPolicy<'a> {
+    /// The selected policy does not inspect the request body.
+    NotPolicyRelevant,
+    /// Re-evaluate every body replacement before the next stage runs.
+    Reevaluate(&'a TransformedBodyValidator<'a>),
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpRequestInput {
@@ -625,22 +639,26 @@ impl ChainRunner {
         entries: &[DescribedChainEntry],
         input: HttpRequestInput,
     ) -> Result<ChainOutcome> {
-        self.evaluate_described_with_validator(entries, input, None)
-            .await
+        self.evaluate_described_with_policy(
+            entries,
+            input,
+            TransformedBodyPolicy::NotPolicyRelevant,
+        )
+        .await
     }
 
     /// Evaluate a described chain, re-checking the request body against sandbox
     /// policy after every stage that replaces it. Policy runs on the original
     /// body before the chain, so without this a stage could hand the next stage
-    /// (or the upstream) a payload the policy rejects. When `validator` returns
+    /// (or the upstream) a payload the policy rejects. When the evaluator returns
     /// a deny reason the chain stops with that reason, so no later stage ever
-    /// sees a non-compliant body. `None` skips re-checks for protocols with no
-    /// body-aware policy.
-    pub async fn evaluate_described_with_validator(
+    /// sees a non-compliant body. Body-independent protocols must select
+    /// [`TransformedBodyPolicy::NotPolicyRelevant`] explicitly.
+    pub async fn evaluate_described_with_policy(
         &self,
         entries: &[DescribedChainEntry],
         input: HttpRequestInput,
-        validator: Option<&TransformedBodyValidator<'_>>,
+        transformed_body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<ChainOutcome> {
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
@@ -831,18 +849,26 @@ impl ChainRunner {
             // before the next stage or the upstream sees the replaced body. A
             // policy deny here is a hard deny, independent of `on_error`.
             if transformed
-                && let Some(validate) = validator
-                && let Some(reason) = validate(&body)?
+                && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
-                return Ok(ChainOutcome {
-                    allowed: false,
-                    reason,
-                    body,
-                    added_headers,
-                    findings,
-                    metadata,
-                    applied,
-                });
+                let denied = match validate(&body) {
+                    Ok(reason) => reason,
+                    Err(error) => Some(format!(
+                        "transformed_body_policy_evaluation_failed: {}",
+                        safe_reason(&error.to_string())
+                    )),
+                };
+                if let Some(reason) = denied {
+                    return Ok(ChainOutcome {
+                        allowed: false,
+                        reason,
+                        body,
+                        added_headers,
+                        findings,
+                        metadata,
+                        applied,
+                    });
+                }
             }
         }
 
@@ -1315,7 +1341,11 @@ mod tests {
             }
         });
         let outcome = runner
-            .evaluate_described_with_validator(&described, input("original"), Some(&*validator))
+            .evaluate_described_with_policy(
+                &described,
+                input("original"),
+                TransformedBodyPolicy::Reevaluate(&*validator),
+            )
             .await
             .expect("evaluate two-stage chain");
 
@@ -1359,7 +1389,11 @@ mod tests {
 
         let validator: Box<TransformedBodyValidator<'_>> = Box::new(|_body: &[u8]| Ok(None));
         let outcome = runner
-            .evaluate_described_with_validator(&described, input("original"), Some(&*validator))
+            .evaluate_described_with_policy(
+                &described,
+                input("original"),
+                TransformedBodyPolicy::Reevaluate(&*validator),
+            )
             .await
             .expect("evaluate two-stage chain");
 
@@ -1369,6 +1403,57 @@ mod tests {
             second_ran.load(std::sync::atomic::Ordering::SeqCst),
             "second stage should run when the transformation is compliant"
         );
+    }
+
+    #[tokio::test]
+    async fn per_stage_validator_error_becomes_structured_denial() {
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+            second_ran: Arc::clone(&second_ran),
+        });
+        let runner = ChainRunner::new(service);
+        let entries = [
+            ChainEntry {
+                name: "transform".into(),
+                implementation: "test/transform".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "second".into(),
+                implementation: "test/second".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+        ];
+        let described = runner
+            .describe_chain(&entries)
+            .await
+            .expect("describe two-stage chain");
+        let validator: Box<TransformedBodyValidator<'_>> =
+            Box::new(|_body: &[u8]| Err(miette!("OPA engine unavailable")));
+
+        let outcome = runner
+            .evaluate_described_with_policy(
+                &described,
+                input("original"),
+                TransformedBodyPolicy::Reevaluate(&*validator),
+            )
+            .await
+            .expect("policy evaluator failure should be a chain outcome");
+
+        assert!(!outcome.allowed);
+        assert!(
+            outcome
+                .reason
+                .starts_with("transformed_body_policy_evaluation_failed:"),
+            "{}",
+            outcome.reason
+        );
+        assert_eq!(outcome.applied.len(), 1);
+        assert!(!second_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {

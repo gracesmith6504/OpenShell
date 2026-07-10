@@ -85,6 +85,14 @@ overlap detection, matching, and chain ordering. The policy and runtime also
 share the core JSON/protobuf adapter for middleware configuration, keeping
 serialization consistent across that boundary.
 
+The Rust HTTP pipeline makes transformed-body handling explicit for every
+middleware invocation: body-independent protocols select a no-recheck mode,
+while GraphQL, JSON-RPC, and MCP carry a policy evaluator bound to the captured
+policy generation. Each replacement is reclassified and evaluated before the
+next stage runs. Hard-deny classification is shared by CONNECT relays,
+route-selected relays, and forward proxying; evaluator failures become
+structured fail-closed outcomes instead of escaping the middleware pipeline.
+
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
 

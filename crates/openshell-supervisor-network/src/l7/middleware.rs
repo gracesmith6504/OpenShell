@@ -107,7 +107,7 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
-    validator: Option<&openshell_supervisor_middleware::TransformedBodyValidator<'_>>,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> Result<MiddlewareApplyResult> {
     apply_middleware_chain_for_scheme(
         req,
@@ -117,7 +117,7 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
         chain,
         runner,
         generation_guard,
-        validator,
+        transformed_body_policy,
     )
     .await
 }
@@ -131,7 +131,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
-    validator: Option<&openshell_supervisor_middleware::TransformedBodyValidator<'_>>,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
@@ -168,24 +168,23 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
-    // The chain re-checks the body against sandbox policy after every
-    // transforming stage via `validator`, so an ALLOW outcome here already
-    // means the final body is policy-compliant.
+    // The explicitly selected transformation policy either re-checks every
+    // replacement or documents that this protocol's policy is body-independent.
+    // An ALLOW outcome therefore means the final body is policy-compliant.
     let outcome = runner
-        .evaluate_described_with_validator(&chain, input, validator)
+        .evaluate_described_with_policy(&chain, input, transformed_body_policy)
         .await?;
     emit_middleware_events(ctx, &req, &outcome);
+    if !outcome.allowed {
+        return Ok(MiddlewareApplyResult::Denied(outcome.reason));
+    }
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
         &req,
         &buffered.headers,
         &outcome.body,
         &outcome.added_headers,
     )?;
-    if outcome.allowed {
-        Ok(MiddlewareApplyResult::Allowed(rebuilt))
-    } else {
-        Ok(MiddlewareApplyResult::Denied(outcome.reason))
-    }
+    Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
 pub(super) fn middleware_request_input(
@@ -395,6 +394,25 @@ pub(super) fn middleware_events(
                 "Supervisor middleware failure",
             ))
             .message("Required supervisor middleware failed closed")
+            .build();
+        events.push(event);
+    }
+    if !outcome.allowed
+        && outcome
+            .reason
+            .starts_with("transformed_body_policy_evaluation_failed:")
+    {
+        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(SeverityId::High)
+            .finding_info(FindingInfo::new(
+                "openshell.middleware.policy_evaluation_failure",
+                "Post-middleware policy evaluation failed",
+            ))
+            .evidence_pairs(&[
+                ("policy", ctx.policy_name.as_str()),
+                ("host", ctx.host.as_str()),
+            ])
+            .message("Transformed request denied because policy evaluation failed")
             .build();
         events.push(event);
     }
