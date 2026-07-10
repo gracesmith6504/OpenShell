@@ -7980,73 +7980,63 @@ network_policies:
     }
 
     /// Drives a real `CONNECT` through the full `handle_tcp_connection` entry
-    /// point and returns `(completed, client_response_bytes)`. `completed` is
-    /// `false` when the handler was still running at `budget` (e.g. a `tls:
-    /// skip` route that proceeded past the fail-closed gate and blocked on the
-    /// unroutable upstream connect).
+    /// point and returns `(completed, client_response_bytes, denial_stages)`.
+    /// `completed` is `false` when the handler was still running at `budget`
+    /// (e.g. a `tls: skip` route that proceeded past the fail-closed gate and
+    /// blocked on the unroutable upstream connect). `denial_stages` collects the
+    /// `denial_stage` of every `DenialEvent` the handler emitted — empty means
+    /// the connection was allowed and not blocked/refused at any stage.
     ///
-    /// A child copy of `/bin/bash` opens the connection via `/dev/tcp` so the
-    /// proxy's `/proc`-based process-identity binding resolves it against a
-    /// permissive policy (glob on the temp dir) — the same identity pattern the
-    /// hot-swap regression test uses. Callers gate on Linux; `evaluate_opa_tcp`
-    /// denies unconditionally without `/proc`.
+    /// The client is an in-process `TcpStream` (no child process), so the client
+    /// socket is owned solely by this test process. Identity resolution finds
+    /// that owner in the descendant scan (which includes the entrypoint PID
+    /// itself), binds to `current_exe()`, and never falls through to the
+    /// whole-`/proc` scan — the environment-sensitive path that made a forked
+    /// child flaky under a busy CI `/proc`. Callers gate on Linux;
+    /// `evaluate_opa_tcp` denies unconditionally without `/proc`.
     async fn drive_connect_through_handler(
         endpoint_yaml: &str,
         connect_target: &str,
         budget: std::time::Duration,
-    ) -> (bool, Vec<u8>) {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::{Command, Stdio};
-
+    ) -> (bool, Vec<u8>, Vec<String>) {
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let bash = tmp.path().join("connect-bash");
-        std::fs::copy("/bin/bash", &bash).expect("copy /bin/bash");
-        std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Permissive policy: allow any binary under the temp dir (the child bash
-        // copy) to reach the endpoint. The binary glob matches the child's
-        // `/proc/<pid>/exe`; matching is by path, not by hash.
+        // Allow the current test binary — the in-process client's
+        // `/proc/<pid>/exe` — to reach the endpoint. Matching is by path.
+        let exe = std::env::current_exe().expect("current_exe");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{glob}/*" }}
+      - {{ path: "{exe}" }}
 "#,
-            glob = tmp.path().display(),
+            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
 
-        // The child connects, sends the CONNECT request, then reads the proxy's
-        // reply to EOF and prints it. Everything is a bash builtin (exec,
-        // printf, read) so NO external command is forked — a forked `cat`/`head`
-        // would inherit the socket fd, making the inode owned by two PIDs with
-        // different binaries, which the resolver correctly denies as ambiguous
-        // shared-socket ownership. `read -d ''` reads all bytes up to EOF into
-        // `resp`; on EOF it returns non-zero but `resp` still holds the reply.
-        let script = format!(
-            "exec 3<>/dev/tcp/127.0.0.1/{proxy_port}; \
-             printf 'CONNECT {connect_target} HTTP/1.1\\r\\nHost: {connect_target}\\r\\n\\r\\n' >&3; \
-             IFS= read -r -d '' resp <&3; printf '%s' \"$resp\"",
-        );
-        let child = Command::new(&bash)
-            .arg("-c")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn connect-bash child");
+        // In-process client: connect, send the CONNECT request, read the reply to
+        // EOF. The proxy closes the socket after writing a 503/403; a proceeding
+        // `tls: skip` route stalls on the upstream connect until the handler is
+        // dropped at `budget`, which closes the socket and ends the read.
+        let target = connect_target.to_string();
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+            sock.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            buf
+        });
 
         let (server, _peer) = listener.accept().await.unwrap();
         let entrypoint_pid = Arc::new(AtomicU32::new(std::process::id()));
         let cache = Arc::new(BinaryIdentityCache::new());
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
 
         let completed = tokio::time::timeout(
             budget,
@@ -8055,25 +8045,28 @@ network_policies:
                 engine,
                 cache,
                 entrypoint_pid,
-                None,           // tls_state — ephemeral CA unavailable
-                None,           // inference_ctx
-                None,           // policy_local_ctx
-                Arc::new(None), // trusted_host_gateway
-                None,           // secret_resolver
-                None,           // dynamic_credentials
-                None,           // denial_tx
-                None,           // activity_tx
+                None,            // tls_state — ephemeral CA unavailable
+                None,            // inference_ctx
+                None,            // policy_local_ctx
+                Arc::new(None),  // trusted_host_gateway
+                None,            // secret_resolver
+                None,            // dynamic_credentials
+                Some(denial_tx), // denial_tx — positive allow/deny signal
+                None,            // activity_tx
             )),
         )
         .await
         .is_ok();
 
-        // Do not kill the child: it exits on its own once the server socket is
-        // dropped (normal return or timeout), at which point its read sees EOF
-        // and it prints whatever the proxy wrote. Killing it here would race
-        // that final read and truncate the captured response.
-        let output = child.wait_with_output().expect("collect child output");
-        (completed, output.stdout)
+        let stdout = client.await.expect("client task");
+
+        // The handler future is now finished or dropped, so its sender half is
+        // gone; drain every denial it emitted.
+        let mut denial_stages = Vec::new();
+        while let Ok(event) = denial_rx.try_recv() {
+            denial_stages.push(event.denial_stage);
+        }
+        (completed, stdout, denial_stages)
     }
 
     /// End-to-end regression for the gator finding on PR #2162: with no TLS
@@ -8086,17 +8079,15 @@ network_policies:
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
         }
-        if !std::path::Path::new("/bin/bash").exists() {
-            eprintln!("skipping: /bin/bash not available");
-            return;
-        }
 
         // Public documentation IP (RFC 5737 TEST-NET-3): passes the SSRF check
         // but is never actually connected — the fail-closed gate refuses first.
-        let (completed, stdout) = drive_connect_through_handler(
+        // The 30s budget is a generous belt against a slow CI runner; the refusal
+        // returns in milliseconds.
+        let (completed, stdout, _denials) = drive_connect_through_handler(
             "      - { host: \"203.0.113.10\", port: 443 }\n",
             "203.0.113.10:443",
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
         )
         .await;
 
@@ -8125,15 +8116,11 @@ network_policies:
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
         }
-        if !std::path::Path::new("/bin/bash").exists() {
-            eprintln!("skipping: /bin/bash not available");
-            return;
-        }
 
-        let (completed, stdout) = drive_connect_through_handler(
+        let (completed, stdout, _denials) = drive_connect_through_handler(
             "      - { host: \"127.0.0.1\", port: 443 }\n",
             "127.0.0.1:443",
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
         )
         .await;
 
@@ -8163,18 +8150,13 @@ network_policies:
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
         }
-        if !std::path::Path::new("/bin/bash").exists() {
-            eprintln!("skipping: /bin/bash not available");
-            return;
-        }
 
         // `_completed` is intentionally ignored: whether the unroutable connect
         // stalls (times out) or is rejected fast by a CI egress firewall, the
         // invariant is the same — a `tls: skip` route is exempt from the
         // fail-closed gate, so it proceeds to the tunnel connect and writes no
-        // 503/denial to the client beforehand. A wrongly-refused route would
-        // instead surface a 503, making `stdout` non-empty.
-        let (_completed, stdout) = drive_connect_through_handler(
+        // 503/denial to the client beforehand.
+        let (_completed, stdout, denial_stages) = drive_connect_through_handler(
             "      - { host: \"203.0.113.10\", port: 443, tls: skip }\n",
             "203.0.113.10:443",
             std::time::Duration::from_millis(800),
@@ -8185,6 +8167,13 @@ network_policies:
         assert!(
             stdout.is_empty(),
             "tls: skip must emit no refusal/denial before the tunnel connect; got: {resp:?}"
+        );
+        // Positive allow evidence, so this test cannot pass vacuously on a
+        // policy/identity deny (which would emit a DenialEvent): the handler
+        // must have emitted no denial at any stage.
+        assert!(
+            denial_stages.is_empty(),
+            "tls: skip must be allowed end-to-end, not denied at any stage; got: {denial_stages:?}"
         );
     }
 
