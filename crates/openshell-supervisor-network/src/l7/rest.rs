@@ -4909,23 +4909,20 @@ mod tests {
             "relay must fail closed when a placeholder cannot be resolved"
         );
 
-        // Nothing must have reached upstream. Drop the proxy write half so the
-        // read observes EOF instead of blocking, then confirm neither the
-        // placeholder nor the secret leaked.
+        // The fail-closed scan rejects the request before any byte reaches
+        // upstream, so nothing at all must have been forwarded — a strictly
+        // stronger invariant than "the placeholder/secret did not appear". Drop
+        // the proxy write half so the read observes EOF instead of blocking.
         drop(proxy_to_upstream);
         let mut forwarded = Vec::new();
         upstream_side
             .read_to_end(&mut forwarded)
             .await
             .expect("upstream read should complete");
-        let forwarded = String::from_utf8_lossy(&forwarded);
         assert!(
-            !forwarded.contains("openshell:resolve:env:"),
-            "placeholder must not leak to upstream: {forwarded}"
-        );
-        assert!(
-            !forwarded.contains("nvapi-secret"),
-            "secret must not leak to upstream: {forwarded}"
+            forwarded.is_empty(),
+            "no bytes may reach upstream when the placeholder cannot be resolved; got: {}",
+            String::from_utf8_lossy(&forwarded)
         );
     }
 

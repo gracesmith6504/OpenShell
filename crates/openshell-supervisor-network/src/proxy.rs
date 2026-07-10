@@ -741,52 +741,14 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    // Determine the route's TLS treatment before acknowledging the tunnel.
-    // `query_tls_mode` resolves purely from the policy decision + host/port
-    // (no peeked bytes), so it is valid here, before the `200`.
+    // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
+    // the policy decision + host/port (no peeked bytes), so it is valid before
+    // the `200`. The fail-closed refusal that consumes it runs after the SSRF/
+    // allowed_ips validation below — so an internal-address CONNECT still gets
+    // the SSRF 403 and telemetry in degraded state — but before the upstream
+    // connect and before `200 Connection Established`.
     let effective_tls_skip =
         query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
-
-    // Fail closed BEFORE `200 Connection Established`. A terminating route with
-    // no TLS termination state cannot rewrite credential placeholders; the 503
-    // must be the first bytes on the socket (see the helper) rather than a
-    // post-200 in-tunnel write the client would misread as a TLS error. No
-    // "allowed CONNECT" event is emitted for this path — that log lives after
-    // the `200` below.
-    if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
-        .await?
-    {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::High)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "tls")
-            .message(format!(
-                "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
-            ))
-            .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
-            .build();
-        ocsf_emit!(event);
-        emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
-        emit_denial(
-            &denial_tx,
-            &host_lc,
-            port,
-            &binary_str,
-            &decision,
-            TLS_TERMINATION_UNAVAILABLE_DETAIL,
-            "connect-tls-termination-unavailable",
-        );
-        return Ok(());
-    }
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
@@ -809,7 +771,7 @@ async fn handle_tcp_connection(
     // The "non-empty" branch is the explicit-allowlist path; reading it first
     // matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let mut upstream = if is_host_gateway_alias(&host_lc)
+    let validated_addrs = if is_host_gateway_alias(&host_lc)
         && let Some(gw) = *trusted_host_gateway
     {
         // Trusted host-gateway path. The compute driver injected this hostname
@@ -818,9 +780,7 @@ async fn handle_tcp_connection(
         // addresses (used by rootless Podman with pasta) are not hard-blocked.
         // Cloud metadata IPs and control-plane ports are still rejected.
         match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -874,9 +834,7 @@ async fn handle_tcp_connection(
                 match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
-                    Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                        .await
-                        .into_diagnostic()?,
+                    Ok(addrs) => addrs,
                     Err(reason) => {
                         {
                             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -976,9 +934,7 @@ async fn handle_tcp_connection(
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
         match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1028,9 +984,7 @@ async fn handle_tcp_connection(
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
         match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1077,6 +1031,52 @@ async fn handle_tcp_connection(
             }
         }
     };
+
+    // Fail closed AFTER SSRF/allowed_ips validation (an internal-address CONNECT
+    // has already returned the SSRF 403 above) but BEFORE connecting upstream
+    // and BEFORE `200 Connection Established`. A terminating route with no TLS
+    // termination state cannot rewrite credential placeholders; the 503 must be
+    // the first bytes on the socket rather than a post-200 in-tunnel write the
+    // client would misread as a TLS error. No "allowed CONNECT" event is emitted
+    // for this path — that log lives after the `200` below.
+    if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
+        .await?
+    {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "tls")
+            .message(format!(
+                "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
+            ))
+            .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
+            .build();
+        ocsf_emit!(event);
+        emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            TLS_TERMINATION_UNAVAILABLE_DETAIL,
+            "connect-tls-termination-unavailable",
+        );
+        return Ok(());
+    }
+
+    let mut upstream = TcpStream::connect(validated_addrs.as_slice())
+        .await
+        .into_diagnostic()?;
 
     debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
@@ -7977,6 +7977,272 @@ network_policies:
                  (tls_present={tls_present}, tls_skip={tls_skip})"
             );
         }
+    }
+
+    /// Drives a real `CONNECT` through the full `handle_tcp_connection` entry
+    /// point and returns `(completed, client_response_bytes)`. `completed` is
+    /// `false` when the handler was still running at `budget` (e.g. a `tls:
+    /// skip` route that proceeded past the fail-closed gate and blocked on the
+    /// unroutable upstream connect).
+    ///
+    /// A child copy of `/bin/bash` opens the connection via `/dev/tcp` so the
+    /// proxy's `/proc`-based process-identity binding resolves it against a
+    /// permissive policy (glob on the temp dir) — the same identity pattern the
+    /// hot-swap regression test uses. Callers gate on Linux; `evaluate_opa_tcp`
+    /// denies unconditionally without `/proc`.
+    async fn drive_connect_through_handler(
+        endpoint_yaml: &str,
+        connect_target: &str,
+        budget: std::time::Duration,
+    ) -> (bool, Vec<u8>) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bash = tmp.path().join("connect-bash");
+        std::fs::copy("/bin/bash", &bash).expect("copy /bin/bash");
+        std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Permissive policy: allow any binary under the temp dir (the child bash
+        // copy) to reach the endpoint. The binary glob matches the child's
+        // `/proc/<pid>/exe`; matching is by path, not by hash.
+        let data = format!(
+            r#"network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+{endpoint_yaml}    binaries:
+      - {{ path: "{glob}/*" }}
+"#,
+            glob = tmp.path().display(),
+        );
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+
+        // The child connects, sends the CONNECT request, then reads the proxy's
+        // reply to EOF. `cat` keeps the socket ESTABLISHED while the proxy
+        // resolves identity, then surfaces whatever bytes the proxy wrote.
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{proxy_port}; \
+             printf 'CONNECT {connect_target} HTTP/1.1\\r\\nHost: {connect_target}\\r\\n\\r\\n' >&3; \
+             cat <&3",
+        );
+        let mut child = Command::new(&bash)
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn connect-bash child");
+
+        let (server, _peer) = listener.accept().await.unwrap();
+        let entrypoint_pid = Arc::new(AtomicU32::new(std::process::id()));
+        let cache = Arc::new(BinaryIdentityCache::new());
+
+        let completed = tokio::time::timeout(
+            budget,
+            Box::pin(handle_tcp_connection(
+                server,
+                engine,
+                cache,
+                entrypoint_pid,
+                None,           // tls_state — ephemeral CA unavailable
+                None,           // inference_ctx
+                None,           // policy_local_ctx
+                Arc::new(None), // trusted_host_gateway
+                None,           // secret_resolver
+                None,           // dynamic_credentials
+                None,           // denial_tx
+                None,           // activity_tx
+            )),
+        )
+        .await
+        .is_ok();
+
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("collect child output");
+        (completed, output.stdout)
+    }
+
+    /// End-to-end regression for the gator finding on PR #2162: with no TLS
+    /// termination state, a terminating `CONNECT` must have its 503 written as
+    /// the FIRST bytes on the socket — never after a `200 Connection
+    /// Established` that would bury the refusal inside the tunnel as a TLS error.
+    #[tokio::test]
+    async fn connect_handler_refuses_terminating_route_with_503_before_200() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        if !std::path::Path::new("/bin/bash").exists() {
+            eprintln!("skipping: /bin/bash not available");
+            return;
+        }
+
+        // Public documentation IP (RFC 5737 TEST-NET-3): passes the SSRF check
+        // but is never actually connected — the fail-closed gate refuses first.
+        let (completed, stdout) = drive_connect_through_handler(
+            "      - { host: \"203.0.113.10\", port: 443 }\n",
+            "203.0.113.10:443",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(completed, "the refusal must return promptly, not hang");
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "first bytes must be a 503, not a 200; got: {resp:?}"
+        );
+        assert!(
+            !resp.contains("200 Connection Established"),
+            "no tunnel must be established before the refusal; got: {resp:?}"
+        );
+        assert!(
+            resp.contains("tls_termination_unavailable"),
+            "must be the TLS-termination-unavailable refusal; got: {resp:?}"
+        );
+    }
+
+    /// Ordering regression (gator re-check item 1): during CA-init failure, an
+    /// internal-address `CONNECT` must still receive the SSRF `403`, not the
+    /// TLS-unavailable `503` — SSRF validation runs before the fail-closed gate.
+    #[tokio::test]
+    async fn connect_handler_returns_ssrf_403_for_internal_address_not_503() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        if !std::path::Path::new("/bin/bash").exists() {
+            eprintln!("skipping: /bin/bash not available");
+            return;
+        }
+
+        let (completed, stdout) = drive_connect_through_handler(
+            "      - { host: \"127.0.0.1\", port: 443 }\n",
+            "127.0.0.1:443",
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(completed, "the SSRF denial must return promptly, not hang");
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden"),
+            "internal address must get the SSRF 403; got: {resp:?}"
+        );
+        assert!(
+            resp.contains("ssrf_denied"),
+            "must be an SSRF denial; got: {resp:?}"
+        );
+        assert!(
+            !resp.contains("503"),
+            "SSRF runs before the fail-closed gate, so the 503 must not appear; got: {resp:?}"
+        );
+    }
+
+    /// A real `tls: skip` policy path through the handler is exempt from the
+    /// fail-closed gate even with no TLS termination state: the handler proceeds
+    /// past the refusal to the raw-tunnel upstream connect (which stalls on the
+    /// unroutable target), emitting no 503 and no client response before it.
+    #[tokio::test]
+    async fn connect_handler_tls_skip_route_is_not_refused() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        if !std::path::Path::new("/bin/bash").exists() {
+            eprintln!("skipping: /bin/bash not available");
+            return;
+        }
+
+        // `_completed` is intentionally ignored: whether the unroutable connect
+        // stalls (times out) or is rejected fast by a CI egress firewall, the
+        // invariant is the same — a `tls: skip` route is exempt from the
+        // fail-closed gate, so it proceeds to the tunnel connect and writes no
+        // 503/denial to the client beforehand. A wrongly-refused route would
+        // instead surface a 503, making `stdout` non-empty.
+        let (_completed, stdout) = drive_connect_through_handler(
+            "      - { host: \"203.0.113.10\", port: 443, tls: skip }\n",
+            "203.0.113.10:443",
+            std::time::Duration::from_millis(800),
+        )
+        .await;
+
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            stdout.is_empty(),
+            "tls: skip must emit no refusal/denial before the tunnel connect; got: {resp:?}"
+        );
+    }
+
+    /// Verifies the policy half of the Linux handler tests on every platform
+    /// (no `/proc` needed): the temp-dir binary glob yields an Allow for a
+    /// literal-IP endpoint, `tls: skip` reads back as `TlsMode::Skip`, and a
+    /// terminating endpoint reads back as `TlsMode::Auto`. Locks the OPA
+    /// preconditions so a policy-format regression is caught even where the
+    /// process-identity binding can't run.
+    #[test]
+    fn handler_test_policy_allows_glob_binary_and_reads_tls_mode() {
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        let eval = |tls_line: &str| {
+            let data = format!(
+                r#"network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+      - {{ host: "203.0.113.10", port: 443{tls_line} }}
+    binaries:
+      - {{ path: "/tmp/openshell-connect-test/*" }}
+"#
+            );
+            let engine = OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy");
+            let input = crate::opa::NetworkInput {
+                host: "203.0.113.10".to_string(),
+                port: 443,
+                binary_path: PathBuf::from("/tmp/openshell-connect-test/connect-bash"),
+                binary_sha256: "unused".to_string(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (action, generation) = engine
+                .evaluate_network_action_with_generation(&input)
+                .expect("evaluate");
+            match &action {
+                NetworkAction::Allow { matched_policy } => {
+                    assert!(matched_policy.is_some(), "allow must carry the policy name");
+                }
+                NetworkAction::Deny { reason } => {
+                    panic!("glob binary must be allowed, got deny: {reason}")
+                }
+            }
+            let decision = ConnectDecision {
+                action,
+                generation,
+                binary: Some(input.binary_path),
+                binary_pid: Some(1),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            query_tls_mode(&engine, &decision, "203.0.113.10", 443)
+        };
+
+        assert_eq!(
+            eval(", tls: skip"),
+            crate::l7::TlsMode::Skip,
+            "tls: skip endpoint must resolve to TlsMode::Skip"
+        );
+        assert_eq!(
+            eval(""),
+            crate::l7::TlsMode::Auto,
+            "terminating endpoint must resolve to TlsMode::Auto"
+        );
     }
 
     #[test]
