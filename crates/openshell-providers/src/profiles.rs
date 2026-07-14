@@ -1328,12 +1328,122 @@ pub fn validate_profile_set(
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
+            let loc = format!("endpoints[{index}]");
             if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
-                    format!("endpoints[{index}]"),
+                    &loc,
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
+                ));
+            }
+
+            let protocol = endpoint.protocol.as_str();
+            let access = endpoint.access.as_str();
+            let has_rules = !endpoint.rules.is_empty();
+            let has_deny_rules = !endpoint.deny_rules.is_empty();
+
+            if !protocol.is_empty() && !is_known_l7_protocol(protocol) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    format!(
+                        "unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, json-rpc, or mcp)"
+                    ),
+                ));
+            }
+
+            if has_rules && !access.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "rules and access are mutually exclusive",
+                ));
+            }
+
+            if is_jsonrpc_family(protocol) && !access.is_empty() {
+                if protocol == "mcp" {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        &loc,
+                        format!(
+                            "protocol {protocol} does not support access presets; use rules/deny_rules or set mcp.allow_all_known_mcp_methods: true for an allow-all MCP policy"
+                        ),
+                    ));
+                } else {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        &loc,
+                        format!(
+                            "protocol {protocol} does not support access presets; use explicit rules with allow.method such as \"*\""
+                        ),
+                    ));
+                }
+            }
+
+            if protocol == "json-rpc" && !has_rules {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    format!("protocol {protocol} requires explicit rules with allow.method"),
+                ));
+            }
+
+            if !protocol.is_empty() && protocol != "mcp" && !has_rules && access.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "protocol requires rules or access to define allowed traffic",
+                ));
+            }
+
+            if protocol == "mcp"
+                && !has_rules
+                && access.is_empty()
+                && !endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.allow_all_known_mcp_methods)
+                    .unwrap_or(false)
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "protocol mcp requires rules when mcp.allow_all_known_mcp_methods is false",
+                ));
+            }
+
+            if endpoint.rules.iter().all(|rule| rule.allow.is_none()) && has_rules {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "rules must contain at least one allow entry (would deny all traffic). Use `access: full` or remove rules.",
+                ));
+            }
+
+            if has_deny_rules && protocol.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "deny_rules require protocol (L7 inspection must be enabled)",
+                ));
+            }
+
+            if has_deny_rules && protocol != "mcp" && !has_rules && access.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    &loc,
+                    "deny_rules require rules or access to define the base allow set",
                 ));
             }
         }
@@ -1363,6 +1473,17 @@ fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
             .all(|port| (1..=65_535).contains(port));
     }
     (1..=65_535).contains(&endpoint.port)
+}
+
+fn is_known_l7_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "rest" | "websocket" | "graphql" | "sql" | "json-rpc" | "mcp"
+    )
+}
+
+fn is_jsonrpc_family(protocol: &str) -> bool {
+    matches!(protocol, "json-rpc" | "mcp")
 }
 
 #[derive(Debug, Clone)]
@@ -2452,21 +2573,11 @@ category: other
 endpoints:
   - host: api.example.com
     ports: [443, 8443]
-    protocol: rest
+    protocol: graphql
     tls: terminate
     enforcement: enforce
     access: read-only
-    rules:
-      - allow:
-          method: GET
-          path: /v1/**
-          query:
-            state:
-              any: [open, closed]
     allowed_ips: [10.0.0.0/24]
-    deny_rules:
-      - method: POST
-        path: /admin/**
     allow_encoded_slash: true
     persisted_queries: allow_registered
     graphql_persisted_queries:
@@ -2476,6 +2587,20 @@ endpoints:
         fields: [viewer]
     graphql_max_body_bytes: 131072
     path: /graphql
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+          query:
+            state:
+              any: [open, closed]
+    deny_rules:
+      - method: POST
+        path: /admin/**
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -2484,8 +2609,8 @@ binaries:
         .expect("profile should parse");
         let diagnostics = validate_profile_set(&[("advanced.yaml".to_string(), profile.clone())]);
         assert!(
-            diagnostics.is_empty(),
-            "unexpected diagnostics: {diagnostics:?}"
+            !diagnostics.iter().any(|d| d.severity == "error"),
+            "unexpected error diagnostics: {diagnostics:?}"
         );
 
         let proto = profile.to_proto();
@@ -2500,15 +2625,6 @@ binaries:
         assert_eq!(endpoint.path, "/graphql");
         assert_eq!(
             endpoint
-                .rules
-                .first()
-                .and_then(|rule| rule.allow.as_ref())
-                .map(|allow| allow.method.as_str()),
-            Some("GET")
-        );
-        assert_eq!(endpoint.deny_rules[0].method, "POST");
-        assert_eq!(
-            endpoint
                 .graphql_persisted_queries
                 .get("hash-a")
                 .map(|operation| operation.operation_name.as_str()),
@@ -2516,11 +2632,22 @@ binaries:
         );
         assert!(proto.binaries[0].harness);
 
+        let rules_endpoint = &proto.endpoints[1];
+        assert_eq!(
+            rules_endpoint
+                .rules
+                .first()
+                .and_then(|rule| rule.allow.as_ref())
+                .map(|allow| allow.method.as_str()),
+            Some("GET")
+        );
+        assert_eq!(rules_endpoint.deny_rules[0].method, "POST");
+
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
         assert!(reprotoo.binaries[0].harness);
     }
@@ -2689,5 +2816,325 @@ endpoints:
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_unknown_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: unknown-proto
+display_name: Unknown Proto
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: ftp
+    access: read-only
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("unknown.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("unknown protocol"))
+            .expect("unknown protocol diagnostic should be reported");
+        assert!(diagnostic.message.contains("ftp"));
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_protocol_without_rules_or_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: no-rules
+display_name: No Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("no-rules.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("protocol requires rules or access"))
+            .expect("protocol-requires-rules-or-access diagnostic should be reported");
+        assert_eq!(diagnostic.severity, "error");
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_rules_and_access_together() {
+        let profile = parse_profile_yaml(
+            r"
+id: both-set
+display_name: Both Set
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("both.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("mutually exclusive"))
+            .expect("mutually-exclusive diagnostic should be reported");
+        assert_eq!(diagnostic.severity, "error");
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_deny_rules_without_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: deny-no-proto
+display_name: Deny No Proto
+endpoints:
+  - host: api.example.com
+    port: 443
+    access: read-only
+    deny_rules:
+      - method: POST
+        path: /admin/**
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("deny-no-proto.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("deny_rules require protocol"))
+            .expect("deny-rules-require-protocol diagnostic should be reported");
+        assert_eq!(diagnostic.severity, "error");
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_deny_rules_without_base_allow() {
+        let profile = parse_profile_yaml(
+            r"
+id: deny-no-base
+display_name: Deny No Base
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    deny_rules:
+      - method: POST
+        path: /admin/**
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("deny-no-base.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules require rules or access")),
+            "expected deny-rules-require-base-allow diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_jsonrpc_with_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: jsonrpc-access
+display_name: JSONRPC Access
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: json-rpc
+    access: read-only
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("jsonrpc.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not support access presets")),
+            "expected jsonrpc-no-access diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_rules_with_no_allow_entries() {
+        let profile = parse_profile_yaml(
+            r"
+id: no-allow-rules
+display_name: No Allow Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    rules:
+      - {}
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("no-allow-rules.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("rules must contain at least one allow entry")),
+            "expected rules-must-contain-allow diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_accepts_valid_l7_endpoint() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-l7
+display_name: Valid L7
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("valid.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics.iter().any(|d| d.severity == "error"),
+            "unexpected error diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_mcp_without_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-no-rules
+display_name: MCP No Rules
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("mcp-no-rules.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("protocol mcp requires rules")),
+            "expected mcp-requires-rules diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_catches_issue_1714_reproduction() {
+        let profile = parse_profile_yaml(
+            r"
+id: opencode-openrouter
+display_name: OpenCode (OpenRouter)
+description: OpenCode agent CLI configured to use OpenRouter.
+category: agent
+inference_capable: true
+
+credentials:
+  - name: openrouter_api_key
+    description: OpenRouter API Key
+    env_vars: [OPENROUTER_API_KEY, OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+
+discovery:
+  credentials: [openrouter_api_key]
+
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    enforcement: enforce
+
+  - host: opencode.ai
+    port: 443
+
+binaries:
+  - /usr/local/bin/opencode
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("opencode-openrouter.yaml".to_string(), profile)]);
+
+        let error = diagnostics
+            .iter()
+            .find(|d| {
+                d.severity == "error"
+                    && d.field == "endpoints[0]"
+                    && d.message.contains("protocol requires rules or access")
+            })
+            .expect("lint should catch the first endpoint missing rules/access");
+        assert_eq!(error.profile_id, "opencode-openrouter");
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| { d.severity == "error" && d.field == "endpoints[1]" }),
+            "second endpoint (no protocol) should not produce errors"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_passes_issue_1714_with_access_added() {
+        let profile = parse_profile_yaml(
+            r"
+id: opencode-openrouter
+display_name: OpenCode (OpenRouter)
+description: OpenCode agent CLI configured to use OpenRouter.
+category: agent
+inference_capable: true
+
+credentials:
+  - name: openrouter_api_key
+    description: OpenRouter API Key
+    env_vars: [OPENROUTER_API_KEY, OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+
+discovery:
+  credentials: [openrouter_api_key]
+
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    access: read-write
+
+  - host: opencode.ai
+    port: 443
+
+binaries:
+  - /usr/local/bin/opencode
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("opencode-openrouter.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics.iter().any(|d| d.severity == "error"),
+            "adding access: read-write should fix the profile: {diagnostics:?}"
+        );
     }
 }
