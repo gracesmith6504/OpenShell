@@ -13,6 +13,7 @@ use openshell_core::proto::{
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
+use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -1616,6 +1617,28 @@ pub fn validate_profile_set(
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
                 ));
             }
+
+            let l7_fields = L7EndpointFields {
+                protocol: &endpoint.protocol,
+                access: &endpoint.access,
+                has_rules: !endpoint.rules.is_empty(),
+                has_deny_rules: !endpoint.deny_rules.is_empty(),
+                rules_would_deny_all: !endpoint.rules.is_empty()
+                    && endpoint.rules.iter().all(|r| r.allow.is_none()),
+                allow_all_known_mcp_methods: endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.allow_all_known_mcp_methods)
+                    .unwrap_or(false),
+            };
+            for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
         }
 
         for (index, binary) in profile.binaries.iter().enumerate() {
@@ -2764,12 +2787,23 @@ id: advanced
 display_name: Advanced
 category: other
 endpoints:
+  - host: graphql.example.com
+    port: 443
+    protocol: graphql
+    access: read-only
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash-a:
+        operation_type: query
+        operation_name: Viewer
+        fields: [viewer]
+    graphql_max_body_bytes: 131072
+    path: /graphql
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
     tls: terminate
     enforcement: enforce
-    access: read-only
     rules:
       - allow:
           method: GET
@@ -2782,14 +2816,6 @@ endpoints:
       - method: POST
         path: /admin/**
     allow_encoded_slash: true
-    persisted_queries: allow_registered
-    graphql_persisted_queries:
-      hash-a:
-        operation_type: query
-        operation_name: Viewer
-        fields: [viewer]
-    graphql_max_body_bytes: 131072
-    path: /graphql
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -2803,39 +2829,44 @@ binaries:
         );
 
         let proto = profile.to_proto();
-        let endpoint = proto.endpoints.first().expect("endpoint should exist");
-        assert_eq!(endpoint.port, 0);
-        assert_eq!(endpoint.ports, vec![443, 8443]);
-        assert_eq!(endpoint.tls, "terminate");
-        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
-        assert!(endpoint.allow_encoded_slash);
-        assert_eq!(endpoint.persisted_queries, "allow_registered");
-        assert_eq!(endpoint.graphql_max_body_bytes, 131_072);
-        assert_eq!(endpoint.path, "/graphql");
+
+        let graphql_ep = &proto.endpoints[0];
+        assert_eq!(graphql_ep.access, "read-only");
+        assert_eq!(graphql_ep.persisted_queries, "allow_registered");
+        assert_eq!(graphql_ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(graphql_ep.path, "/graphql");
         assert_eq!(
-            endpoint
+            graphql_ep
+                .graphql_persisted_queries
+                .get("hash-a")
+                .map(|operation| operation.operation_name.as_str()),
+            Some("Viewer")
+        );
+
+        let rest_ep = &proto.endpoints[1];
+        assert_eq!(rest_ep.port, 0);
+        assert_eq!(rest_ep.ports, vec![443, 8443]);
+        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(rest_ep.allow_encoded_slash);
+        assert_eq!(
+            rest_ep
                 .rules
                 .first()
                 .and_then(|rule| rule.allow.as_ref())
                 .map(|allow| allow.method.as_str()),
             Some("GET")
         );
-        assert_eq!(endpoint.deny_rules[0].method, "POST");
-        assert_eq!(
-            endpoint
-                .graphql_persisted_queries
-                .get("hash-a")
-                .map(|operation| operation.operation_name.as_str()),
-            Some("Viewer")
-        );
+        assert_eq!(rest_ep.deny_rules[0].method, "POST");
         assert!(proto.binaries[0].harness);
 
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
+        assert_eq!(reprotoo.endpoints[0].access, "read-only");
+        assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
         assert!(reprotoo.binaries[0].harness);
     }
 
@@ -3429,6 +3460,175 @@ credentials:
         assert!(
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_protocol_without_rules_or_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: opencode-openrouter
+display_name: OpenCode (OpenRouter)
+credentials:
+  - name: api_key
+    env_vars: [OPENROUTER_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    enforcement: enforce
+binaries:
+  - /usr/bin/opencode
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("protocol requires rules or access")),
+            "expected lint to reject protocol without rules or access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_protocol_with_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-rest
+display_name: Valid REST
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-protocol
+display_name: Bad Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: ftp
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown protocol")),
+            "expected lint to reject unknown protocol, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rules_and_access_together() {
+        let profile = parse_profile_yaml(
+            r"
+id: both-rules-access
+display_name: Both
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    rules:
+      - allow:
+          method: GET
+          path: /api/**
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("mutually exclusive")),
+            "expected lint to reject rules + access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_deny_rules_without_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: deny-no-protocol
+display_name: Deny No Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    deny_rules:
+      - method: POST
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules require protocol")),
+            "expected lint to reject deny_rules without protocol, got: {diagnostics:?}"
         );
     }
 }

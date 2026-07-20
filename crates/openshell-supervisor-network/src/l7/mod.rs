@@ -21,6 +21,8 @@ pub mod tls;
 pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
+use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
+
 /// Application-layer protocol for L7 inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {
@@ -1031,40 +1033,31 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // rules + access mutual exclusion
-            if has_rules && !access.is_empty() {
-                errors.push(format!("{loc}: rules and access are mutually exclusive"));
-            }
-
-            if jsonrpc_family && !access.is_empty() {
-                if protocol == "mcp" {
-                    errors.push(format!(
-                        "{loc}: protocol {protocol} does not support access presets; use rules/deny_rules or set mcp.allow_all_known_mcp_methods: true for an allow-all MCP policy"
-                    ));
-                } else {
-                    errors.push(format!(
-                        "{loc}: protocol {protocol} does not support access presets; use explicit rules with allow.method such as \"*\""
-                    ));
-                }
-            }
-
-            if protocol == "json-rpc" && !has_rules {
-                errors.push(format!(
-                    "{loc}: protocol {protocol} requires explicit rules with allow.method"
-                ));
-            }
-
-            // protocol requires rules or access
-            if !protocol.is_empty() && protocol != "mcp" && !has_rules && access.is_empty() {
-                errors.push(format!(
-                    "{loc}: protocol requires rules or access to define allowed traffic"
-                ));
-            }
-
-            if !protocol.is_empty() && l7_protocol.is_none() {
-                errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, json-rpc, or mcp)"
-                ));
+            // L7 endpoint semantic validation (shared with profile lint).
+            // Computed lazily: has_deny_rules and rules_would_deny_all are
+            // needed here but also referenced by per-rule checks below.
+            let has_deny_rules = ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+            let rules_would_deny_all = ep
+                .get("rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty);
+            let mcp_allow_all_known_mcp_methods = ep
+                .get("mcp_allow_all_known_mcp_methods")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let l7_fields = L7EndpointFields {
+                protocol,
+                access,
+                has_rules,
+                has_deny_rules,
+                rules_would_deny_all,
+                allow_all_known_mcp_methods: mcp_allow_all_known_mcp_methods,
+            };
+            for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                errors.push(format!("{loc}: {msg}"));
             }
 
             if let Some(mode) = ep.get("persisted_queries").and_then(|v| v.as_str())
@@ -1154,20 +1147,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .get("mcp_strict_tool_names")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            let mcp_allow_all_known_mcp_methods = ep
-                .get("mcp_allow_all_known_mcp_methods")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if protocol == "mcp"
-                && !has_rules
-                && access.is_empty()
-                && !mcp_allow_all_known_mcp_methods
-            {
-                errors.push(format!(
-                    "{loc}: protocol mcp requires rules when mcp.allow_all_known_mcp_methods is false"
-                ));
-            }
-
             if ep
                 .get("websocket_credential_rewrite")
                 .and_then(serde_json::Value::as_bool)
@@ -1225,41 +1204,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            // rules with empty list
-            if ep
-                .get("rules")
-                .and_then(|v| v.as_array())
-                .is_some_and(Vec::is_empty)
-            {
-                errors.push(format!(
-                    "{loc}: rules list cannot be empty (would deny all traffic). Use `access: full` or remove rules."
-                ));
-            }
-
             // port 443 + rest + tls: skip — L7 won't work (already handled above)
             // The old warning about missing `tls: terminate` is no longer needed
             // because TLS termination is now automatic.
 
-            // Validate deny_rules
-            let has_deny_rules = ep
-                .get("deny_rules")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty());
+            // Per-rule deny_rules validation (semantic checks handled by
+            // shared validator above).
             if has_deny_rules {
-                // deny_rules require L7 inspection
-                if protocol.is_empty() {
-                    errors.push(format!(
-                        "{loc}: deny_rules require protocol (L7 inspection must be enabled)"
-                    ));
-                }
-
-                // deny_rules require some allow base (access or rules)
-                if protocol != "mcp" && !has_rules && access.is_empty() {
-                    errors.push(format!(
-                        "{loc}: deny_rules require rules or access to define the base allow set"
-                    ));
-                }
-
                 let has_mcp_tool_allow_selectors =
                     protocol == "mcp" && mcp_endpoint_has_tool_allow_selectors(ep);
 
